@@ -587,10 +587,11 @@ export const handlePaymentWebhook = async (req, res) => {
 async function handleCheckoutSessionCompletedEnhanced(session, summary) {
   try {
     console.log("Processing checkout session completed:", {
-      sessionId: session.id,
-      customerId: session.customer,
-      subscriptionId: session.subscription,
-      paymentStatus: session.payment_status,
+      // sessionId: session.id,
+      // customerId: session.customer,
+      // subscriptionId: session.subscription,
+      // paymentStatus: session.payment_status,
+      fullsession:session
     });
 
     // Verify payment was successful
@@ -657,7 +658,7 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
     const planName = price?.nickname || productObj?.name || null;
     const interval = price?.recurring?.interval || null;
     const intervalCount = price?.recurring?.interval_count || null;
-
+    const invoiceId = fullSession.invoice
     // Extract metadata
     const metadata = {
       ...fullSession.metadata,
@@ -732,8 +733,62 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
       billing_reason: "subscription_create",
       metadata,
     };
-
+    console.log("details",  summary.details)
     console.log(`Checkout session completed for user ${userId}: ${session.id}`);
+
+    // --- Always create a Transaction record after session completion ---
+    const user = await User.findById(userId);
+    const planId = metadata.planId || null;
+    // Build Stripe details for transaction (full schema)
+    const stripeDetails = {
+      customerId: customer?.id || "",
+      customerEmail: customer?.email || "",
+      invoiceId: invoiceId,
+      paymentIntentId: paymentIntent?.id || "",
+      chargeId: charge?.id || "",
+      balanceTransactionId:
+        typeof charge?.balance_transaction === "string"
+          ? charge.balance_transaction
+          : charge?.balance_transaction?.id || "",
+      subscriptionId: subscriptionId || "",
+      priceId: priceId || "",
+      productId: productId || "",
+      planName: planName || "Unknown Plan",
+      interval: interval || "",
+      intervalCount: intervalCount || 1,
+      periodStart: subscription?.start_date
+        ? new Date(subscription.start_date * 1000)
+        : null,
+      periodEnd: subscription?.current_period_end
+        ? new Date(subscription.current_period_end * 1000)
+        : null,
+      // eventId: session?.eventId || null,
+    };
+
+    const transactionData = {
+      userId,
+      planId,
+      planType: "subscription",
+      stripe: stripeDetails,
+      stripePaymentIntentId: paymentIntent?.id || null,
+      stripeSubscriptionId: subscriptionId || null,
+      transactionId: session.id,
+      amount: (fullSession.amount_total || 0) / 100,
+      currency: (fullSession.currency || "usd").toUpperCase(),
+      status: "succeeded",
+      type: "payment",
+      planName: planName || "Unknown Plan",
+      interval,
+      description: `Checkout session payment for ${planName}`,
+      couponCode: metadata.couponCode || null,
+      discountAmount: metadata.discountAmount || 0,
+      metadata,
+    };
+    if (user && (user.role === "teacher" || user.userRole === "teacher")) {
+      transactionData.teacherId = user._id;
+    }
+    await Transaction.create(transactionData);
+    console.log(`Transaction record created for user ${userId} after checkout session.`);
   } catch (error) {
     console.error("Error handling checkout session completed:", error);
     summary.paid = false;
