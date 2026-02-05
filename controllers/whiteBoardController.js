@@ -1,7 +1,9 @@
 // controllers/ai.controller.js
-import OpenAI from "openai";
+// import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Reusable helper
 async function askVision({
@@ -18,24 +20,47 @@ async function askVision({
 
 Use a warm, encouraging, parent-like tone throughout. Keep responses concise, child-friendly, and focused on learning rather than giving the final answers unless the student has failed the same step three times or the teacher requests the solution.`,
 }) {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
+  // const resp = await genAI.getGenerativeModel({
+  //   model: "gemini-2.5-flash",
+  //   messages: [
+  //     {
+  //       role: "system",
+  //       content:
+  //         "You are a warm, patient, and encouraging tutor (like a caring parent) who reads a student's classwork image and provides short, supportive, and educational guidance. Keep responses concise (up to ~500 characters) when appropriate. Avoid repeating raw extracted text and do not reveal the final answer unless the student has attempted the same incorrect step three times or the teacher explicitly asks for it. Always start advice with the student's name if provided and use a kind, child-friendly tone.",
+  //     },
+  //     {
+  //       role: "user",
+  //       content: [
+  //         { type: "text", text: prompt },
+  //         { type: "image_url", image_url: { url: dataUrl } },
+  //       ],
+  //     },
+  //   ],
+  // });
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+    systemInstruction: `
+      You are a warm, patient, and encouraging tutor (like a caring parent)
+      who reads a student's classwork image and provides short, supportive,
+      and educational guidance.
+
+      Rules:
+      - Start advice with the student's name if provided
+      - Never give final answers unless failed 3 times
+      - Be concise, child-friendly, and encouraging
+      `
+    });
+  const base64Image = dataUrl.split(",")[1];
+  const result = await model.generateContent([
       {
-        role: "system",
-        content:
-          "You are a warm, patient, and encouraging tutor (like a caring parent) who reads a student's classwork image and provides short, supportive, and educational guidance. Keep responses concise (up to ~500 characters) when appropriate. Avoid repeating raw extracted text and do not reveal the final answer unless the student has attempted the same incorrect step three times or the teacher explicitly asks for it. Always start advice with the student's name if provided and use a kind, child-friendly tone.",
+        inlineData: {
+          data: base64Image,
+          mimeType: "image/jpeg", // or image/png
+        },
       },
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: dataUrl } },
-        ],
-      },
-    ],
-  });
-  return resp.choices?.[0]?.message?.content ?? "No answer";
+      prompt,
+    ]);
+  return result.response.text() ?? "No answer";
 }
 
 /** POST /api/ai/whiteboard (multipart/form-data: image) */
