@@ -10,6 +10,10 @@ import {
   validateSessionForUser,
   reportOffScreen,
 } from "../controllers/classroomController.js";
+
+import { uploadScreenshot } from "../utils/multer.js";
+import { uploadUserScreenshot } from "../controllers/screenshotController.js";
+
 import { addCustomIdMapping } from "../controllers/customIdMapController.js";
 import auth_token from "../middleware/auth_token.js";
 import auth_key_header from "../middleware/auth_key_header.js";
@@ -27,6 +31,13 @@ const allowTeacherOrAdmin = (req, res, next) => {
 // Add a mapping for custom sessionId or userId
 router.post("/custom-id-map", addCustomIdMapping);
 
+router.post(
+  "/upload-screenshot",
+  auth_key_header,
+  auth_token,
+  uploadScreenshot,
+  uploadUserScreenshot
+);
 // ✅ Report off-screen activity - logs when student goes off-screen
 router.post(
   "/reportoffscreen/:sessionId/:userId",
@@ -101,5 +112,6 @@ router.delete(
   allowTeacherOrAdmin,
   deleteSession
 );
+
 
 export default router;
