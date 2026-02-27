@@ -12,7 +12,7 @@ import {
 } from "../controllers/classroomController.js";
 
 import { uploadScreenshot } from "../utils/multer.js";
-import { uploadUserScreenshot } from "../controllers/screenshotController.js";
+import { uploadUserScreenshot, getScreenshotsBySession } from "../controllers/screenshotController.js";
 
 import { addCustomIdMapping } from "../controllers/customIdMapController.js";
 import auth_token from "../middleware/auth_token.js";
@@ -38,6 +38,16 @@ router.post(
   uploadScreenshot,
   uploadUserScreenshot
 );
+  
+// Get all screenshots for a session with optional filters
+router.get(
+  "/screenshots/:sessionId",
+  auth_key_header,
+  auth_token,
+  allowTeacherOrAdmin,
+  getScreenshotsBySession
+);
+
 // ✅ Report off-screen activity - logs when student goes off-screen
 router.post(
   "/reportoffscreen/:sessionId/:userId",

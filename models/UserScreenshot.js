@@ -7,6 +7,11 @@ const userScreenshotSchema = new mongoose.Schema(
       ref: "User",
       required: true,
     },
+    SessionId:{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Session",
+      required: true,
+    },
     screenshotUrl: {
       type: String,
       required: true,
