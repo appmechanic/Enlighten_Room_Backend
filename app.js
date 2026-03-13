@@ -11,6 +11,7 @@ import userRoutes from "./routes/user.js";
 import keysRoutes from "./routes/keys.js";
 import crudRoutes from "./routes/crud.js";
 import teacherRoutes from "./routes/teacherRoutes.js";
+import classworkRoutes from "./routes/classworkRoutes.js";
 import studentRoutes from "./routes/studentRoutes.js";
 import parentRoutes from "./routes/parentRoutes.js";
 import driveRoutes from "./routes/driveRoutes.js";
@@ -93,7 +94,9 @@ app.use("/api/plans", planRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/question-bank", questionRoutes);
 app.use("/api/analytics", analyticsRoutes);
-app.use("/api/task", taskRoutes);
+
+// Classwork routes
+app.use("/api/classwork", classworkRoutes);
 
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/admin/promotions", promotionRoutes);
