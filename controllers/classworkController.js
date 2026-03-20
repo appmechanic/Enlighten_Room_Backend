@@ -94,6 +94,7 @@ export const viewAllAnswers = async (req, res) => {
         question: q.question,
         format: q.format || q.formatLabel || '',
         totalStudents: 0,
+        correctAnswer: q.correctAnswer,
         submitted,
         waiting: [],
       };
