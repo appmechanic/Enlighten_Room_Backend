@@ -3,10 +3,11 @@ import ClassworkModel from '../models/ClassworkModel.js';
 // Add a question (teacher side)
 export const addQuestion = async (req, res) => {
   try {
-    const { question, correctAnswer, roomId } = req.body;
-    const newQuestion = await ClassworkModel.create({ ...question, correctAnswer, roomId });
+    const { question, roomId } = req.body;
+    const newQuestion = await ClassworkModel.create({ ...question, roomId });
     res.status(201).json(newQuestion);
   } catch (err) {
+    console.error('Error in addQuestion:', err);
     res.status(500).json({ message: 'Error adding question', error: err.message });
   }
 };
