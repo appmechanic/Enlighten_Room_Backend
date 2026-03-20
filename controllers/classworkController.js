@@ -18,6 +18,15 @@ export const submitAnswer = async (req, res) => {
     const question = await ClassworkModel.findOne({ id: questionId });
     if (!question) return res.status(404).json({ message: 'Question not found' });
     if (!question.roomId && roomId) question.roomId = roomId;
+
+    // Check if question has expired
+    if (question.expiryTime && question.createdAt) {
+      const elapsed = (Date.now() - new Date(question.createdAt).getTime()) / 1000;
+      if (elapsed > question.expiryTime) {
+        return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
+      }
+    }
+
     let isCorrect = false;
     // Compare answer to correctAnswer
     if (question.correctAnswer !== undefined) {

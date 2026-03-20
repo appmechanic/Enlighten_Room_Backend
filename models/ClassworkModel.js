@@ -22,6 +22,8 @@ const ClassworkSchema = new mongoose.Schema({
   blanks: { type: [String], default: [] },
   maxLength: { type: Number },
   correctAnswer: { type: mongoose.Schema.Types.Mixed },
+  expiryTime: { type: Number, default: 30 },
+  createdAt: { type: Date, default: Date.now },
   submitted: { type: [SubmittedSchema], default: [] },
 });
 
