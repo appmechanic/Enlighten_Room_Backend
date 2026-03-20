@@ -40,7 +40,7 @@ export const submitAnswer = async (req, res) => {
     }
     question.submitted.push({ studentId, studentName, answer, isCorrect });
     await question.save();
-    res.status(200).json({ message: 'Answer submitted', isCorrect });
+    res.status(200).json({ message: 'Answer submitted', isCorrect ,"correctAnswer": question.correctAnswer});
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
   }
