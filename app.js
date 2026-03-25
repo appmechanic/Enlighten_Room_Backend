@@ -39,6 +39,7 @@ import GradeSubmissionRoutes from "./routes/gradedSubmissionRoutes.js";
 import PrivacyPolicyRoutes from "./routes/privacyPolicyRoutes.js";
 import ResourcesRoutes from "./routes/resourcesRoutes.js";
 import testimonialRoutes from "./routes/testimonialRoutes.js";
+import geminiHintRoutes from './routes/geminiHintRoutes.js';
 // import transactionRoutes from "./routes/transactionRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
 import partnerRoutes from "./routes/partnerRoutes.js";
@@ -97,6 +98,9 @@ app.use("/api/analytics", analyticsRoutes);
 
 // Classwork routes
 app.use("/api/classwork", classworkRoutes);
+
+// Gemini hint route
+app.use("/api/gemini-hint", geminiHintRoutes);
 
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/admin/promotions", promotionRoutes);
