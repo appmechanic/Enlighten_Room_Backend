@@ -1,6 +1,14 @@
 import ClassworkModel from '../models/ClassworkModel.js';
 import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
 
+export const clearAllClasswork = async (req, res) => {
+  try {
+    await ClassworkModel.deleteMany({});
+    res.status(200).json({ message: 'All classwork cleared.' });
+  } catch (err) {
+    res.status(500).json({ message: 'Error clearing classwork', error: err.message });
+  }
+};
 // Add a question (teacher side)
 export const addQuestion = async (req, res) => {
   try {
@@ -29,21 +37,10 @@ export const submitAnswer = async (req, res) => {
       }
     }
 
-    let isCorrect = false;
-    // Compare answer to correctAnswer
-    if (question.correctAnswer !== undefined) {
-      if (typeof answer === 'string' && typeof question.correctAnswer === 'string') {
-        isCorrect = answer.trim().toLowerCase() === question.correctAnswer.trim().toLowerCase();
-      } else if (Array.isArray(answer) && Array.isArray(question.correctAnswer)) {
-        isCorrect = JSON.stringify(answer.map(a => a.trim().toLowerCase())) === JSON.stringify(question.correctAnswer.map(a => a.trim().toLowerCase()));
-      } else {
-        isCorrect = answer === question.correctAnswer;
-      }
-    }
-
-    // Get AI-based score and feedback
+    // Get AI-based score, feedback, and correctness
     let aiScore = 0;
     let feedback = '';
+    let isCorrect = false;
     try {
       const aiResult = await getGeminiScoreAndFeedback(
         question.question,
@@ -52,6 +49,7 @@ export const submitAnswer = async (req, res) => {
       );
       aiScore = aiResult.aiScore;
       feedback = aiResult.feedback;
+      isCorrect = aiResult.isCorrect;
     } catch (aiErr) {
       console.error('AI scoring failed:', aiErr);
     }

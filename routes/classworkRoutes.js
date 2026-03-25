@@ -1,7 +1,8 @@
 import express from 'express';
-import { addQuestion, submitAnswer, viewAnswers, viewAllAnswers, getQuestions } from '../controllers/classworkController.js';
+import { clearAllClasswork, addQuestion, submitAnswer, viewAnswers, viewAllAnswers, getQuestions } from '../controllers/classworkController.js';
 const router = express.Router();
 
+router.get('/', clearAllClasswork)
 router.post('/question', addQuestion);
 router.post('/submit', submitAnswer);
 router.get('/questions/:roomId', getQuestions);
