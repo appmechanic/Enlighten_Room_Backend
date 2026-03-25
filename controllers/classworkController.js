@@ -15,7 +15,7 @@ export const addQuestion = async (req, res) => {
 // Submit answer (student side)
 export const submitAnswer = async (req, res) => {
   try {
-    const { questionId, studentId, studentName, answer, roomId } = req.body;
+    const { questionId, studentId, studentName, answer, roomId, aiUsed } = req.body;
     const question = await ClassworkModel.findOne({ id: questionId });
     if (!question) return res.status(404).json({ message: 'Question not found' });
     if (!question.roomId && roomId) question.roomId = roomId;
@@ -39,9 +39,23 @@ export const submitAnswer = async (req, res) => {
         isCorrect = answer === question.correctAnswer;
       }
     }
-    question.submitted.push({ studentId, studentName, answer, isCorrect });
+
+    // Check if student already submitted an answer
+    const existingSubmissionIndex = question.submitted.findIndex(
+      (s) => s.studentId === studentId
+    );
+    if (existingSubmissionIndex !== -1) {
+      // Update existing answer
+      question.submitted[existingSubmissionIndex].answer = answer;
+      question.submitted[existingSubmissionIndex].isCorrect = isCorrect;
+      question.submitted[existingSubmissionIndex].aiUsed = aiUsed;
+      question.submitted[existingSubmissionIndex].studentName = studentName;
+    } else {
+      // Add new answer
+      question.submitted.push({ studentId, studentName, answer, isCorrect, aiUsed });
+    }
     await question.save();
-    res.status(200).json({ message: 'Answer submitted', isCorrect ,"correctAnswer": question.correctAnswer});
+    res.status(200).json({ message: 'Answer submitted', isCorrect, correctAnswer: question.correctAnswer, data: question.submitted });
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
   }
