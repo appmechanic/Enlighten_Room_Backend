@@ -1,4 +1,5 @@
 import ClassworkModel from '../models/ClassworkModel.js';
+import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
 
 // Add a question (teacher side)
 export const addQuestion = async (req, res) => {
@@ -40,6 +41,21 @@ export const submitAnswer = async (req, res) => {
       }
     }
 
+    // Get AI-based score and feedback
+    let aiScore = 0;
+    let feedback = '';
+    try {
+      const aiResult = await getGeminiScoreAndFeedback(
+        question.question,
+        answer,
+        question.correctAnswer
+      );
+      aiScore = aiResult.aiScore;
+      feedback = aiResult.feedback;
+    } catch (aiErr) {
+      console.error('AI scoring failed:', aiErr);
+    }
+
     // Check if student already submitted an answer
     const existingSubmissionIndex = question.submitted.findIndex(
       (s) => s.studentId === studentId
@@ -50,12 +66,14 @@ export const submitAnswer = async (req, res) => {
       question.submitted[existingSubmissionIndex].isCorrect = isCorrect;
       question.submitted[existingSubmissionIndex].aiUsed = aiUsed;
       question.submitted[existingSubmissionIndex].studentName = studentName;
+      question.submitted[existingSubmissionIndex].aiScore = aiScore;
+      question.submitted[existingSubmissionIndex].feedback = feedback;
     } else {
       // Add new answer
-      question.submitted.push({ studentId, studentName, answer, isCorrect, aiUsed });
+      question.submitted.push({ studentId, studentName, answer, isCorrect, aiUsed, aiScore, feedback });
     }
     await question.save();
-    res.status(200).json({ message: 'Answer submitted', isCorrect, correctAnswer: question.correctAnswer, data: question.submitted });
+    res.status(200).json({ message: 'Answer submitted', isCorrect, aiScore, feedback, correctAnswer: question.correctAnswer, data: question.submitted });
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
   }
