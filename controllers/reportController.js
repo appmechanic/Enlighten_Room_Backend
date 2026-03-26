@@ -193,3 +193,21 @@ export const sendReportsToParents = async (req, res) => {
       .json({ error: "Failed to send reports due to internal error." });
   }
 };
+
+// Download Report by ID
+export const downloadReport = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const report = await Report.findById(id);
+    if (!report) {
+      return res.status(404).json({ error: "Report not found" });
+    }
+    // For now, send as JSON. To send as PDF, generate PDF and set headers accordingly.
+    res.setHeader('Content-Disposition', `attachment; filename=report_${id}.json`);
+    res.setHeader('Content-Type', 'application/json');
+    res.status(200).send(JSON.stringify(report, null, 2));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to download report" });
+  }
+};

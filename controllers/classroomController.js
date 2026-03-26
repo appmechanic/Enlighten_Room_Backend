@@ -98,15 +98,42 @@ export const getClassrooms = async (req, res) => {
 
 export const getClassroomById = async (req, res) => {
   try {
+    // Populate studentIds with parentId
     const classroom = await Classroom.findById(req.params.id)
       .populate("subject")
-      .populate("studentIds", "firstName lastName email userName")
+      .populate({
+        path: "studentIds",
+        select: "firstName lastName email userName parentId",
+        populate: {
+          path: "parentId",
+          select: "email",
+        },
+      })
       .populate("teacherId", "firstName lastName email username");
 
     if (!classroom)
       return res.status(404).json({ error: "Classroom not found" });
 
-    res.status(200).json(classroom);
+    // Map studentIds to include parentEmail
+    const studentsWithParentEmail = classroom.studentIds.map((student) => {
+      let parentEmail = null;
+      if (student.parentId && student.parentId.email) {
+        parentEmail = student.parentId.email;
+      }
+      return {
+        _id: student._id,
+        firstName: student.firstName,
+        lastName: student.lastName,
+        email: student.email,
+        userName: student.userName,
+        parentEmail,
+      };
+    });
+
+    // Return classroom with students including parentEmail
+    const classroomObj = classroom.toObject();
+    classroomObj.studentIds = studentsWithParentEmail;
+    res.status(200).json(classroomObj);
   } catch (err) {
     res
       .status(500)
