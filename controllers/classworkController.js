@@ -13,7 +13,25 @@ export const clearAllClasswork = async (req, res) => {
 export const addQuestion = async (req, res) => {
   try {
     const { question, roomId } = req.body;
+    // Validate expiryTime if present
+    if (question && question.expiryTime !== undefined) {
+      if (
+        typeof question.expiryTime !== 'number' ||
+        !Number.isFinite(question.expiryTime) ||
+        question.expiryTime <= 0
+      ) {
+        console.warn('[AddQuestion] Invalid expiryTime:', question.expiryTime);
+        return res.status(400).json({ message: 'Invalid expiryTime. It must be a positive number of seconds.' });
+      }
+    }
     const newQuestion = await ClassworkModel.create({ ...question, roomId });
+    console.log('[AddQuestion] Question created:', {
+      id: newQuestion.id,
+      createdAt: newQuestion.createdAt,
+      expiryTime: newQuestion.expiryTime,
+      roomId: newQuestion.roomId,
+      now: new Date().toISOString()
+    });
     res.status(201).json(newQuestion);
   } catch (err) {
     console.error('Error in addQuestion:', err);
@@ -26,6 +44,12 @@ export const submitAnswer = async (req, res) => {
   try {
     const { questionId, studentId, studentName, answer, roomId, aiUsed } = req.body;
     const question = await ClassworkModel.findOne({ id: questionId });
+    console.log('[SubmitAnswer] Attempt:', {
+      questionId,
+      studentId,
+      now: new Date().toISOString(),
+      questionCreatedAt: question ? question.createdAt : null
+    });
     if (!question) return res.status(404).json({ message: 'Question not found' });
     if (!question.roomId && roomId) question.roomId = roomId;
 
