@@ -31,7 +31,17 @@ export const submitAnswer = async (req, res) => {
 
     // Check if question has expired
     if (question.expiryTime && question.createdAt) {
-      const elapsed = (Date.now() - new Date(question.createdAt).getTime()) / 1000;
+      const now = Date.now();
+      const createdAtTime = new Date(question.createdAt).getTime();
+      const elapsed = (now - createdAtTime) / 1000;
+      console.log('[Expiry Debug]', {
+        now: new Date(now).toISOString(),
+        createdAt: question.createdAt,
+        createdAtTime,
+        expiryTime: question.expiryTime,
+        elapsed,
+        expiryExceeded: elapsed > question.expiryTime
+      });
       if (elapsed > question.expiryTime) {
         return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
       }
