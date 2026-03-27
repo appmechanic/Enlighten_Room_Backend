@@ -141,7 +141,8 @@ export const clearAllClasswork = async (req, res) => {
 // Add a question (teacher side)
 export const addQuestion = async (req, res) => {
   try {
-    const { question, roomId } = req.body;
+    const question  = JSON.parse(req.body.question);
+    const roomId = req.body.roomId;
     // Validate expiryTime if present
     if (question && question.expiryTime !== undefined) {
       if (
@@ -154,14 +155,22 @@ export const addQuestion = async (req, res) => {
       }
     }
     const newQuestion = await ClassworkModel.create({ ...question, roomId });
+    if (req.file){
+      newQuestion.image = req.file.location;
+    }
+    newQuestion.save()
     console.log('[AddQuestion] Question created:', {
       id: newQuestion.id,
       createdAt: newQuestion.createdAt,
       expiryTime: newQuestion.expiryTime,
       roomId: newQuestion.roomId,
+      image: newQuestion.image,
       now: new Date().toISOString()
     });
-    res.status(201).json(newQuestion);
+    res.status(201).json({
+      ...newQuestion.toObject(),
+      image: newQuestion.image // This will be the S3/Spaces URL if uploaded
+    });
   } catch (err) {
     console.error('Error in addQuestion:', err);
     res.status(500).json({ message: 'Error adding question', error: err.message });

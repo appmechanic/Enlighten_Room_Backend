@@ -46,3 +46,4 @@ export const screenshotupload = multer({
 
 // For screenshot uploads
 export const uploadScreenshot = screenshotupload.single("screenshot");
+export const uploadClasswork = screenshotupload.single("image");
