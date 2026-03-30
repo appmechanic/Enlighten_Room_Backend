@@ -217,7 +217,7 @@ export const submitAnswer = async (req, res) => {
       const aiResult = await getGeminiScoreAndFeedback(
         question.question,
         answer,
-        question.correctAnswer
+        question.image
       );
       aiScore = aiResult.aiScore;
       feedback = aiResult.feedback;
@@ -243,7 +243,14 @@ export const submitAnswer = async (req, res) => {
       question.submitted.push({ studentId, studentName, answer, isCorrect, aiUsed, aiScore, feedback });
     }
     await question.save();
-    res.status(200).json({ message: 'Answer submitted', isCorrect, aiScore, feedback, correctAnswer: question.correctAnswer, data: question.submitted });
+    res.status(200).json({
+      message: 'Answer submitted',
+      isCorrect,
+      aiScore,
+      feedback,
+      correctAnswer: question.correctAnswer,
+      data: question.submitted
+    });
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
   }
