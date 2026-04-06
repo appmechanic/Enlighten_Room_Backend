@@ -449,28 +449,22 @@ export const submitAnswer = async (req, res) => {
       questionId: question.id || questionId,
       studentId,
     });
-    const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
-    if (!aiAllowed) {
-      feedback = 'AI hints and checking are disabled for this question.';
-    } else if (aiExpiryState.isExpired) {
-      aiExpired = true;
-      feedback = 'AI evaluation time expired for this question.';
-    } else {
-      try {
-        const aiResult = await getGeminiScoreAndFeedback(
-          question.question,
-          normalizedAnswer,
-          question.image,
-          question.correctAnswer,
-          question.format
-        );
-        aiScore = aiResult.aiScore;
-        feedback = aiResult.feedback;
-        isCorrect = aiResult.isCorrect;
-      } catch (aiErr) {
-        console.error('AI scoring failed:', aiErr);
-      }
+   
+    try {
+      const aiResult = await getGeminiScoreAndFeedback(
+        question.question,
+        normalizedAnswer,
+        question.image,
+        question.correctAnswer,
+        question.format
+      );
+      aiScore = aiResult.aiScore;
+      feedback = aiResult.feedback;
+      isCorrect = aiResult.isCorrect;
+    } catch (aiErr) {
+      console.error('AI scoring failed:', aiErr);
     }
+    
 
     // Check if student already submitted an answer
     const existingSubmissionIndex = question.submitted.findIndex(
