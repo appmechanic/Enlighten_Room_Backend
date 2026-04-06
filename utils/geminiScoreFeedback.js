@@ -3,6 +3,80 @@ import fetch from "node-fetch";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+function normalizeAnswerText(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry, index) => `Blank ${index + 1}: ${String(entry ?? "")}`)
+      .join("\n");
+  }
+
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string" && value.text.trim()) {
+      return value.text.trim();
+    }
+
+    if (typeof value.value === "string" && value.value.trim()) {
+      return value.value.trim();
+    }
+
+    if (value.type === "image") {
+      return "Student submitted the answer as an image/handwriting sample.";
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  if (typeof value === "string") {
+    return /^data:image\//i.test(value)
+      ? "Student submitted the answer as an image/handwriting sample."
+      : value;
+  }
+
+  return value == null ? "" : String(value);
+}
+
+function getAnswerImageSource(answer) {
+  if (!answer) {
+    return null;
+  }
+
+  if (typeof answer === "string") {
+    return /^data:image\//i.test(answer) ? answer : null;
+  }
+
+  if (typeof answer === "object") {
+    if (typeof answer.imageData === "string" && answer.imageData.trim()) {
+      return answer.imageData;
+    }
+
+    if (typeof answer.imageUrl === "string" && answer.imageUrl.trim()) {
+      return answer.imageUrl;
+    }
+  }
+
+  return null;
+}
+
+async function sourceToInlineData(source) {
+  if (!source || typeof source !== "string") {
+    return null;
+  }
+
+  const dataUrlMatch = source.match(/^data:(.+?);base64,(.+)$/);
+  if (dataUrlMatch) {
+    return {
+      mimeType: dataUrlMatch[1],
+      base64: dataUrlMatch[2],
+    };
+  }
+
+  return urlToBase64(source);
+}
+
 /**
  * Convert URL → base64
  */
@@ -22,7 +96,9 @@ async function urlToBase64(url) {
 export async function getGeminiScoreAndFeedback(
   question,
   answer,
-  image // ✅ added image param
+  image,
+  correctAnswer,
+  format
 ) {
   try {
     const systemInstruction = `
@@ -35,7 +111,8 @@ Your job:
 
 Rules:
 - Be flexible with wording
-- Use image if provided as part of answer
+- Use any attached images as part of the question or student's answer
+- Use the reference answer when provided
 - If unsure, return isCorrect: false
 - ONLY return JSON
 
@@ -48,28 +125,55 @@ Format:
       systemInstruction,
     });
 
-    const prompt = `Question: ${question}\nStudent Answer: ${answer}`;
+    const normalizedAnswerText = normalizeAnswerText(answer);
+    const answerImageSource = getAnswerImageSource(answer);
+    const referenceAnswer = normalizeAnswerText(correctAnswer);
+
+    const prompt = [
+      `Question: ${question}`,
+      format ? `Answer Format: ${format}` : null,
+      referenceAnswer ? `Reference Answer: ${referenceAnswer}` : null,
+      `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
+      image ? "A question image is attached." : null,
+      answerImageSource ? "A student answer image is attached. Inspect the handwriting/image carefully." : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     let parts = [];
 
-    // ✅ Add image if exists
     if (image) {
-      const { base64, mimeType } = await urlToBase64(image);
+      const imageData = await sourceToInlineData(image);
 
-      parts.push({
-        inlineData: {
-          data: base64,
-          mimeType,
-        },
-      });
+      if (imageData) {
+        parts.push({ text: "Question image:" });
+        parts.push({
+          inlineData: {
+            data: imageData.base64,
+            mimeType: imageData.mimeType,
+          },
+        });
+      }
     }
 
-    // ✅ Always add text
+    if (answerImageSource) {
+      const answerImageData = await sourceToInlineData(answerImageSource);
+
+      if (answerImageData) {
+        parts.push({ text: "Student answer image:" });
+        parts.push({
+          inlineData: {
+            data: answerImageData.base64,
+            mimeType: answerImageData.mimeType,
+          },
+        });
+      }
+    }
+
     parts.push({
       text: prompt,
     });
 
-    // ✅ Correct Gemini call (important)
     const result = await model.generateContent({
       contents: [
         {
@@ -83,7 +187,6 @@ Format:
 
     console.log("[Gemini AI Response]", response);
 
-    // ✅ Extract JSON safely
     const match = response.match(/\{[\s\S]*\}/);
 
     if (match) {

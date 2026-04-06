@@ -23,6 +23,7 @@ import reportRoutes from "./routes/reportRoutes.js";
 import subscriptionRoutes from "./routes/subscriptionRoutes.js";
 import planRoutes from "./routes/planRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
+import paypalRoutes from "./routes/paypalRoutes.js";
 import questionRoutes from "./routes/questionRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import notificationRoutes from "./routes/notificationsRoutes.js";
@@ -93,6 +94,7 @@ app.use("/api/drive/student", studentDriveRoutes);
 app.use("/api/classrooms", classroomRoutes);
 app.use("/api/plans", planRoutes);
 app.use("/api/payments", paymentRoutes);
+app.use("/api/paypal", paypalRoutes);
 app.use("/api/question-bank", questionRoutes);
 app.use("/api/analytics", analyticsRoutes);
 

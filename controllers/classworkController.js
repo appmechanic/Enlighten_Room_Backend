@@ -1,7 +1,12 @@
 import { Parser as Json2csvParser } from 'json2csv';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
 import ClassworkModel from '../models/ClassworkModel.js';
 import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
+import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
+
+const bucketName = process.env.DO_SPACE_BUCKET;
+const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
 
 const transporter = nodemailer.createTransport({
   service: "gmail", // or your SMTP provider
@@ -11,7 +16,7 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-
+ 
 // Placeholder for sending email with attachment (implement with your email service)
 async function sendEmailWithAttachment({ to, subject, text, attachment, filename }) {
   // Add try-catch and support for attachments
@@ -38,6 +43,151 @@ async function sendEmailWithAttachment({ to, subject, text, attachment, filename
   }
 }
 
+function getSpacesPublicUrl(key) {
+  if (!bucketName || !spaceEndpoint) {
+    throw new Error('DigitalOcean Spaces configuration is missing.');
+  }
+
+  const endpoint = new URL(spaceEndpoint);
+  return `${endpoint.protocol}//${bucketName}.${endpoint.host}/${key}`;
+}
+
+function parseBase64Image(dataUrl) {
+  if (typeof dataUrl !== 'string') {
+    return null;
+  }
+
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    mimeType: match[1],
+    buffer: Buffer.from(match[2], 'base64'),
+  };
+}
+
+function getImageExtension(mimeType) {
+  switch (mimeType) {
+    case 'image/jpeg':
+      return 'jpg';
+    case 'image/png':
+      return 'png';
+    case 'image/webp':
+      return 'webp';
+    case 'image/gif':
+      return 'gif';
+    default:
+      return 'bin';
+  }
+}
+
+async function uploadAnswerImageToSpaces({ roomId, questionId, studentId, imageData }) {
+  const parsedImage = parseBase64Image(imageData);
+
+  if (!parsedImage) {
+    return null;
+  }
+
+  const extension = getImageExtension(parsedImage.mimeType);
+  const key = `photos/classwork-answers/${roomId}/${questionId}-${studentId}-${Date.now()}.${extension}`;
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: parsedImage.buffer,
+      ContentType: parsedImage.mimeType,
+      ACL: 'public-read',
+    })
+  );
+
+  return getSpacesPublicUrl(key);
+}
+
+async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
+  if (format !== 'handwriting') {
+    return answer;
+  }
+
+  if (typeof answer === 'string') {
+    if (!/^data:image\//i.test(answer)) {
+      return answer;
+    }
+
+    const imageUrl = await uploadAnswerImageToSpaces({
+      roomId: metadata.roomId,
+      questionId: metadata.questionId,
+      studentId: metadata.studentId,
+      imageData: answer,
+    });
+
+    return {
+      type: 'image',
+      imageUrl,
+      text: 'Handwritten answer submitted as image.',
+    };
+  }
+
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
+    return answer;
+  }
+
+  const rawImageData = typeof answer.imageData === 'string' ? answer.imageData : '';
+  const uploadedImageUrl = rawImageData
+    ? await uploadAnswerImageToSpaces({
+        roomId: metadata.roomId,
+        questionId: metadata.questionId,
+        studentId: metadata.studentId,
+        imageData: rawImageData,
+      })
+    : null;
+
+  return {
+    ...answer,
+    type: 'image',
+    imageUrl: uploadedImageUrl || answer.imageUrl || '',
+    text: answer.text || 'Handwritten answer submitted as image.',
+  };
+}
+
+function getSubmittedAnswerImage(answer) {
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
+    return null;
+  }
+
+  return answer.imageUrl || answer.imageData || null;
+}
+
+function formatSubmittedAnswerText(answer) {
+  if (Array.isArray(answer)) {
+    return answer.map((entry) => String(entry ?? '')).join(' | ');
+  }
+
+  if (typeof answer === 'string') {
+    return /^data:image\//i.test(answer) ? '[Image answer submitted]' : answer;
+  }
+
+  if (answer && typeof answer === 'object') {
+    if (typeof answer.text === 'string' && answer.text.trim()) {
+      return answer.text;
+    }
+
+    if (answer.type === 'image') {
+      return '[Image answer submitted]';
+    }
+
+    try {
+      return JSON.stringify(answer);
+    } catch (err) {
+      return '[Unsupported answer format]';
+    }
+  }
+
+  return answer == null ? '' : String(answer);
+}
+
 export const downloadAllAnswersCsvReport = async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -52,7 +202,7 @@ export const downloadAllAnswersCsvReport = async (req, res) => {
           'Format': q.format || q.formatLabel || '',
           'Student ID': s.studentId,
           'Student Name': s.studentName,
-          'Answer': s.answer,
+          'Answer': formatSubmittedAnswerText(s.answer),
           'Is Correct': s.isCorrect ? 'Yes' : 'No',
           'AI Score': s.aiScore,
           'AI Used': s.aiUsed,
@@ -94,7 +244,7 @@ export const sendClassworkReportToStudentsAndParents = async (req, res) => {
           'Format': q.format || q.formatLabel || '',
           'Student ID': s.studentId,
           'Student Name': s.studentName,
-          'Answer': s.answer,
+          'Answer': formatSubmittedAnswerText(s.answer),
           'Is Correct': s.isCorrect ? 'Yes' : 'No',
           'AI Score': s.aiScore,
           'AI Used': s.aiUsed,
@@ -143,6 +293,12 @@ export const addQuestion = async (req, res) => {
   try {
     const question  = JSON.parse(req.body.question);
     const roomId = req.body.roomId;
+    console.log('[AddQuestion] Incoming payload:', {
+      id: question?.id,
+      roomId,
+      expiryTime: question?.expiryTime,
+      receivedAt: new Date().toISOString()
+    });
     // Validate expiryTime if present
     if (question && question.expiryTime !== undefined) {
       if (
@@ -153,16 +309,32 @@ export const addQuestion = async (req, res) => {
         console.warn('[AddQuestion] Invalid expiryTime:', question.expiryTime);
         return res.status(400).json({ message: 'Invalid expiryTime. It must be a positive number of seconds.' });
       }
+      console.log('[AddQuestion] Expiry provided by client:', {
+        questionId: question.id,
+        expiryTime: question.expiryTime,
+        unit: 'seconds'
+      });
+    } else {
+      console.log('[AddQuestion] No expiryTime provided. Schema default will be used.', {
+        questionId: question?.id,
+        schemaDefaultExpiryTime: 30,
+        unit: 'seconds'
+      });
     }
     const newQuestion = await ClassworkModel.create({ ...question, roomId });
     if (req.file){
       newQuestion.image = req.file.location;
     }
     newQuestion.save()
+    const createdAtTime = new Date(newQuestion.createdAt).getTime();
+    const expiresAt = Number.isFinite(createdAtTime)
+      ? new Date(createdAtTime + (newQuestion.expiryTime * 1000)).toISOString()
+      : null;
     console.log('[AddQuestion] Question created:', {
       id: newQuestion.id,
       createdAt: newQuestion.createdAt,
       expiryTime: newQuestion.expiryTime,
+      expiresAt,
       roomId: newQuestion.roomId,
       image: newQuestion.image,
       now: new Date().toISOString()
@@ -180,15 +352,23 @@ export const addQuestion = async (req, res) => {
 // Submit answer (student side)
 export const submitAnswer = async (req, res) => {
   try {
-    const { questionId, studentId, studentName, answer, roomId, aiUsed } = req.body;
-    const question = await ClassworkModel.findOne({ id: questionId });
+    const { id , questionId, studentId, studentName, answer, roomId, aiUsed } = req.body;
+    const lookup = roomId ? { _id: id,  id: questionId, roomId } : { id: questionId };
+    const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
     console.log('[SubmitAnswer] Attempt:', {
       questionId,
+      roomId,
       studentId,
+      lookup,
       now: new Date().toISOString(),
-      questionCreatedAt: question ? question.createdAt : null
+      questionCreatedAt: question ? question.createdAt : null,
+      matchedQuestionRoomId: question ? question.roomId : null
     });
-    if (!question) return res.status(404).json({ message: 'Question not found' });
+    if (!question) {
+      return res.status(404).json({
+        message: roomId ? 'Question not found for this room' : 'Question not found'
+      });
+    }
     if (!question.roomId && roomId) question.roomId = roomId;
 
     // Check if question has expired
@@ -196,11 +376,13 @@ export const submitAnswer = async (req, res) => {
       const now = Date.now();
       const createdAtTime = new Date(question.createdAt).getTime();
       const elapsed = (now - createdAtTime) / 1000;
+      const expiresAt = new Date(createdAtTime + (question.expiryTime * 1000)).toISOString();
       console.log('[Expiry Debug]', {
         now: new Date(now).toISOString(),
         createdAt: question.createdAt,
         createdAtTime,
         expiryTime: question.expiryTime,
+        expiresAt,
         elapsed,
         expiryExceeded: elapsed > question.expiryTime
       });
@@ -213,11 +395,18 @@ export const submitAnswer = async (req, res) => {
     let aiScore = 0;
     let feedback = '';
     let isCorrect = false;
+    const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
+      roomId: question.roomId || roomId,
+      questionId: question.id || questionId,
+      studentId,
+    });
     try {
       const aiResult = await getGeminiScoreAndFeedback(
         question.question,
-        answer,
-        question.image
+        normalizedAnswer,
+        question.image,
+        question.correctAnswer,
+        question.format
       );
       aiScore = aiResult.aiScore;
       feedback = aiResult.feedback;
@@ -232,7 +421,7 @@ export const submitAnswer = async (req, res) => {
     );
     if (existingSubmissionIndex !== -1) {
       // Update existing answer
-      question.submitted[existingSubmissionIndex].answer = answer;
+      question.submitted[existingSubmissionIndex].answer = normalizedAnswer;
       question.submitted[existingSubmissionIndex].isCorrect = isCorrect;
       question.submitted[existingSubmissionIndex].aiUsed = aiUsed;
       question.submitted[existingSubmissionIndex].studentName = studentName;
@@ -240,7 +429,7 @@ export const submitAnswer = async (req, res) => {
       question.submitted[existingSubmissionIndex].feedback = feedback;
     } else {
       // Add new answer
-      question.submitted.push({ studentId, studentName, answer, isCorrect, aiUsed, aiScore, feedback });
+      question.submitted.push({ studentId, studentName, answer: normalizedAnswer, isCorrect, aiUsed, aiScore, feedback });
     }
     await question.save();
     res.status(200).json({
@@ -286,7 +475,8 @@ export const viewAllAnswers = async (req, res) => {
         return {
           name,
           initials,
-          answer: s.answer,
+          answer: formatSubmittedAnswerText(s.answer),
+          answerImage: getSubmittedAnswerImage(s.answer),
           isCorrect: s.isCorrect || false,
           aiScore: s.aiScore || 0,
           aiUsed: s.aiUsed || '0x',

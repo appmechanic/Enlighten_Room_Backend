@@ -1312,3 +1312,28 @@ export const deletePaymentLog = async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 };
+
+/**
+ * Get PayPal Client ID for frontend
+ * GET /api/payments/paypal-config
+ */
+export const getPayPalConfig = async (req, res) => {
+  try {
+    const clientId = process.env.PAYPAL_CLIENT_ID || "";
+    
+    if (!clientId) {
+      return res.status(400).json({
+        success: false,
+        error: "PayPal Client ID not configured on server",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      clientId,
+    });
+  } catch (error) {
+    console.error("PayPal config error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};

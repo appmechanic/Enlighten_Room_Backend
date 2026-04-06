@@ -33,6 +33,11 @@ const planSchema = new mongoose.Schema(
     stripeProductId: { type: String },
     stripePriceMonthly: { type: String },
     stripePriceYearly: { type: String },
+    
+    // PayPal product and billing plan IDs
+    paypalProductId: { type: String },
+    paypalBillingPlanMonthly: { type: String },
+    paypalBillingPlanYearly: { type: String },
 
     features: [
       {

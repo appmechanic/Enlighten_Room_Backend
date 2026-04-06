@@ -5,6 +5,7 @@ import {
   getPlanPricing,
   getPaymentStatus,
   handlePaymentWebhook,
+  getPayPalConfig,
   // Legacy payment log functions
   createPaymentLog,
   updatePaymentLog,
@@ -34,6 +35,9 @@ router.get("/status/:userId", auth_key_header, auth_token, getPaymentStatus);
 
 // Handle Stripe webhooks (NO AUTH - Stripe sends this)
 router.post("/webhook", auth_key_header, auth_token, handlePaymentWebhook);
+
+// Get PayPal Client ID (public, no auth needed)
+router.get("/paypal-config", getPayPalConfig);
 
 // ============================================
 // LEGACY PAYMENT LOG ENDPOINTS
