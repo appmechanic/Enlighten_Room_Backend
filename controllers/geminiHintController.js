@@ -1,4 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import ClassworkModel from '../models/ClassworkModel.js';
+import { getExpiryState, getQuestionAiExpirySeconds } from '../utils/classworkExpiry.js';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -6,13 +8,35 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
  * POST /api/gemini-hint
  * Body: { prompt: string, image: string (base64), studentName?: string }
  * Returns: { hint: string }
- */
+ */ 
 const getGeminiHint = async (req, res) => {
   try {
 
-    const { prompt, image, studentName } = req.body;
+    const { prompt, image, studentName, questionId, roomId, classworkId } = req.body;
     if (!prompt && !image) {
       return res.status(400).json({ error: 'Either prompt or image is required.' });
+    }
+
+    if (!questionId || !roomId) {
+      return res.status(400).json({ error: 'questionId and roomId are required.' });
+    }
+
+    const lookup = classworkId
+      ? { _id: classworkId, id: questionId, roomId }
+      : { id: questionId, roomId };
+    const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
+
+    if (!question) {
+      return res.status(404).json({ error: 'Question not found for this room.' });
+    }
+
+    if (question.aiAllowed === false) {
+      return res.status(403).json({ error: 'AI hints are disabled for this question.' });
+    }
+
+    const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
+    if (aiExpiryState.isExpired) {
+      return res.status(403).json({ error: 'AI hint time expired for this question.' });
     }
 
     const systemInstruction = `

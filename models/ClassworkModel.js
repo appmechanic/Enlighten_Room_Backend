@@ -8,7 +8,7 @@ const SubmittedSchema = new mongoose.Schema({
   aiScore: { type: Number, default: 0 },
   aiUsed: { type: String, default: '0x' },
   feedback: { type: String, default: '' },
-});
+}); 
 
 const ClassworkSchema = new mongoose.Schema({
   id: { type: String, required: true },
@@ -24,6 +24,8 @@ const ClassworkSchema = new mongoose.Schema({
   correctAnswer: { type: mongoose.Schema.Types.Mixed },
   image: { type: String }, // URL of the question image (optional)
   expiryTime: { type: Number, default: 30 },
+  aiAllowed: { type: Boolean, default: true },
+  aiExpiryTime: { type: Number, default: 30 },
   createdAt: { type: Date, default: Date.now },
   submitted: { type: [SubmittedSchema], default: [] },
 });

@@ -2,6 +2,7 @@ import { Parser as Json2csvParser } from 'json2csv';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import ClassworkModel from '../models/ClassworkModel.js';
 import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
+import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
 
@@ -328,19 +329,18 @@ export const addQuestion = async (req, res) => {
   try {
     const question  = JSON.parse(req.body.question);
     const roomId = req.body.roomId;
+    const resolvedAiAllowed = question?.aiAllowed !== false;
+    const resolvedAiExpiryTime = question?.aiExpiryTime ?? question?.expiryTime;
     console.log('[AddQuestion] Incoming payload:', {
       id: question?.id,
       roomId,
       expiryTime: question?.expiryTime,
+      aiAllowed: resolvedAiAllowed,
+      aiExpiryTime: resolvedAiExpiryTime,
       receivedAt: new Date().toISOString()
     });
-    // Validate expiryTime if present
     if (question && question.expiryTime !== undefined) {
-      if (
-        typeof question.expiryTime !== 'number' ||
-        !Number.isFinite(question.expiryTime) ||
-        question.expiryTime <= 0
-      ) {
+      if (!isValidExpirySeconds(question.expiryTime)) {
         console.warn('[AddQuestion] Invalid expiryTime:', question.expiryTime);
         return res.status(400).json({ message: 'Invalid expiryTime. It must be a positive number of seconds.' });
       }
@@ -356,7 +356,35 @@ export const addQuestion = async (req, res) => {
         unit: 'seconds'
       });
     }
-    const newQuestion = await ClassworkModel.create({ ...question, roomId });
+    if (resolvedAiAllowed && resolvedAiExpiryTime !== undefined && !isValidExpirySeconds(resolvedAiExpiryTime)) {
+      console.warn('[AddQuestion] Invalid aiExpiryTime:', resolvedAiExpiryTime);
+      return res.status(400).json({ message: 'Invalid aiExpiryTime. It must be a positive number of seconds.' });
+    }
+
+    if (resolvedAiAllowed && resolvedAiExpiryTime !== undefined) {
+      console.log('[AddQuestion] AI expiry provided by client or inherited from question expiry.', {
+        questionId: question?.id,
+        aiExpiryTime: resolvedAiExpiryTime,
+        unit: 'seconds'
+      });
+    } else if (!resolvedAiAllowed) {
+      console.log('[AddQuestion] AI hints/check disabled for this question.', {
+        questionId: question?.id,
+      });
+    } else {
+      console.log('[AddQuestion] No aiExpiryTime provided. Schema default will be used.', {
+        questionId: question?.id,
+        schemaDefaultAiExpiryTime: 30,
+        unit: 'seconds'
+      });
+    }
+
+    const newQuestion = await ClassworkModel.create({
+      ...question,
+      roomId,
+      aiAllowed: resolvedAiAllowed,
+      aiExpiryTime: resolvedAiAllowed ? resolvedAiExpiryTime : question?.expiryTime,
+    });
     if (req.file){
       newQuestion.image = req.file.location;
     }
@@ -365,11 +393,17 @@ export const addQuestion = async (req, res) => {
     const expiresAt = Number.isFinite(createdAtTime)
       ? new Date(createdAtTime + (newQuestion.expiryTime * 1000)).toISOString()
       : null;
+    const aiExpiresAt = Number.isFinite(createdAtTime)
+      ? new Date(createdAtTime + (newQuestion.aiExpiryTime * 1000)).toISOString()
+      : null;
     console.log('[AddQuestion] Question created:', {
       id: newQuestion.id,
       createdAt: newQuestion.createdAt,
       expiryTime: newQuestion.expiryTime,
+      aiAllowed: newQuestion.aiAllowed,
+      aiExpiryTime: newQuestion.aiExpiryTime,
       expiresAt,
+      aiExpiresAt,
       roomId: newQuestion.roomId,
       image: newQuestion.image,
       now: new Date().toISOString()
@@ -390,15 +424,7 @@ export const submitAnswer = async (req, res) => {
     const { id , questionId, studentId, studentName, answer, roomId, aiUsed } = req.body;
     const lookup = roomId ? { _id: id,  id: questionId, roomId } : { id: questionId };
     const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
-    console.log('[SubmitAnswer] Attempt:', {
-      questionId,
-      roomId,
-      studentId,
-      lookup,
-      now: new Date().toISOString(),
-      questionCreatedAt: question ? question.createdAt : null,
-      matchedQuestionRoomId: question ? question.roomId : null
-    });
+    
     if (!question) {
       return res.status(404).json({
         message: roomId ? 'Question not found for this room' : 'Question not found'
@@ -407,47 +433,43 @@ export const submitAnswer = async (req, res) => {
     if (!question.roomId && roomId) question.roomId = roomId;
 
     // Check if question has expired
-    if (question.expiryTime && question.createdAt) {
-      const now = Date.now();
-      const createdAtTime = new Date(question.createdAt).getTime();
-      const elapsed = (now - createdAtTime) / 1000;
-      const expiresAt = new Date(createdAtTime + (question.expiryTime * 1000)).toISOString();
-      console.log('[Expiry Debug]', {
-        now: new Date(now).toISOString(),
-        createdAt: question.createdAt,
-        createdAtTime,
-        expiryTime: question.expiryTime,
-        expiresAt,
-        elapsed,
-        expiryExceeded: elapsed > question.expiryTime
-      });
-      if (elapsed > question.expiryTime) {
+    const answerExpiryState = getExpiryState(question.createdAt, getQuestionExpirySeconds(question));
+    if (answerExpiryState.isExpired) {
         return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
-      }
     }
 
     // Get AI-based score, feedback, and correctness
     let aiScore = 0;
     let feedback = '';
     let isCorrect = false;
+    let aiExpired = false;
+    const aiAllowed = question.aiAllowed !== false;
     const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
       roomId: question.roomId || roomId,
       questionId: question.id || questionId,
       studentId,
     });
-    try {
-      const aiResult = await getGeminiScoreAndFeedback(
-        question.question,
-        normalizedAnswer,
-        question.image,
-        question.correctAnswer,
-        question.format
-      );
-      aiScore = aiResult.aiScore;
-      feedback = aiResult.feedback;
-      isCorrect = aiResult.isCorrect;
-    } catch (aiErr) {
-      console.error('AI scoring failed:', aiErr);
+    const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
+    if (!aiAllowed) {
+      feedback = 'AI hints and checking are disabled for this question.';
+    } else if (aiExpiryState.isExpired) {
+      aiExpired = true;
+      feedback = 'AI evaluation time expired for this question.';
+    } else {
+      try {
+        const aiResult = await getGeminiScoreAndFeedback(
+          question.question,
+          normalizedAnswer,
+          question.image,
+          question.correctAnswer,
+          question.format
+        );
+        aiScore = aiResult.aiScore;
+        feedback = aiResult.feedback;
+        isCorrect = aiResult.isCorrect;
+      } catch (aiErr) {
+        console.error('AI scoring failed:', aiErr);
+      }
     }
 
     // Check if student already submitted an answer
@@ -471,6 +493,8 @@ export const submitAnswer = async (req, res) => {
       message: 'Answer submitted',
       isCorrect,
       aiScore,
+      aiAllowed,
+      aiExpired,
       feedback,
       correctAnswer: question.correctAnswer,
       data: question.submitted
@@ -528,6 +552,8 @@ export const viewAllAnswers = async (req, res) => {
         title: q.title,
         question: q.question,
         format: q.format || q.formatLabel || '',
+        aiAllowed: q.aiAllowed !== false,
+        aiExpiryTime: q.aiExpiryTime,
         totalStudents: 0,
         correctAnswer: q.correctAnswer,
         submitted,
