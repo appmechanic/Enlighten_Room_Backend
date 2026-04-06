@@ -107,12 +107,29 @@ async function uploadAnswerImageToSpaces({ roomId, questionId, studentId, imageD
 }
 
 async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
+  console.log('[normalizeSubmittedAnswer] Received answer payload:', {
+    format,
+    roomId: metadata.roomId,
+    questionId: metadata.questionId,
+    studentId: metadata.studentId,
+    answerType: Array.isArray(answer) ? 'array' : typeof answer,
+    hasImageData: Boolean(answer && typeof answer === 'object' && answer.imageData),
+    hasImageUrl: Boolean(answer && typeof answer === 'object' && answer.imageUrl),
+    hasText: Boolean(
+      typeof answer === 'string'
+        ? answer.trim()
+        : answer && typeof answer === 'object' && typeof answer.text === 'string' && answer.text.trim()
+    ),
+  });
+
   if (format !== 'handwriting') {
+    console.log('[normalizeSubmittedAnswer] Non-handwriting answer kept as-is.');
     return answer;
   }
 
   if (typeof answer === 'string') {
     if (!/^data:image\//i.test(answer)) {
+      console.log('[normalizeSubmittedAnswer] Handwriting answer received as plain text.');
       return answer;
     }
 
@@ -123,6 +140,12 @@ async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
       imageData: answer,
     });
 
+    console.log('[normalizeSubmittedAnswer] Uploaded handwriting base64 image to Spaces.', {
+      questionId: metadata.questionId,
+      studentId: metadata.studentId,
+      imageUrl,
+    });
+
     return {
       type: 'image',
       imageUrl,
@@ -131,6 +154,7 @@ async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
   }
 
   if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
+    console.log('[normalizeSubmittedAnswer] Unsupported handwriting payload returned unchanged.');
     return answer;
   }
 
@@ -144,12 +168,23 @@ async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
       })
     : null;
 
-  return {
+  const normalizedAnswer = {
     ...answer,
-    type: 'image',
+    type: uploadedImageUrl || answer.imageUrl ? 'image' : answer.type || 'text',
     imageUrl: uploadedImageUrl || answer.imageUrl || '',
-    text: answer.text || 'Handwritten answer submitted as image.',
+    text: answer.text || (uploadedImageUrl || answer.imageUrl ? 'Handwritten answer submitted as image.' : ''),
   };
+
+  console.log('[normalizeSubmittedAnswer] Normalized handwriting payload.', {
+    questionId: metadata.questionId,
+    studentId: metadata.studentId,
+    usedUploadedImage: Boolean(uploadedImageUrl),
+    usedExistingImageUrl: Boolean(answer.imageUrl),
+    retainedText: Boolean(normalizedAnswer.text),
+    finalType: normalizedAnswer.type,
+  });
+
+  return normalizedAnswer;
 }
 
 function getSubmittedAnswerImage(answer) {

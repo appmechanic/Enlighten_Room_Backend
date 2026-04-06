@@ -49,10 +49,7 @@ function getAnswerImageSource(answer) {
   }
 
   if (typeof answer === "object") {
-    if (typeof answer.imageData === "string" && answer.imageData.trim()) {
-      return answer.imageData;
-    }
-
+    console.log("[Gemini AI] Inspecting answer object for image source.", answer);    
     if (typeof answer.imageUrl === "string" && answer.imageUrl.trim()) {
       return answer.imageUrl;
     }
@@ -81,6 +78,7 @@ async function sourceToInlineData(source) {
  * Convert URL → base64
  */
 async function urlToBase64(url) {
+  console.log("[Gemini AI] Fetching remote image for evaluation:", url);
   const response = await fetch(url);
   const buffer = await response.arrayBuffer();
 
@@ -128,6 +126,16 @@ Format:
     const normalizedAnswerText = normalizeAnswerText(answer);
     const answerImageSource = getAnswerImageSource(answer);
     const referenceAnswer = normalizeAnswerText(correctAnswer);
+    const gradingMode = answerImageSource ? "image" : "text";
+
+    console.log("[Gemini AI] Starting grading", {
+      format,
+      gradingMode,
+      hasQuestionImage: Boolean(image),
+      hasStudentAnswerImage: Boolean(answerImageSource),
+      hasReferenceAnswer: Boolean(referenceAnswer),
+      answerPreview: normalizedAnswerText?.slice(0, 160) || "",
+    });
 
     const prompt = [
       `Question: ${question}`,
@@ -143,6 +151,7 @@ Format:
     let parts = [];
 
     if (image) {
+      console.log("[Gemini AI] Attaching question image for grading.");
       const imageData = await sourceToInlineData(image);
 
       if (imageData) {
@@ -157,6 +166,10 @@ Format:
     }
 
     if (answerImageSource) {
+      console.log("[Gemini AI] Grading against student answer image.", {
+        sourceType: answerImageSource.startsWith("data:image/") ? "base64" : "url",
+      });
+
       const answerImageData = await sourceToInlineData(answerImageSource);
 
       if (answerImageData) {
@@ -168,10 +181,17 @@ Format:
           },
         });
       }
+    } else {
+      console.log("[Gemini AI] Grading against student answer text only.");
     }
 
     parts.push({
       text: prompt,
+    });
+
+    console.log("[Gemini AI] Prompt prepared.", {
+      partsCount: parts.length,
+      prompt,
     });
 
     const result = await model.generateContent({
@@ -199,6 +219,15 @@ Format:
       if (score < 0) score = 0;
       if (score > 10) score = 10;
 
+      console.log("[Gemini AI] Parsed grading result.", {
+        aiScore: score,
+        isCorrect:
+          typeof json.isCorrect === "boolean"
+            ? json.isCorrect
+            : String(json.isCorrect).toLowerCase() === "true",
+        hasFeedback: Boolean(json.feedback),
+      });
+
       return {
         aiScore: score,
         feedback: json.feedback || "",
@@ -215,7 +244,7 @@ Format:
       isCorrect: false,
     };
   } catch (err) {
-    console.error("Gemini AI scoring error:", err);
+    console.error("[Gemini AI] Scoring error:", err);
 
     return {
       aiScore: 0,
