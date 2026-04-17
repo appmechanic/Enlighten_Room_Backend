@@ -33,11 +33,13 @@ const planSchema = new mongoose.Schema(
     stripeProductId: { type: String },
     stripePriceMonthly: { type: String },
     stripePriceYearly: { type: String },
-    
-    // PayPal product and billing plan IDs
+
+    // PayPal product and billing plan IDs (for Stripe-like parity)
     paypalProductId: { type: String },
-    paypalBillingPlanMonthly: { type: String },
-    paypalBillingPlanYearly: { type: String },
+    paypalPriceMonthly: { type: String }, // PayPal price ID for monthly
+    paypalPriceYearly: { type: String },  // PayPal price ID for yearly
+    paypalBillingPlanMonthly: { type: String }, // legacy, for compatibility
+    paypalBillingPlanYearly: { type: String },  // legacy, for compatibility
 
     features: [
       {

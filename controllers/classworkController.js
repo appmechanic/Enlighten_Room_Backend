@@ -1,10 +1,13 @@
 import { Parser as Json2csvParser } from 'json2csv';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import ClassworkModel from '../models/ClassworkModel.js';
 import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
@@ -569,5 +572,120 @@ export const getQuestions = async (req, res) => {
     res.status(200).json(questions);
   } catch (err) {
     res.status(500).json({ message: 'Error fetching questions', error: err.message });
+  }
+};
+
+// Save AI Hint Usage (before final answer submission)
+export const saveAiHintUsage = async (req, res) => {
+  try {
+    const { questionId, roomId, studentId, studentName, currentAnswer, image } = req.body;
+
+    if (!questionId || !roomId || !studentId) {
+      return res.status(400).json({ message: 'questionId, roomId, and studentId are required.' });
+    }
+
+    if (!currentAnswer && !image) {
+      return res.status(400).json({ message: 'Either currentAnswer or image is required.' });
+    }
+
+    // Find the question
+    const question = await ClassworkModel.findOne({ id: questionId, roomId }).sort({ createdAt: -1 });
+
+    if (!question) {
+      return res.status(404).json({ message: 'Question not found for this room.' });
+    }
+
+    // Check if AI is allowed
+    if (question.aiAllowed === false) {
+      return res.status(403).json({ message: 'AI hints are disabled for this question.' });
+    }
+
+    // Check if AI hint time has expired
+    const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
+    if (aiExpiryState.isExpired) {
+      return res.status(403).json({ message: 'AI hint time expired for this question.' });
+    }
+
+    // Generate AI hint using Gemini
+    const systemInstruction = `
+      You are a warm, patient, and encouraging tutor (like a caring parent)
+      who reads a student's classwork attempt and provides short, supportive,
+      and educational guidance.
+
+      Rules:
+      - Start advice with the student's name if provided
+      - Never give final answers unless the student has failed 3 times
+      - Be concise, child-friendly, and encouraging
+      - Provide hints to guide the student to the correct answer
+    `;
+
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      systemInstruction,
+    });
+
+    let inputArr = [];
+    if (image) {
+      const base64Image = image.includes(',') ? image.split(',')[1] : image;
+      inputArr.push({
+        inlineData: {
+          data: base64Image,
+          mimeType: 'image/jpeg',
+        },
+      });
+    }
+    
+    const questionText = `Question: ${question.question}`;
+    const answerText = currentAnswer ? `Student's current answer: ${typeof currentAnswer === 'string' ? currentAnswer : JSON.stringify(currentAnswer)}` : '';
+    const promptText = studentName 
+      ? `${studentName}: ${questionText}. ${answerText}` 
+      : `${questionText}. ${answerText}`;
+
+    inputArr.push(promptText);
+
+    const result = await model.generateContent(inputArr);
+    const hint = (result.response && result.response.text && result.response.text()) || 'No hint available';
+
+    // Find or create submission for this student
+    const existingSubmissionIndex = question.submitted.findIndex(
+      (s) => s.studentId === studentId
+    );
+
+    if (existingSubmissionIndex !== -1) {
+      // Update existing submission
+      const submission = question.submitted[existingSubmissionIndex];
+      
+      // Add current answer to preSubmitAnswers if it's different
+      if (currentAnswer && JSON.stringify(submission.answer) !== JSON.stringify(currentAnswer)) {
+        submission.preSubmitAnswers.push(currentAnswer);
+      }
+      
+      // Add hint to aiHintsUsed
+      submission.aiHintsUsed.push(hint);
+    } else {
+      // Create new submission with pre-submit data
+      question.submitted.push({
+        studentId,
+        studentName: studentName || 'Unknown',
+        answer: currentAnswer || '',
+        isCorrect: false,
+        aiScore: 0,
+        aiUsed: '0x',
+        feedback: '',
+        preSubmitAnswers: currentAnswer ? [currentAnswer] : [],
+        aiHintsUsed: [hint],
+      });
+    }
+
+    await question.save();
+
+    res.status(200).json({
+      message: 'AI hint saved',
+      hint,
+      aiExpiryState,
+    });
+  } catch (err) {
+    console.error('Error in saveAiHintUsage:', err);
+    res.status(500).json({ message: 'Error generating AI hint', error: err.message });
   }
 };

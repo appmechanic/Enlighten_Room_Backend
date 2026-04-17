@@ -4,6 +4,7 @@ import {
   capturePayPalOrder,
   initializePayPalPricing,
   initializePlanPayPalPricing,
+  syncStripePlansToPayPal
 } from '../controllers/paypalController.js';
 import auth_key_header from '../middleware/auth_key_header.js';
 import auth_token from '../middleware/auth_token.js';
@@ -22,5 +23,5 @@ router.post('/init-pricing', auth_key_header, auth_token, auth_admin, initialize
 
 // Initialize PayPal pricing for a specific plan (admin only)
 router.post('/init-plan/:planId', auth_key_header, auth_token, auth_admin, initializePlanPayPalPricing);
-
+router.get('/paypal/sync-plans', syncStripePlansToPayPal); // TEMP: allow GET for testing
 export default router;

@@ -334,7 +334,7 @@ export const createPaymentIntent = async (req, res) => {
           coupon: appDiscount.code,
         },
       ];
-    }
+    } 
 
     // Create Stripe checkout session
     const session = await stripe.checkout.sessions.create(sessionConfig);

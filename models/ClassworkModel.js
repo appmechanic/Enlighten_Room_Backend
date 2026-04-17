@@ -8,6 +8,8 @@ const SubmittedSchema = new mongoose.Schema({
   aiScore: { type: Number, default: 0 },
   aiUsed: { type: String, default: '0x' },
   feedback: { type: String, default: '' },
+  preSubmitAnswers: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  aiHintsUsed: { type: [String], default: [] },
 }); 
 
 const ClassworkSchema = new mongoose.Schema({

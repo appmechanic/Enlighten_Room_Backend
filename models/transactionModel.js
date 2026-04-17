@@ -25,7 +25,8 @@ const transactionSchema = new mongoose.Schema(
     // Optional linkage to the buyer in your system (if you have one)
     customerUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
 
-    // Stripe details
+
+    // Stripe details (optional)
     stripe: {
       customerId: String,
       customerEmail: String,
@@ -54,6 +55,31 @@ const transactionSchema = new mongoose.Schema(
 
       // optional: de-dup webhook retries
       eventId: { type: String, index: true, sparse: true, unique: true }, // evt_...
+    },
+
+    // PayPal details (optional)
+    paypal: {
+      payerId: String,
+      payerEmail: String,
+
+      // identifiers
+      orderId: String, // PayPal order ID
+      subscriptionId: String, // PayPal subscription ID
+      captureId: String, // PayPal capture ID (for one-time payments)
+      productId: String, // PayPal product ID
+      planId: String, // PayPal plan ID
+
+      // plan/price info
+      planName: String, // product/plan name
+      interval: String, // day | week | month | year
+      intervalCount: Number, // e.g. 1, 12
+
+      // subscription period
+      periodStart: Date,
+      periodEnd: Date,
+
+      // optional: webhook event id
+      eventId: { type: String, index: true, sparse: true, unique: true },
     },
 
     planType: {

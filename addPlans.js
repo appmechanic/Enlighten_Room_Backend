@@ -18,6 +18,11 @@ const plans = [
       maxStudentsPerClass: 2,
     },
     priceText: 'Free',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
   {
     category: 'Individual',
@@ -34,6 +39,11 @@ const plans = [
       maxStudentsPerClass: 2,
     },
     priceText: 'US$13.9 / month • US$149.9 / year',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
   {
     category: 'Individual',
@@ -50,6 +60,11 @@ const plans = [
       maxStudentsPerClass: 4,
     },
     priceText: 'US$19.9 / month • US$219.9 / year',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
   {
     category: 'Individual',
@@ -66,6 +81,11 @@ const plans = [
       maxStudentsPerClass: 20,
     },
     priceText: 'US$29.9 / month • US$329.9 / year',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
   // School Plans
   {
@@ -83,6 +103,11 @@ const plans = [
       maxStudentsPerClass: 25,
     },
     priceText: 'US$124.9 / month • US$1,349.9 / year',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
   {
     category: 'School',
@@ -99,6 +124,11 @@ const plans = [
       maxStudentsPerClass: 30,
     },
     priceText: 'US$179.9 / month • US$1,999.9 / year',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
   {
     category: 'School',
@@ -115,6 +145,11 @@ const plans = [
       maxStudentsPerClass: 40,
     },
     priceText: 'US$254.9 / month • US$2,929.9 / year',
+    paypalProductId: '',
+    paypalPriceMonthly: '',
+    paypalPriceYearly: '',
+    paypalBillingPlanMonthly: '',
+    paypalBillingPlanYearly: '',
   },
 ];
 

@@ -1,16 +1,82 @@
+/**
+ * Sync Stripe-like plans to PayPal
+ * POST /api/paypal/sync-plans
+ * Admin only
+ *
+ * For each active plan, create PayPal product and billing plans if missing,
+ * save PayPal IDs to the plan, and return all plans with PayPal IDs.
+ */
+export const syncStripePlansToPayPal = async (req, res) => {
+  try {
+    const plans = await Plan.find({ status: 'active' });
+    if (!plans.length) {
+      return res.status(200).json({ success: true, message: 'No active plans found', plans: [] });
+    }
+
+    const results = [];
+    for (const plan of plans) {
+      try {
+        // Create PayPal product if missing
+        let updated = false;
+        if (!plan.paypalProductId) {
+          plan.paypalProductId = await getOrCreatePayPalProduct(plan);
+          updated = true;
+        }
+        // Create PayPal monthly billing plan if missing
+        if (!plan.paypalPriceMonthly) {
+          plan.paypalPriceMonthly = await getOrCreatePayPalBillingPlan(plan, 'monthly');
+          plan.paypalBillingPlanMonthly = plan.paypalPriceMonthly;
+          updated = true;
+        }
+        // Create PayPal yearly billing plan if missing
+        if (!plan.paypalPriceYearly) {
+          plan.paypalPriceYearly = await getOrCreatePayPalBillingPlan(plan, 'yearly');
+          plan.paypalBillingPlanYearly = plan.paypalPriceYearly;
+          updated = true;
+        }
+        if (updated) await plan.save();
+        results.push({
+          _id: plan._id,
+          name: plan.name,
+          priceMonthly: plan.priceMonthly,
+          priceYearly: plan.priceYearly,
+          paypalProductId: plan.paypalProductId,
+          paypalPriceMonthly: plan.paypalPriceMonthly,
+          paypalPriceYearly: plan.paypalPriceYearly,
+        });
+      } catch (err) {
+        results.push({
+          _id: plan._id,
+          name: plan.name,
+          error: err.message,
+        });
+      }
+    }
+    return res.status(200).json({ success: true, plans: results });
+  } catch (err) {
+    console.error('PayPal sync plans error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
 import { paypalClient } from '../config/paypal.js';
+import * as paypal from '@paypal/checkout-server-sdk';// Initialize PayPal REST SDK (ensure config/paypal.js exports credentials)
+
 import User from '../models/user.js';
 import Plan from '../models/PlanModel.js';
 import Subscription from '../models/SubscriptionModel.js';
 import Coupon from '../models/couponModel.js';
 import Transaction from '../models/transactionModel.js';
-
 // Helper: Get base price in dollars for a plan
 function getPlanBaseDollars(planDoc, interval) {
   if (!planDoc) return 0;
   return interval === 'yearly'
     ? planDoc.priceYearly || planDoc.priceMonthly || 0
     : planDoc.priceMonthly || 0;
+}
+function discountedCentsFromDollars(baseDollars, discountPercent) {
+  const discountFraction = clampPct(discountPercent) / 100;
+  const discountedDollars = baseDollars * (1 - discountFraction);
+  return Math.round(discountedDollars * 100);
 }
 
 // Helper: Clamp percentage to max 100%
@@ -19,122 +85,148 @@ function clampPct(percent) {
 }
 
 // Helper: Create PayPal Product if not exists
-async function getOrCreatePayPalProduct(plan) {
-  try {
-    // Check if product ID already exists in plan
-    if (plan.paypalProductId) {
-      return plan.paypalProductId;
+
+// utils/paypalAuth.js
+import axios from 'axios';
+
+export async function generateAccessToken() {
+  const auth = Buffer.from(
+    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
+  ).toString('base64');
+
+  const response = await axios.post(
+    'https://api-m.sandbox.paypal.com/v1/oauth2/token',
+    'grant_type=client_credentials',
+    {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
     }
+  );
 
-    const PayPalProductsSDK = (await import('@paypal/checkout-server-sdk')).default;
-    const client = paypalClient();
+  return response.data.access_token;
+}
+async function getOrCreatePayPalProduct(plan) {
+  const accessToken = await generateAccessToken(); // you must implement this
 
-    // Create product
-    const createProductRequest = new PayPalProductsSDK.catalog.ProductCreateRequest();
-    createProductRequest.requestBody({
+  const response = await axios.post(
+    'https://api-m.sandbox.paypal.com/v1/catalogs/products',
+    {
       name: plan.name,
-      description: plan.name + ' subscription plan',
+      description: `${plan.name} subscription plan`,
       type: 'SERVICE',
       category: 'SOFTWARE',
-    });
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+  const productId = response.data.id; // ✅ IMPORTANT
 
-    const productResponse = await client.execute(createProductRequest);
-    const productId = productResponse.result.id;
+  plan.paypalProductId = productId;
+  await plan.save();
 
-    // Save product ID to plan
-    plan.paypalProductId = productId;
-    await plan.save();
-
-    console.log(`Created PayPal product ${productId} for plan ${plan.name}`);
-    return productId;
-  } catch (err) {
-    console.error('Error creating PayPal product:', err);
-    throw err;
-  }
+  return productId;
 }
 
-// Helper: Create PayPal Billing Plan if not exists
-async function getOrCreatePayPalBillingPlan(plan, interval) {
+
+export async function getOrCreatePayPalBillingPlan(plan, interval) {
   try {
-    const planKey = interval === 'yearly' ? 'paypalBillingPlanYearly' : 'paypalBillingPlanMonthly';
-    
-    if (plan[planKey]) {
-      return plan[planKey];
+    if (plan.paypalPlans?.[interval]) {
+      return plan.paypalPlans[interval];
     }
 
-    const PayPalBillingSDK = (await import('@paypal/checkout-server-sdk')).default;
-    const client = paypalClient();
-
-    // First ensure product exists
+    const accessToken = await generateAccessToken();
     const productId = await getOrCreatePayPalProduct(plan);
 
-    const baseDollars = getPlanBaseDollars(plan, interval);
-    const billingCycles = interval === 'yearly' ? 1 : 1;
-    const tenureType = interval === 'yearly' ? 'REGULAR' : 'REGULAR';
+    const price = interval === 'yearly'
+      ? plan.priceYearly
+      : plan.priceMonthly;
 
-    // Create billing plan
-    const createBillingPlanRequest = new PayPalBillingSDK.billing.PlanCreateRequest();
-    createBillingPlanRequest.requestBody({
-      product_id: productId,
-      name: `${plan.name} - ${interval.toUpperCase()}`,
-      description: `${plan.name} subscription (${interval} billing)`,
-      status: 'ACTIVE',
-      billing_cycles: [
-        {
-          frequency: {
-            interval_unit: interval === 'yearly' ? 'YEAR' : 'MONTH',
-            interval_count: 1,
-          },
-          tenure_type: tenureType,
-          sequence: 1,
-          total_cycles: 0, // 0 = infinite
-          pricing_scheme: {
-            fixed_price: {
-              currency_code: 'USD',
-              value: String(baseDollars.toFixed(2)),
+    const response = await axios.post(
+      'https://api-m.sandbox.paypal.com/v1/billing/plans',
+      {
+        product_id: productId,
+        name: `${plan.name} - ${interval}`,
+        billing_cycles: [
+          {
+            frequency: {
+              interval_unit: interval === 'yearly' ? 'YEAR' : 'MONTH',
+              interval_count: 1,
+            },
+            tenure_type: 'REGULAR',
+            sequence: 1,
+            total_cycles: 0,
+            pricing_scheme: {
+              fixed_price: {
+                value: price.toFixed(2),
+                currency_code: 'USD',
+              },
             },
           },
+        ],
+        payment_preferences: {
+          auto_bill_outstanding: true,
+          setup_fee_failure_action: 'CONTINUE',
+          payment_failure_threshold: 3,
         },
-      ],
-      payment_preferences: {
-        auto_bill_amount: 'YES',
-        payment_failure_threshold: 3,
-        setup_fee_failure_action: 'CANCEL',
       },
-    });
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
 
-    const billingPlanResponse = await client.execute(createBillingPlanRequest);
-    const billingPlanId = billingPlanResponse.result.id;
+    const billingPlanId = response.data.id;
 
-    // Save billing plan ID to plan
-    plan[planKey] = billingPlanId;
+    if (!plan.paypalPlans) plan.paypalPlans = {};
+    plan.paypalPlans[interval] = billingPlanId;
+
     await plan.save();
 
-    console.log(`Created PayPal billing plan ${billingPlanId} for ${plan.name} (${interval})`);
+    console.log(`✅ Created PayPal billing plan: ${billingPlanId}`);
+
     return billingPlanId;
   } catch (err) {
-    console.error('Error creating PayPal billing plan:', err);
+    console.error('❌ Error creating billing plan:', err.response?.data || err);
     throw err;
   }
 }
-
 // Create PayPal order
+
 export const createPayPalOrder = async (req, res) => {
   try {
-    const { userId, planId, interval = 'monthly', currency = 'USD', couponCode, customer } = req.body;
-    
+    const {
+      userId,
+      planId,
+      interval = 'monthly',
+      currency = 'USD',
+      couponCode,
+      customer
+    } = req.body;
+
     const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
-    
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
     const plan = await Plan.findById(planId);
-    if (!plan) return res.status(404).json({ success: false, error: 'Plan not found' });
-    
+    if (!plan) {
+      return res.status(404).json({ success: false, error: 'Plan not found' });
+    }
+
     const baseDollars = getPlanBaseDollars(plan, interval);
     if (!baseDollars || baseDollars <= 0) {
       return res.status(400).json({ success: false, error: 'Invalid plan price' });
     }
 
-    // Handle coupon discount
+    // Coupon
     let discountPercent = 0;
     if (couponCode) {
       const coupon = await Coupon.findOne({
@@ -142,26 +234,30 @@ export const createPayPalOrder = async (req, res) => {
         isActive: true,
         expiresAt: { $gt: new Date() },
       }).lean();
-      
+
       if (coupon && coupon.discountPercent > 0 && coupon.discountPercent <= 100) {
         discountPercent = coupon.discountPercent;
       }
     }
 
-    // Calculate final price in cents, then convert to dollars
+    // Final price
     const finalCents = discountedCentsFromDollars(baseDollars, discountPercent);
     const finalPrice = (finalCents / 100).toFixed(2);
 
-    // Create or get PayPal product and billing plan IDs
+    // ✅ Ensure these return STRINGS
     const productId = await getOrCreatePayPalProduct(plan);
     const billingPlanId = await getOrCreatePayPalBillingPlan(plan, interval);
 
-    // Create PayPal order
-    const PayPalOrdersSDK = (await import('@paypal/checkout-server-sdk')).default;
-    const request = new PayPalOrdersSDK.orders.OrderCreateRequest();
-    request.prefer('return=representation');
-    
-    request.requestBody({
+    // 🔍 Safety check (prevents your previous bug)
+    const safeProductId =
+      typeof productId === 'string' ? productId : productId?.id;
+
+    const safeBillingPlanId =
+      typeof billingPlanId === 'string' ? billingPlanId : billingPlanId?.id;
+
+    // Create PayPal order using REST API
+    const accessToken = await generateAccessToken();
+    const orderPayload = {
       intent: 'CAPTURE',
       payer: {
         name: {
@@ -194,7 +290,7 @@ export const createPayPalOrder = async (req, res) => {
               },
             },
           ],
-          custom_id: billingPlanId, // Link to billing plan
+          custom_id: safeBillingPlanId,
         },
       ],
       application_context: {
@@ -204,84 +300,120 @@ export const createPayPalOrder = async (req, res) => {
         return_url: `${process.env.FRONTEND_URL || 'http://localhost:5174'}/checkout?paypal=success`,
         cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:5174'}/checkout?paypal=cancel`,
       },
+    };
+
+    const orderResponse = await axios.post(
+      'https://api-m.sandbox.paypal.com/v2/checkout/orders',
+      orderPayload,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    const order = orderResponse.data;
+
+    return res.status(200).json({
+      success: true,
+      id: order.id,
+      status: order.status,
+      links: order.links,
+      billingPlanId: safeBillingPlanId,
+      productId: safeProductId,
     });
 
-    const client = paypalClient();
-    const order = await client.execute(request);
-    
-    return res.status(200).json({ 
-      success: true, 
-      id: order.result.id, 
-      status: order.result.status,
-      links: order.result.links,
-      billingPlanId, // Return billing plan ID for future reference
-    });
   } catch (err) {
-    console.error('PayPal order error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error('❌ PayPal order error:', err.response?.data || err);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 };
 
-// Capture PayPal order
+
 export const capturePayPalOrder = async (req, res) => {
   try {
     const { orderId, userId, planId, interval = 'monthly', couponCode } = req.body;
-    
+
     if (!orderId) {
-      return res.status(400).json({ success: false, error: 'Order ID is required' });
-    }
-
-    const PayPalOrdersSDK = (await import('@paypal/checkout-server-sdk')).default;
-    const request = new PayPalOrdersSDK.orders.OrderCaptureRequest(orderId);
-    request.requestBody({});
-    
-    const client = paypalClient();
-    const capture = await client.execute(request);
-
-    if (capture.result.status !== 'COMPLETED') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Payment not completed',
-        status: capture.result.status,
+      return res.status(400).json({
+        success: false,
+        error: 'Order ID is required',
       });
     }
 
-    // Create/update subscription in database
+    // Capture PayPal order using REST API
+    const accessToken = await generateAccessToken();
+    const captureResponse = await axios.post(
+      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`,
+      {},
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    const capture = captureResponse.data;
+
+    if (capture.status !== 'COMPLETED') {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment not completed',
+        status: capture.status,
+      });
+    }
+    console.log(capture, '✅ PayPal capture successful');
+
+    // DB logic (unchanged, just safer)
     if (userId && planId) {
       const user = await User.findById(userId);
+
       if (user) {
         const subscription = await Subscription.findOneAndUpdate(
           { userId },
           {
-            userId,
-            planId,
-            status: 'active',
-            billingInterval: interval,
-            paymentMethod: 'paypal',
-            paypalOrderId: orderId,
-            startDate: new Date(),
-            renewalDate: interval === 'yearly' 
-              ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
-              : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+            $set: {
+              userId,
+              planType: planId,
+              status: 'active',
+              frequency: interval,
+              currency: capture.purchase_units?.[0]?.amount?.currency_code || 'USD',
+              promoCode: couponCode || null,
+            },
           },
           { upsert: true, new: true }
         );
 
-        // Create transaction record
         const plan = await Plan.findById(planId);
-        const amount = interval === 'yearly' ? plan.priceYearly : plan.priceMonthly;
-        
+
+        const amount =
+          interval === 'yearly'
+            ? plan.priceYearly
+            : plan.priceMonthly;
+
+        // Find capture details
+        const purchaseUnit = capture.purchase_units?.[0];
+        const captureObj = purchaseUnit?.payments?.captures?.[0];
+
         await Transaction.create({
           userId,
           amount,
-          currency: 'USD',
+          planType: 'subscription',
+          teacherId: user._id,
+          currency: capture.purchase_units?.[0]?.amount?.currency_code || 'USD',
           status: 'success',
           method: 'paypal',
           provider: 'paypal',
           paypal: {
             orderId,
-            payerId: capture.result.payer?.payer_id,
-            amount: capture.result.purchase_units?.[0]?.amount?.value,
+            payerId: capture.payer?.payer_id,
+            amount: captureObj?.amount?.value,
+            captureId: captureObj?.id,
             created: new Date(),
           },
           planId,
@@ -290,14 +422,19 @@ export const capturePayPalOrder = async (req, res) => {
       }
     }
 
-    return res.status(200).json({ 
-      success: true, 
-      status: capture.result.status,
-      order: capture.result,
+    return res.status(200).json({
+      success: true,
+      status: capture.status,
+      order: capture,
     });
+
   } catch (err) {
-    console.error('PayPal capture error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error('❌ PayPal capture error:', err.response?.data || err);
+
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 };
 
@@ -372,27 +509,34 @@ export const initializePayPalPricing = async (req, res) => {
 export const initializePlanPayPalPricing = async (req, res) => {
   try {
     const { planId } = req.params;
-
     const plan = await Plan.findById(planId);
     if (!plan) {
       return res.status(404).json({ success: false, error: 'Plan not found' });
     }
-
     try {
+      // Create or get PayPal product and plans
       const productId = await getOrCreatePayPalProduct(plan);
       const monthlyPlanId = await getOrCreatePayPalBillingPlan(plan, 'monthly');
       const yearlyPlanId = await getOrCreatePayPalBillingPlan(plan, 'yearly');
 
-      return res.status(200).json({ 
-        success: true, 
+      // Save PayPal IDs to plan (Stripe-like)
+      plan.paypalProductId = productId;
+      plan.paypalPriceMonthly = monthlyPlanId;
+      plan.paypalPriceYearly = yearlyPlanId;
+      plan.paypalBillingPlanMonthly = monthlyPlanId; // for compatibility
+      plan.paypalBillingPlanYearly = yearlyPlanId;   // for compatibility
+      await plan.save();
+
+      return res.status(200).json({
+        success: true,
         message: `PayPal pricing initialized for ${plan.name}`,
         productId,
-        monthlyBillingPlanId: monthlyPlanId,
-        yearlyBillingPlanId: yearlyPlanId,
+        paypalPriceMonthly: monthlyPlanId,
+        paypalPriceYearly: yearlyPlanId,
       });
     } catch (err) {
-      return res.status(400).json({ 
-        success: false, 
+      return res.status(400).json({
+        success: false,
         error: err.message,
       });
     }
