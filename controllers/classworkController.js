@@ -537,6 +537,8 @@ export const viewAllAnswers = async (req, res) => {
           aiScore: s.aiScore || 0,
           aiUsed: s.aiUsed || '0x',
           feedback: s.feedback || '',
+          preSubmitAnswers: s.preSubmitAnswers || [],
+          
         };
       });
 
