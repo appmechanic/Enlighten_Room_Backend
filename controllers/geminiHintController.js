@@ -76,7 +76,7 @@ const getGeminiHint = async (req, res) => {
           await ClassworkModel.updateOne(
             { _id: question._id },
             { $push: { [updatePath]: { status: 'correct', interpretedAnswer, createdAt: new Date() } } }
-          );
+          ); 
         }
       }
       return res.json({ correct: true, message: 'Answer is correct! You can submit now.' });
