@@ -35,9 +35,9 @@ const getGeminiHint = async (req, res) => {
     }
 
     const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
-    if (aiExpiryState.isExpired) {
-      return res.status(403).json({ error: 'AI hint time expired for this question.' });
-    }
+    // if (aiExpiryState.isExpired) {
+    //   return res.status(403).json({ error: 'AI hint time expired for this question.' });
+    // }
 
     const systemInstruction = `
       You are a warm, patient, and encouraging tutor (like a caring parent)
