@@ -72,6 +72,22 @@ const getGeminiHint = async (req, res) => {
     const result = await model.generateContent(inputArr);
 
     const hint = (result.response && result.response.text && result.response.text()) || 'No answer';
+
+    // Save the AI hint to preSubmitAnswers for the student in the submitted array
+    if (studentName) {
+      // Find the submitted entry for this student
+      const submittedIndex = question.submitted.findIndex(
+        (s) => s.studentName === studentName
+      );
+      if (submittedIndex !== -1) {
+        // Update preSubmitAnswers for the student
+        const updatePath = `submitted.${submittedIndex}.preSubmitAnswers`;
+        await ClassworkModel.updateOne(
+          { _id: question._id },
+          { $push: { [updatePath]: { hint, createdAt: new Date() } } }
+        );
+      }
+    }
     return res.json({ hint });
   } catch (error) {
     console.error('Gemini hint error:', error);
