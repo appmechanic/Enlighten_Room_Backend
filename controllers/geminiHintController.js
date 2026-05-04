@@ -54,6 +54,7 @@ const getGeminiHint = async (req, res) => {
     let isCorrect = false;
     let interpretedAnswer = null;
 
+
     if (isImageAnswer) {
       // Answer is an image (handwriting) - use AI to interpret and evaluate
       const result = await evaluateHandwritingAnswer(studentAnswer, question, genAI);
@@ -64,22 +65,75 @@ const getGeminiHint = async (req, res) => {
       isCorrect = checkAnswerCorrectness(studentAnswer, question.correctAnswer, question.format);
     }
 
-    // If answer is correct, return success without generating a hint
+    // If answer is correct, auto-submit and generate a new advanced question
     if (isCorrect) {
-      // Save the AI usage to preSubmitAnswers
+      // Auto-submit the answer for the student
       if (studentName) {
-        const submittedIndex = question.submitted.findIndex(
+        // Find or create the student's submission
+        let submittedIndex = question.submitted.findIndex(
           (s) => s.studentName === studentName
         );
-        if (submittedIndex !== -1) {
+        if (submittedIndex === -1) {
+          // Add new submission if not found
+          question.submitted.push({
+            studentName,
+            answer: interpretedAnswer || studentAnswer,
+            isCorrect: true,
+            preSubmitAnswers: [{ status: 'correct', interpretedAnswer, createdAt: new Date() }],
+            createdAt: new Date(),
+          });
+          await question.save();
+        } else {
+          // Update existing submission
           const updatePath = `submitted.${submittedIndex}.preSubmitAnswers`;
           await ClassworkModel.updateOne(
             { _id: question._id },
-            { $push: { [updatePath]: { status: 'correct', interpretedAnswer, createdAt: new Date() } } }
-          ); 
+            {
+              $set: {
+                [`submitted.${submittedIndex}.answer`]: interpretedAnswer || studentAnswer,
+                [`submitted.${submittedIndex}.isCorrect`]: true,
+              },
+              $push: { [updatePath]: { status: 'correct', interpretedAnswer, createdAt: new Date() } },
+            }
+          );
         }
       }
-      return res.json({ correct: true, message: 'Answer is correct! You can submit now.' });
+
+      // Check if classwork is expired
+      const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
+      if (aiExpiryState.isExpired) {
+        return res.json({ correct: true, message: 'Classwork expired. No more questions.' });
+      }
+
+      // Generate a similar but more advanced question using AI
+      const systemInstruction = `
+        You are an expert teacher. Given the following question and answer, generate a new question that is similar in topic but more advanced in difficulty. The new question should challenge the student further and help them deepen their understanding. Only return the new question text, nothing else.
+      `;
+      const model = genAI.getGenerativeModel({
+        model: 'gemini-2.5-flash',
+        systemInstruction,
+      });
+      const prompt = `
+        Original question: ${question.question}
+        Correct answer: ${question.correctAnswer}
+        Please generate a new, more advanced question for the student on the same topic.
+      `;
+      let newQuestionText = '';
+      try {
+        const result = await model.generateContent([prompt]);
+        newQuestionText = (result.response && result.response.text && result.response.text()) || '';
+      } catch (err) {
+        console.error('Error generating advanced question:', err);
+        newQuestionText = '';
+      }
+
+      // Optionally, you could create a new ClassworkModel entry for the new question, or just return it to the student
+      return res.json({
+        correct: true,
+        message: 'Answer is correct! Here is a new, more advanced question.',
+        advancedQuestion: newQuestionText,
+        expired: false,
+      });
     }
 
     // Answer is incorrect - generate a personalized hint
