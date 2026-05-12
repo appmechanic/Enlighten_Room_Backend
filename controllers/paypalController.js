@@ -66,6 +66,8 @@ import Plan from '../models/PlanModel.js';
 import Subscription from '../models/SubscriptionModel.js';
 import Coupon from '../models/couponModel.js';
 import Transaction from '../models/transactionModel.js';
+import { cancelPreviousSubscription } from '../utils/cancelPreviousSubscription.js';
+import { sendSubscriptionConfirmationEmail } from '../utils/subscriptionEmails.js';
 // Helper: Get base price in dollars for a plan
 function getPlanBaseDollars(planDoc, interval) {
   if (!planDoc) return 0;
@@ -371,9 +373,26 @@ export const capturePayPalOrder = async (req, res) => {
 
     // DB logic (unchanged, just safer)
     if (userId && planId) {
+      // Idempotency: if we've already recorded a transaction for this PayPal
+      // order, don't create another one. StrictMode re-renders, double-clicks,
+      // or client retries can otherwise produce duplicate rows.
+      const existingTxn = await Transaction.findOne({ "paypal.orderId": orderId });
+      if (existingTxn) {
+        return res.status(200).json({
+          success: true,
+          status: capture.status,
+          order: capture,
+          duplicate: true,
+        });
+      }
+
       const user = await User.findById(userId);
 
       if (user) {
+        // Stop the user's previous active subscription with no refund
+        // before activating the new one.
+        await cancelPreviousSubscription(userId);
+
         const subscription = await Subscription.findOneAndUpdate(
           { userId },
           {
@@ -384,6 +403,13 @@ export const capturePayPalOrder = async (req, res) => {
               frequency: interval,
               currency: capture.purchase_units?.[0]?.amount?.currency_code || 'USD',
               promoCode: couponCode || null,
+              provider: 'paypal',
+              // One-time PayPal orders don't have a recurring subscription
+              // id, so leave providerSubscriptionId null. (Set it to the
+              // PayPal billing subscription id only if we switch to
+              // /v1/billing/subscriptions in the future.)
+              providerSubscriptionId: null,
+              cancelledAt: null,
             },
           },
           { upsert: true, new: true }
@@ -399,26 +425,50 @@ export const capturePayPalOrder = async (req, res) => {
         // Find capture details
         const purchaseUnit = capture.purchase_units?.[0];
         const captureObj = purchaseUnit?.payments?.captures?.[0];
+        const captureId = captureObj?.id;
+        const captureCurrency =
+          capture.purchase_units?.[0]?.amount?.currency_code || 'USD';
 
         await Transaction.create({
           userId,
           amount,
           planType: 'subscription',
           teacherId: user._id,
-          currency: capture.purchase_units?.[0]?.amount?.currency_code || 'USD',
+          currency: captureCurrency,
           status: 'success',
           method: 'paypal',
           provider: 'paypal',
           paypal: {
             orderId,
             payerId: capture.payer?.payer_id,
-            amount: captureObj?.amount?.value,
-            captureId: captureObj?.id,
-            created: new Date(),
+            payerEmail: capture.payer?.email_address,
+            captureId,
+            planId: plan?.paypalPlans?.[interval] || plan?.paypalProductId,
+            planName: plan?.name,
+            interval,
+            intervalCount: 1,
           },
           planId,
           subscriptionId: subscription._id,
         });
+
+        try {
+          await sendSubscriptionConfirmationEmail({
+            to: user.email,
+            name:
+              [user.firstName, user.lastName].filter(Boolean).join(' ') ||
+              user.userName ||
+              null,
+            planName: plan?.name,
+            interval,
+            amount,
+            currency: captureCurrency,
+            referenceId: captureId || orderId,
+            provider: 'PayPal',
+          });
+        } catch (mailErr) {
+          console.error('Subscription confirmation email failed:', mailErr);
+        }
       }
     }
 

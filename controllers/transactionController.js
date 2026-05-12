@@ -1321,24 +1321,67 @@ export const getTeacherTransactions = async (req, res) => {
       Transaction.countDocuments({ teacherId }),
     ]);
 
-    const data = items.map((t) => ({
-      transactionId: t._id,
-      planType: t.planType,
-      plan: t?.stripe?.planName || "",
-      name: t?.customerName || "",
-      duration: t?.stripe?.interval,
-      userAddress: t?.customerAddress || null,
-      stripe: {
-        invoiceId: t?.stripe?.invoiceId || "",
-        paymentIntentId: t?.stripe?.paymentIntentId || "",
-        chargeId: t?.stripe?.chargeId || "",
-        balanceTransactionId: t?.stripe?.balanceTransactionId || "",
-        subscriptionId: t?.stripe?.subscriptionId || "",
-        periodEnd: t?.stripe?.periodEnd || null,
-        periodStart: t?.stripe?.periodStart || null,
-      },
-      planId: t.planId,
-    }));
+    const data = items.map((t) => {
+      const hasPayPal = !!(t?.paypal?.orderId || t?.paypal?.captureId);
+      const hasStripe = !!(
+        t?.stripe?.invoiceId ||
+        t?.stripe?.paymentIntentId ||
+        t?.stripe?.chargeId ||
+        t?.stripe?.subscriptionId
+      );
+
+      const rawProvider = String(t?.provider || t?.method || "").toLowerCase();
+      const provider =
+        rawProvider === "paypal" || rawProvider === "stripe"
+          ? rawProvider
+          : hasPayPal
+          ? "paypal"
+          : hasStripe
+          ? "stripe"
+          : null;
+
+      return {
+        transactionId: t._id,
+        planType: t.planType,
+        plan:
+          t?.stripe?.planName ||
+          t?.paypal?.planName ||
+          t?.planId?.name ||
+          "",
+        name: t?.customerName || "",
+        duration:
+          t?.stripe?.interval || t?.paypal?.interval || null,
+        userAddress: t?.customerAddress || null,
+        amount: t?.amount ?? null,
+        currency: t?.currency || "USD",
+        createdAt: t?.createdAt || null,
+        provider,
+        method: t?.method || provider,
+        stripe: hasStripe
+          ? {
+              invoiceId: t?.stripe?.invoiceId || "",
+              paymentIntentId: t?.stripe?.paymentIntentId || "",
+              chargeId: t?.stripe?.chargeId || "",
+              balanceTransactionId: t?.stripe?.balanceTransactionId || "",
+              subscriptionId: t?.stripe?.subscriptionId || "",
+              periodEnd: t?.stripe?.periodEnd || null,
+              periodStart: t?.stripe?.periodStart || null,
+            }
+          : null,
+        paypal: hasPayPal
+          ? {
+              orderId: t?.paypal?.orderId || "",
+              captureId: t?.paypal?.captureId || "",
+              subscriptionId: t?.paypal?.subscriptionId || "",
+              payerEmail: t?.paypal?.payerEmail || "",
+              interval: t?.paypal?.interval || "",
+              periodStart: t?.paypal?.periodStart || null,
+              periodEnd: t?.paypal?.periodEnd || null,
+            }
+          : null,
+        planId: t.planId,
+      };
+    });
 
     return res.json({
       success: true,
@@ -1363,24 +1406,71 @@ export const getAllTransactions = async (req, res) => {
       Transaction.countDocuments(),
     ]);
 
-    const data = items.map((t) => ({
-      transactionId: t._id,
-      planType: t.planType,
-      plan: t?.stripe?.planName || "",
-      name: t?.customerName || "",
-      duration: t?.stripe?.interval,
-      userAddress: t?.customerAddress || null,
-      stripe: {
-        invoiceId: t?.stripe?.invoiceId || "",
-        paymentIntentId: t?.stripe?.paymentIntentId || "",
-        chargeId: t?.stripe?.chargeId || "",
-        balanceTransactionId: t?.stripe?.balanceTransactionId || "",
-        subscriptionId: t?.stripe?.subscriptionId || "",
-        periodEnd: t?.stripe?.periodEnd || null,
-        periodStart: t?.stripe?.periodStart || null,
-      },
-      planId: t.planId,
-    }));
+    const data = items.map((t) => {
+      const hasPayPal = !!(t?.paypal?.orderId || t?.paypal?.captureId);
+      const hasStripe = !!(
+        t?.stripe?.invoiceId ||
+        t?.stripe?.paymentIntentId ||
+        t?.stripe?.chargeId ||
+        t?.stripe?.subscriptionId
+      );
+
+      // Trust explicit provider/method first; only fall back to provider-
+      // specific identifiers. A subdocument that's present but entirely
+      // empty (Mongoose default) must NOT count as "stripe".
+      const rawProvider = String(t?.provider || t?.method || "").toLowerCase();
+      const provider =
+        rawProvider === "paypal" || rawProvider === "stripe"
+          ? rawProvider
+          : hasPayPal
+          ? "paypal"
+          : hasStripe
+          ? "stripe"
+          : null;
+
+      return {
+        transactionId: t._id,
+        planType: t.planType,
+        plan:
+          t?.stripe?.planName ||
+          t?.paypal?.planName ||
+          t?.planId?.name ||
+          "",
+        name: t?.customerName || "",
+        duration:
+          t?.stripe?.interval ||
+          t?.paypal?.interval ||
+          null,
+        userAddress: t?.customerAddress || null,
+        amount: t?.amount ?? null,
+        currency: t?.currency || "USD",
+        provider,
+        method: t?.method || provider,
+        stripe: hasStripe
+          ? {
+              invoiceId: t?.stripe?.invoiceId || "",
+              paymentIntentId: t?.stripe?.paymentIntentId || "",
+              chargeId: t?.stripe?.chargeId || "",
+              balanceTransactionId: t?.stripe?.balanceTransactionId || "",
+              subscriptionId: t?.stripe?.subscriptionId || "",
+              periodEnd: t?.stripe?.periodEnd || null,
+              periodStart: t?.stripe?.periodStart || null,
+            }
+          : null,
+        paypal: hasPayPal
+          ? {
+              orderId: t?.paypal?.orderId || "",
+              captureId: t?.paypal?.captureId || "",
+              subscriptionId: t?.paypal?.subscriptionId || "",
+              payerEmail: t?.paypal?.payerEmail || "",
+              interval: t?.paypal?.interval || "",
+              periodStart: t?.paypal?.periodStart || null,
+              periodEnd: t?.paypal?.periodEnd || null,
+            }
+          : null,
+        planId: t.planId,
+      };
+    });
 
     return res.json({
       success: true,

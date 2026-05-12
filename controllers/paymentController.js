@@ -6,6 +6,8 @@ import Transaction from "../models/transactionModel.js";
 import Subscription from "../models/SubscriptionModel.js";
 import Coupon from "../models/couponModel.js";
 import CurrencyRate from "../models/CurrencyRate.js";
+import { cancelPreviousSubscription } from "../utils/cancelPreviousSubscription.js";
+import { sendSubscriptionConfirmationEmail } from "../utils/subscriptionEmails.js";
 
 // ============================================
 // HELPER FUNCTIONS FOR CURRENCY & PRICING
@@ -676,6 +678,10 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
       // Map interval to frequency field required by schema
       const frequency = interval === "year" ? "yearly" : "monthly";
 
+      // Cancel any previously active subscription with no refund
+      // before activating the new one.
+      await cancelPreviousSubscription(userId);
+
       await Subscription.findOneAndUpdate(
         { userId },
         {
@@ -686,6 +692,9 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
             frequency: frequency,
             currency: fullSession.currency || "usd",
             promoCode: metadata.couponCode || null,
+            provider: "stripe",
+            providerSubscriptionId: subscriptionId,
+            cancelledAt: null,
           },
         },
         { upsert: true, new: true }
@@ -769,6 +778,8 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
       userId,
       planId,
       planType: "subscription",
+      provider: "stripe",
+      method: "stripe",
       stripe: stripeDetails,
       stripePaymentIntentId: paymentIntent?.id || null,
       stripeSubscriptionId: subscriptionId || null,
@@ -789,6 +800,28 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
     }
     await Transaction.create(transactionData);
     console.log(`Transaction record created for user ${userId} after checkout session.`);
+
+    try {
+      const recipient = customer?.email || user?.email;
+      if (recipient) {
+        await sendSubscriptionConfirmationEmail({
+          to: recipient,
+          name:
+            customer?.name ||
+            [user?.firstName, user?.lastName].filter(Boolean).join(" ") ||
+            user?.userName ||
+            null,
+          planName,
+          interval: interval === "year" ? "yearly" : "monthly",
+          amount: (fullSession.amount_total || 0) / 100,
+          currency: (fullSession.currency || "usd").toUpperCase(),
+          referenceId: invoiceId || session.id,
+          provider: "Stripe",
+        });
+      }
+    } catch (mailErr) {
+      console.error("Subscription confirmation email failed:", mailErr);
+    }
   } catch (error) {
     console.error("Error handling checkout session completed:", error);
     summary.paid = false;

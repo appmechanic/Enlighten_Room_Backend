@@ -87,6 +87,8 @@ const transactionSchema = new mongoose.Schema(
       enum: ["subscription", "one_time"],
       required: true,
     },
+    provider: { type: String, enum: ["stripe", "paypal"] },
+    method: { type: String },
     planId: { type: mongoose.Schema.Types.ObjectId, ref: "Plan" },
     amount: { type: Number, default: 0 }, // minor units (cents)
     currency: { type: String, default: "usd" },

@@ -12,7 +12,7 @@ const transporter = nodemailer.createTransport({
 /**
  * Generic email sender
  */
-export const sendEmail = async ({ to, subject, html }) => {
+export const sendEmail = async ({ to, subject, html, replyTo }) => {
   console
     .log
     // `Sending email to ${to} with subject: ${subject} with html: ${html}`
@@ -23,6 +23,7 @@ export const sendEmail = async ({ to, subject, html }) => {
     subject,
     html,
   };
+  if (replyTo) mailOptions.replyTo = replyTo;
 
   try {
     await transporter.sendMail(mailOptions);

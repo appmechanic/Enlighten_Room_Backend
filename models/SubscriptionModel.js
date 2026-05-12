@@ -18,13 +18,23 @@ const subscriptionSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ["active", "inactive"],
+    enum: ["active", "inactive", "cancelled"],
     default: "active",
   },
   frequency: {
     type: String,
     enum: ["monthly", "yearly"],
     required: true,
+  },
+  provider: {
+    type: String,
+    enum: ["stripe", "paypal"],
+  },
+  providerSubscriptionId: {
+    type: String,
+  },
+  cancelledAt: {
+    type: Date,
   },
   addons: [
     {
