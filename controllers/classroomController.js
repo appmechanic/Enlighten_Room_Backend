@@ -435,26 +435,37 @@ export const updateClassroomRemarks = async (req, res) => {
 
 export const addClassSession = async (req, res) => {
   const { id: classroomId } = req.params;
-  const { sessionDate, topic, notes, sessionUrl } = req.body;
-
-  if (!sessionDate || !topic) {
-    return res
-      .status(400)
-      .json({ error: "sessionDate and topic are required" });
-  }
+  const { sessionDate, sessionDates, topic, notes, sessionUrl, duration } = req.body;
 
   if (!classroomId) {
     return res.status(400).json({ error: "Classroom ID is required." });
   }
+  if (!topic) {
+    return res.status(400).json({ error: "topic is required" });
+  }
+
+  const dates = Array.isArray(sessionDates) && sessionDates.length > 0
+    ? sessionDates
+    : (sessionDate ? [sessionDate] : []);
+
+  if (dates.length === 0) {
+    return res.status(400).json({ error: "sessionDate or sessionDates is required" });
+  }
+
   try {
-    const session = await Session.create({
+    const docs = dates.map((d) => ({
       classroomId,
-      sessionDate,
+      sessionDate: d,
       topic,
       notes,
       sessionUrl,
-    });
-    res.status(201).json({ message: "Session created", session });
+      ...(duration !== undefined ? { duration } : {}),
+    }));
+    const created = await Session.insertMany(docs);
+    if (created.length === 1) {
+      return res.status(201).json({ message: "Session created", session: created[0] });
+    }
+    res.status(201).json({ message: "Sessions created", sessions: created });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

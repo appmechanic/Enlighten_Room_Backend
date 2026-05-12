@@ -441,6 +441,14 @@ export const submitAnswer = async (req, res) => {
         return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
     }
 
+    if (question.format === 'textbox') {
+      const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
+      const answerText = typeof answer === 'string' ? answer : '';
+      if (answerText.length > textboxLimit) {
+        return res.status(400).json({ message: `Answer exceeds ${textboxLimit} character limit.` });
+      }
+    }
+
     // Get AI-based score, feedback, and correctness
     let aiScore = 0;
     let feedback = '';
@@ -517,7 +525,10 @@ export const viewAnswers = async (req, res) => {
 export const viewAllAnswers = async (req, res) => {
   try {
     const { roomId } = req.params;
-    const questions = await ClassworkModel.find({ roomId });
+    const { lessonName } = req.query;
+    const filter = { roomId };
+    if (lessonName !== undefined) filter.lessonName = lessonName;
+    const questions = await ClassworkModel.find(filter);
 
     const data = questions.map((q) => {
       const submitted = q.submitted.map((s) => {
@@ -571,7 +582,10 @@ export const viewAllAnswers = async (req, res) => {
 export const getQuestions = async (req, res) => {
   try {
     const { roomId } = req.params;
-    const questions = await ClassworkModel.find({ roomId }).select('-submitted -correctAnswer');
+    const { lessonName } = req.query;
+    const filter = { roomId };
+    if (lessonName !== undefined) filter.lessonName = lessonName;
+    const questions = await ClassworkModel.find(filter).select('-submitted -correctAnswer');
     res.status(200).json(questions);
   } catch (err) {
     res.status(500).json({ message: 'Error fetching questions', error: err.message });
