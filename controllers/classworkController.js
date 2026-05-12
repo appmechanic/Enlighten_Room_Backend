@@ -550,6 +550,7 @@ export const viewAllAnswers = async (req, res) => {
         label: q.label,
         title: q.title,
         question: q.question,
+        lessonName: q.lessonName || '',
         format: q.format || q.formatLabel || '',
         aiAllowed: q.aiAllowed !== false,
         aiExpiryTime: q.aiExpiryTime,
