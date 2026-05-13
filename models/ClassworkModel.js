@@ -10,7 +10,8 @@ const SubmittedSchema = new mongoose.Schema({
   feedback: { type: String, default: '' },
   preSubmitAnswers: { type: [mongoose.Schema.Types.Mixed], default: [] },
   aiHintsUsed: { type: [String], default: [] },
-}); 
+  submittedAt: { type: Date, default: Date.now },
+});
 
 const ClassworkSchema = new mongoose.Schema({
   id: { type: String, required: true },

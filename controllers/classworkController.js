@@ -489,9 +489,10 @@ export const submitAnswer = async (req, res) => {
       question.submitted[existingSubmissionIndex].studentName = studentName;
       question.submitted[existingSubmissionIndex].aiScore = aiScore;
       question.submitted[existingSubmissionIndex].feedback = feedback;
+      question.submitted[existingSubmissionIndex].submittedAt = new Date();
     } else {
       // Add new answer
-      question.submitted.push({ studentId, studentName, answer: normalizedAnswer, isCorrect, aiUsed, aiScore, feedback });
+      question.submitted.push({ studentId, studentName, answer: normalizedAnswer, isCorrect, aiUsed, aiScore, feedback, submittedAt: new Date() });
     }
     await question.save();
     res.status(200).json({
@@ -549,7 +550,7 @@ export const viewAllAnswers = async (req, res) => {
           aiUsed: s.aiUsed || '0x',
           feedback: s.feedback || '',
           preSubmitAnswers: s.preSubmitAnswers || [],
-          
+          submittedAt: s.submittedAt || null,
         };
       });
 
