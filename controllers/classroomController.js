@@ -453,7 +453,32 @@ export const addClassSession = async (req, res) => {
   }
 
   try {
-    const docs = dates.map((d) => ({
+    const requestedDates = dates
+      .map((d) => new Date(d))
+      .filter((d) => !Number.isNaN(d.getTime()));
+
+    const existing = await Session.find(
+      { classroomId, sessionDate: { $in: requestedDates } },
+      "sessionDate",
+    );
+    const existingTimes = new Set(
+      existing.map((s) => new Date(s.sessionDate).getTime()),
+    );
+
+    const newDates = requestedDates.filter(
+      (d) => !existingTimes.has(d.getTime()),
+    );
+    const skipped = requestedDates.length - newDates.length;
+
+    if (newDates.length === 0) {
+      return res.status(200).json({
+        message: "No new sessions created — all requested dates already exist for this classroom.",
+        sessions: [],
+        skipped,
+      });
+    }
+
+    const docs = newDates.map((d) => ({
       classroomId,
       sessionDate: d,
       topic,
@@ -462,10 +487,16 @@ export const addClassSession = async (req, res) => {
       ...(duration !== undefined ? { duration } : {}),
     }));
     const created = await Session.insertMany(docs);
-    if (created.length === 1) {
+    if (created.length === 1 && skipped === 0) {
       return res.status(201).json({ message: "Session created", session: created[0] });
     }
-    res.status(201).json({ message: "Sessions created", sessions: created });
+    res.status(201).json({
+      message: skipped > 0
+        ? `Created ${created.length} session${created.length === 1 ? "" : "s"}, skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}.`
+        : "Sessions created",
+      sessions: created,
+      skipped,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
