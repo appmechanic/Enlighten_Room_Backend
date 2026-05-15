@@ -7,6 +7,7 @@ import Teacher from "../models/teacherModel.js";
 import transactionModel from "../models/transactionModel.js";
 import User from "../models/user.js";
 import { addSendEmail } from "../utils/addSendEmail.js";
+import { expandSessionOccurrences } from "../utils/expandSessionRecurrence.js";
 
 // Create new teacher
 // export const createTeacher = async (req, res) => {
@@ -428,38 +429,50 @@ export const getTeacherDashboard = async (req, res) => {
       }
     }
 
-    // B) SESSION EVENTS (for full calendar range)
+    // B) SESSION EVENTS (for full calendar range, expanding recurrence)
     const calendarSessions = await Session.find({
       classroomId: { $in: classroomIds },
-      sessionDate: { $gte: rangeStart, $lte: rangeEnd },
+      $or: [
+        { sessionDate: { $gte: rangeStart, $lte: rangeEnd } },
+        {
+          "recurrence.type": { $in: ["daily", "weekly", "monthly"] },
+          sessionDate: { $lte: rangeEnd },
+          "recurrence.untilDate": { $gte: rangeStart },
+        },
+      ],
     })
-      .select("_id title sessionDate duration classroomId status sessionUrl")
+      .select(
+        "_id title topic sessionDate duration classroomId status sessionUrl notes recurrence",
+      )
       .lean();
 
-    // console.log("calendarSessions", calendarSessions);
-
-    const sessionEvents = calendarSessions.map((s) => {
-      const sDate = new Date(s.sessionDate);
-
+    const sessionEvents = [];
+    calendarSessions.forEach((s) => {
       const cls = classroomMap.get(String(s.classroomId));
-      console.log("cls for session", s._id, cls);
       const className =
-        cls?.settings?.room || // e.g., “Room A-101”
-        cls?.subject?.name || // e.g., “Algebra”
-        cls?.subject?.code || // e.g., “MATH-101”
+        cls?.settings?.room ||
+        cls?.subject?.name ||
+        cls?.subject?.code ||
         "Class";
-
-      return {
-        id: s._id,
-        type: "session",
-        title: s.title || "Session",
-        start: sDate,
-        sessionUrl: s.sessionUrl,
-        classroomId: s.classroomId,
-        className,
-        end: addMinutes(sDate, Number(s.duration) || 60),
-        allDay: false,
-      };
+      const durMin = Number(s.duration) || Number(cls?.duration) || 60;
+      const occurrences = expandSessionOccurrences(s, rangeStart, rangeEnd);
+      occurrences.forEach((sDate, idx) => {
+        sessionEvents.push({
+          id: `${s._id}_${idx}`,
+          sessionId: s._id,
+          type: "session",
+          title: s.title || s.topic || "Session",
+          topic: s.topic || null,
+          notes: s.notes || null,
+          start: sDate,
+          sessionUrl: s.sessionUrl,
+          classroomId: s.classroomId,
+          className,
+          end: addMinutes(sDate, durMin),
+          allDay: false,
+          recurrence: s.recurrence || null,
+        });
+      });
     });
 
     const getClassName = (cls) =>

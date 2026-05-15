@@ -5,6 +5,7 @@ import Student from "../models/studentModel.js";
 import Teacher from "../models/teacherModel.js";
 import Session from "../models/SessionModel.js";
 import User from "../models/user.js";
+import { expandSessionOccurrences } from "../utils/expandSessionRecurrence.js";
 
 export const createClassroom = async (req, res) => {
   try {
@@ -433,9 +434,52 @@ export const updateClassroomRemarks = async (req, res) => {
   }
 };
 
+// Compute the first occurrence Date from slots/repeat/windowStart.
+// slots: [{ weekday:0-6, time:"HH:MM" }], repeat: none|daily|weekly|monthly.
+const firstOccurrenceFromSlots = (slots, repeat, windowStart) => {
+  if (!Array.isArray(slots) || slots.length === 0) return null;
+  const start = new Date(windowStart);
+  if (Number.isNaN(start.getTime())) return null;
+
+  const candidates = [];
+  slots.forEach((slot) => {
+    const [hh, mm] = String(slot.time || "").split(":").map(Number);
+    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return;
+    const wd = Number(slot.weekday);
+
+    if (repeat === "daily") {
+      const d = new Date(start);
+      d.setHours(hh, mm, 0, 0);
+      if (d < start) d.setDate(d.getDate() + 1);
+      candidates.push(d);
+      return;
+    }
+
+    const d = new Date(start);
+    d.setHours(hh, mm, 0, 0);
+    const dayDiff = (wd - d.getDay() + 7) % 7;
+    d.setDate(d.getDate() + dayDiff);
+    if (d < start) d.setDate(d.getDate() + 7);
+    candidates.push(d);
+  });
+
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => a - b);
+  return candidates[0];
+};
+
 export const addClassSession = async (req, res) => {
   const { id: classroomId } = req.params;
-  const { sessionDate, sessionDates, topic, notes, sessionUrl, duration } = req.body;
+  const {
+    sessionDate,
+    topic,
+    notes,
+    sessionUrl,
+    duration,
+    slots,
+    repeat,
+    untilDate,
+  } = req.body;
 
   if (!classroomId) {
     return res.status(400).json({ error: "Classroom ID is required." });
@@ -444,59 +488,80 @@ export const addClassSession = async (req, res) => {
     return res.status(400).json({ error: "topic is required" });
   }
 
-  const dates = Array.isArray(sessionDates) && sessionDates.length > 0
-    ? sessionDates
-    : (sessionDate ? [sessionDate] : []);
-
-  if (dates.length === 0) {
-    return res.status(400).json({ error: "sessionDate or sessionDates is required" });
-  }
-
   try {
-    const requestedDates = dates
-      .map((d) => new Date(d))
-      .filter((d) => !Number.isNaN(d.getTime()));
+    const repeatType = ["none", "daily", "weekly", "monthly"].includes(repeat)
+      ? repeat
+      : "none";
+    const hasSlots = Array.isArray(slots) && slots.length > 0;
 
-    const existing = await Session.find(
-      { classroomId, sessionDate: { $in: requestedDates } },
-      "sessionDate",
-    );
-    const existingTimes = new Set(
-      existing.map((s) => new Date(s.sessionDate).getTime()),
-    );
+    // Resolve the first occurrence (sessionDate).
+    let firstDate = null;
+    if (hasSlots) {
+      const classroom = await Classroom.findById(classroomId).select(
+        "dateTime",
+      );
+      const now = new Date();
+      const classStart = classroom?.dateTime
+        ? new Date(classroom.dateTime)
+        : null;
+      const windowStart =
+        classStart && classStart > now ? classStart : now;
+      firstDate = firstOccurrenceFromSlots(slots, repeatType, windowStart);
+    } else if (sessionDate) {
+      const d = new Date(sessionDate);
+      if (!Number.isNaN(d.getTime())) firstDate = d;
+    }
 
-    const newDates = requestedDates.filter(
-      (d) => !existingTimes.has(d.getTime()),
-    );
-    const skipped = requestedDates.length - newDates.length;
+    if (!firstDate) {
+      return res
+        .status(400)
+        .json({ error: "A valid day/time (slots) or sessionDate is required" });
+    }
+    if (repeatType !== "none" && !untilDate) {
+      return res
+        .status(400)
+        .json({ error: "untilDate is required for repeating sessions" });
+    }
 
-    if (newDates.length === 0) {
+    // Skip duplicate (same classroom + same first-occurrence start time).
+    const existing = await Session.findOne({
+      classroomId,
+      sessionDate: firstDate,
+    }).lean();
+    if (existing) {
       return res.status(200).json({
-        message: "No new sessions created — all requested dates already exist for this classroom.",
+        message:
+          "No new session created — a session already exists at that start time.",
         sessions: [],
-        skipped,
+        skipped: 1,
       });
     }
 
-    const docs = newDates.map((d) => ({
+    const doc = {
       classroomId,
-      sessionDate: d,
+      sessionDate: firstDate,
       topic,
       notes,
       sessionUrl,
       ...(duration !== undefined ? { duration } : {}),
-    }));
-    const created = await Session.insertMany(docs);
-    if (created.length === 1 && skipped === 0) {
-      return res.status(201).json({ message: "Session created", session: created[0] });
-    }
-    res.status(201).json({
-      message: skipped > 0
-        ? `Created ${created.length} session${created.length === 1 ? "" : "s"}, skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}.`
-        : "Sessions created",
-      sessions: created,
-      skipped,
-    });
+      recurrence: {
+        type: repeatType,
+        slots: hasSlots
+          ? slots.map((s) => ({
+              weekday: Number(s.weekday),
+              time: String(s.time || ""),
+            }))
+          : [],
+        untilDate:
+          repeatType === "none"
+            ? undefined
+            : untilDate
+              ? new Date(untilDate)
+              : undefined,
+      },
+    };
+    const created = await Session.create(doc);
+    return res.status(201).json({ message: "Session created", session: created });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -533,15 +598,50 @@ export const getAllClassSessions = async (req, res) => {
   }
 
   try {
-    const sessions = await Session.find({ classroomId }).sort({
-      sessionDate: -1,
-    });
+    const docs = await Session.find({ classroomId })
+      .sort({ sessionDate: 1 })
+      .lean();
 
-    if (!sessions || sessions.length === 0) {
+    if (!docs || docs.length === 0) {
       return res
         .status(404)
         .json({ error: "No sessions found for this classroom." });
     }
+
+    // Expand each recurring session into individual occurrences so the UI
+    // shows one card per occurrence, while the DB still holds a single record.
+    const classroom = await Classroom.findById(classroomId)
+      .select("dateTime expiryDateTime lastDate")
+      .lean();
+    const rangeStart = classroom?.dateTime
+      ? new Date(classroom.dateTime)
+      : new Date(0);
+    const rangeEnd = new Date(
+      Math.max(
+        new Date().getTime() + 365 * 24 * 60 * 60 * 1000,
+        classroom?.expiryDateTime
+          ? new Date(classroom.expiryDateTime).getTime()
+          : 0,
+        classroom?.lastDate ? new Date(classroom.lastDate).getTime() : 0,
+      ),
+    );
+
+    const sessions = [];
+    docs.forEach((s) => {
+      const occurrences = expandSessionOccurrences(s, rangeStart, rangeEnd);
+      const dates = occurrences.length ? occurrences : [new Date(s.sessionDate)];
+      dates.forEach((d, idx) => {
+        sessions.push({
+          ...s,
+          // Keep _id as the underlying session id so screenshot/report
+          // queries continue to work. Use occurrenceKey for React keys.
+          occurrenceKey: `${s._id}_${idx}`,
+          occurrenceIndex: idx,
+          sessionDate: d,
+        });
+      });
+    });
+    sessions.sort((a, b) => new Date(b.sessionDate) - new Date(a.sessionDate));
 
     res.status(200).json({ sessions });
   } catch (err) {

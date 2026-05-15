@@ -11,6 +11,7 @@ import Student from "../models/studentModel.js";
 import Teacher from "../models/teacherModel.js";
 import User from "../models/user.js";
 import { addSendEmail } from "../utils/addSendEmail.js";
+import { expandSessionOccurrences } from "../utils/expandSessionRecurrence.js";
 import { sendAssignmentReportEmails } from "../utils/emailAssignmentReport.js";
 import { getGradeFromPercentage } from "../utils/gradeHelper.js";
 import { notifyAssignmentReport } from "../utils/notify.js";
@@ -1106,39 +1107,46 @@ export const getStudentDashboard = async (req, res) => {
       }
     }
 
-    // B) SESSION EVENTS (fetch only for the calendar window)
+    // B) SESSION EVENTS (expand recurrence within the calendar window)
     const calendarSessions = await Session.find({
       classroomId: { $in: classroomIds },
-      sessionDate: { $gte: rangeStart, $lte: rangeEnd },
-    });
-    // .select("_id topic sessionDate classroomId duration")
-    // .lean();
+      $or: [
+        { sessionDate: { $gte: rangeStart, $lte: rangeEnd } },
+        {
+          "recurrence.type": { $in: ["daily", "weekly", "monthly"] },
+          sessionDate: { $lte: rangeEnd },
+          "recurrence.untilDate": { $gte: rangeStart },
+        },
+      ],
+    }).lean();
 
-    const sessionEvents = calendarSessions
-      .map((s) => {
-        const cls = classroomMap.get(String(s.classroomId));
-        const start = new Date(s.sessionDate);
-        const dur =
-          Number(s?.duration) > 0
-            ? Number(s.duration)
-            : Number(cls?.duration) || 60;
-
-        // console.log("Session Event:", s);
-        return {
-          id: s._id,
+    const sessionEvents = [];
+    calendarSessions.forEach((s) => {
+      const cls = classroomMap.get(String(s.classroomId));
+      const dur =
+        Number(s?.duration) > 0
+          ? Number(s.duration)
+          : Number(cls?.duration) || 60;
+      const occurrences = expandSessionOccurrences(s, rangeStart, rangeEnd);
+      occurrences.forEach((start, idx) => {
+        sessionEvents.push({
+          id: `${s._id}_${idx}`,
+          sessionId: s._id,
           type: "session",
           title: s.topic || "Session",
+          topic: s.topic || null,
+          notes: s.notes || null,
           start,
           sessionUrl: s.sessionUrl || null,
           end: addMinutes(start, dur),
           allDay: false,
-
           classroomId: s.classroomId,
           subject: cls?.subject ?? null,
-        };
-      })
-      .filter(Boolean) // drop any nulls from missing classrooms
-      .sort((a, b) => a.start - b.start);
+          recurrence: s.recurrence || null,
+        });
+      });
+    });
+    sessionEvents.sort((a, b) => a.start - b.start);
 
     // C) ASSIGNMENT DEADLINES (use allAssignments you already loaded)
     const assignmentEvents = [];

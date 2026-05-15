@@ -25,6 +25,24 @@ const SessionSchema = new mongoose.Schema(
     notes: {
       type: String,
     },
+    duration: {
+      type: Number,
+    },
+    recurrence: {
+      type: {
+        type: String,
+        enum: ["none", "daily", "weekly", "monthly"],
+        default: "none",
+      },
+      slots: [
+        {
+          _id: false,
+          weekday: { type: Number, min: 0, max: 6 },
+          time: { type: String },
+        },
+      ],
+      untilDate: { type: Date },
+    },
     // 🔔 reminder flags
     reminders: {
       // used by send24hLessonReminders()
