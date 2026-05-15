@@ -494,8 +494,15 @@ export const addClassSession = async (req, res) => {
     const hasSlots = Array.isArray(slots) && slots.length > 0;
 
     // Resolve the first occurrence (sessionDate).
+    // Prefer the ISO timestamp from the client — it was computed in the
+    // user's local timezone, so we avoid re-interpreting slot HH:MM in
+    // the server's timezone (which would drift by the UTC offset).
     let firstDate = null;
-    if (hasSlots) {
+    if (sessionDate) {
+      const d = new Date(sessionDate);
+      if (!Number.isNaN(d.getTime())) firstDate = d;
+    }
+    if (!firstDate && hasSlots) {
       const classroom = await Classroom.findById(classroomId).select(
         "dateTime",
       );
@@ -506,9 +513,6 @@ export const addClassSession = async (req, res) => {
       const windowStart =
         classStart && classStart > now ? classStart : now;
       firstDate = firstOccurrenceFromSlots(slots, repeatType, windowStart);
-    } else if (sessionDate) {
-      const d = new Date(sessionDate);
-      if (!Number.isNaN(d.getTime())) firstDate = d;
     }
 
     if (!firstDate) {
