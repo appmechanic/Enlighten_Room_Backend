@@ -5,7 +5,6 @@ import Student from "../models/studentModel.js";
 import Teacher from "../models/teacherModel.js";
 import Session from "../models/SessionModel.js";
 import User from "../models/user.js";
-import { expandSessionOccurrences } from "../utils/expandSessionRecurrence.js";
 
 export const createClassroom = async (req, res) => {
   try {
@@ -598,50 +597,15 @@ export const getAllClassSessions = async (req, res) => {
   }
 
   try {
-    const docs = await Session.find({ classroomId })
-      .sort({ sessionDate: 1 })
-      .lean();
+    const sessions = await Session.find({ classroomId }).sort({
+      sessionDate: -1,
+    });
 
-    if (!docs || docs.length === 0) {
+    if (!sessions || sessions.length === 0) {
       return res
         .status(404)
         .json({ error: "No sessions found for this classroom." });
     }
-
-    // Expand each recurring session into individual occurrences so the UI
-    // shows one card per occurrence, while the DB still holds a single record.
-    const classroom = await Classroom.findById(classroomId)
-      .select("dateTime expiryDateTime lastDate")
-      .lean();
-    const rangeStart = classroom?.dateTime
-      ? new Date(classroom.dateTime)
-      : new Date(0);
-    const rangeEnd = new Date(
-      Math.max(
-        new Date().getTime() + 365 * 24 * 60 * 60 * 1000,
-        classroom?.expiryDateTime
-          ? new Date(classroom.expiryDateTime).getTime()
-          : 0,
-        classroom?.lastDate ? new Date(classroom.lastDate).getTime() : 0,
-      ),
-    );
-
-    const sessions = [];
-    docs.forEach((s) => {
-      const occurrences = expandSessionOccurrences(s, rangeStart, rangeEnd);
-      const dates = occurrences.length ? occurrences : [new Date(s.sessionDate)];
-      dates.forEach((d, idx) => {
-        sessions.push({
-          ...s,
-          // Keep _id as the underlying session id so screenshot/report
-          // queries continue to work. Use occurrenceKey for React keys.
-          occurrenceKey: `${s._id}_${idx}`,
-          occurrenceIndex: idx,
-          sessionDate: d,
-        });
-      });
-    });
-    sessions.sort((a, b) => new Date(b.sessionDate) - new Date(a.sessionDate));
 
     res.status(200).json({ sessions });
   } catch (err) {
