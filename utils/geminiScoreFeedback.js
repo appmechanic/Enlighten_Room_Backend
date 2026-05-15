@@ -1,7 +1,7 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import fetch from "node-fetch";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 function normalizeAnswerText(value) {
   if (Array.isArray(value)) {
@@ -118,11 +118,6 @@ Format:
 {"aiScore": number, "feedback": string, "isCorrect": boolean}
 `;
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
-      systemInstruction,
-    });
-
     const normalizedAnswerText = normalizeAnswerText(answer);
     const answerImageSource = getAnswerImageSource(answer);
     const referenceAnswer = normalizeAnswerText(correctAnswer);
@@ -194,16 +189,18 @@ Format:
       prompt,
     });
 
-    const result = await model.generateContent({
+    const result = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
       contents: [
         {
           role: "user",
           parts,
         },
       ],
+      config: { systemInstruction },
     });
 
-    const response = result.response.text();
+    const response = result.text || "";
 
     console.log("[Gemini AI Response]", response);
 

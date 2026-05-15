@@ -1,9 +1,9 @@
 // controllers/ai.controller.js
 // import OpenAI from "openai";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 
 // const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Reusable helper
 async function askVision({
@@ -37,9 +37,7 @@ Use a warm, encouraging, parent-like tone throughout. Keep responses concise, ch
   //     },
   //   ],
   // });
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
-    systemInstruction: `
+  const systemInstruction = `
       You are a warm, patient, and encouraging tutor (like a caring parent)
       who reads a student's classwork image and provides short, supportive,
       and educational guidance.
@@ -48,19 +46,22 @@ Use a warm, encouraging, parent-like tone throughout. Keep responses concise, ch
       - Start advice with the student's name if provided
       - Never give final answers unless failed 3 times
       - Be concise, child-friendly, and encouraging
-      `
-    });
+      `;
   const base64Image = dataUrl.split(",")[1];
-  const result = await model.generateContent([
+  const result = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [
       {
         inlineData: {
           data: base64Image,
           mimeType: "image/jpeg", // or image/png
         },
       },
-      prompt,
-    ]);
-  return result.response.text() ?? "No answer";
+      { text: prompt },
+    ],
+    config: { systemInstruction },
+  });
+  return result.text ?? "No answer";
 }
 
 /** POST /api/ai/whiteboard (multipart/form-data: image) */

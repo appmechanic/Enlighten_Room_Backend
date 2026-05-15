@@ -1,8 +1,8 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import ClassworkModel from '../models/ClassworkModel.js';
 import { getExpiryState, getQuestionAiExpirySeconds } from '../utils/classworkExpiry.js';
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 /**
  * POST /api/gemini-hint
@@ -57,7 +57,7 @@ const getGeminiHint = async (req, res) => {
 
     if (isImageAnswer) {
       // Answer is an image (handwriting) - use AI to interpret and evaluate
-      const result = await evaluateHandwritingAnswer(studentAnswer, question, genAI);
+      const result = await evaluateHandwritingAnswer(studentAnswer, question, ai);
       isCorrect = result.isCorrect;
       interpretedAnswer = result.interpretedText;
     } else {
@@ -109,10 +109,6 @@ const getGeminiHint = async (req, res) => {
       const systemInstruction = `
         You are an expert teacher. Given the following question and answer, generate a new question that is similar in topic but more advanced in difficulty. The new question should challenge the student further and help them deepen their understanding. Only return the new question text, nothing else.
       `;
-      const model = genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
-        systemInstruction,
-      });
       const prompt = `
         Original question: ${question.question}
         Correct answer: ${question.correctAnswer}
@@ -120,8 +116,12 @@ const getGeminiHint = async (req, res) => {
       `;
       let newQuestionText = '';
       try {
-        const result = await model.generateContent([prompt]);
-        newQuestionText = (result.response && result.response.text && result.response.text()) || '';
+        const result = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: [{ text: prompt }],
+          config: { systemInstruction },
+        });
+        newQuestionText = result.text || '';
       } catch (err) {
         console.error('Error generating advanced question:', err);
         newQuestionText = '';
@@ -151,11 +151,6 @@ const getGeminiHint = async (req, res) => {
       ${studentName ? `- Address the student as "${studentName}"` : ''}
       `;
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      systemInstruction,
-    });
-
     // Build the prompt with question and student's incorrect answer
     let hintPrompt = `
 Question: ${question.question}
@@ -165,12 +160,12 @@ The student ${studentName ? `"${studentName}" ` : ''}answered: ${interpretedAnsw
 Please provide a personalized hint based on their specific answer.
     `;
 
-    let inputArr = [hintPrompt];
+    let inputArr = [{ text: hintPrompt }];
 
     // Add image if the student's answer is an image (handwriting)
     if (isImageAnswer) {
-      const base64Image = typeof studentAnswer === 'string' && studentAnswer.includes(',') 
-        ? studentAnswer.split(',')[1] 
+      const base64Image = typeof studentAnswer === 'string' && studentAnswer.includes(',')
+        ? studentAnswer.split(',')[1]
         : studentAnswer;
       inputArr.push({
         inlineData: {
@@ -191,8 +186,12 @@ Please provide a personalized hint based on their specific answer.
       });
     }
 
-    const result = await model.generateContent(inputArr);
-    const hint = (result.response && result.response.text && result.response.text()) || 'Please try again.';
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: inputArr,
+      config: { systemInstruction },
+    });
+    const hint = result.text || 'Please try again.';
 
     // Save the AI hint to preSubmitAnswers for the student
     if (studentName) {
@@ -252,7 +251,7 @@ const checkAnswerCorrectness = (studentAnswer, correctAnswer, format) => {
  * Helper function to evaluate handwriting/image answers using AI
  * Interprets the handwritten answer and compares it against the correct answer
  */
-const evaluateHandwritingAnswer = async (imageData, question, genAI) => {
+const evaluateHandwritingAnswer = async (imageData, question, ai) => {
   try {
     const systemInstruction = `
       You are an expert at reading handwritten answers. Your task is to:
@@ -260,17 +259,12 @@ const evaluateHandwritingAnswer = async (imageData, question, genAI) => {
       2. Extract the exact answer text
       3. Compare it against the correct answer provided
       4. Respond with JSON format: { "interpretedText": "...", "isCorrect": true/false }
-      
+
       Be lenient with handwriting variations (spelling, spacing) but strict with numerical/factual correctness.
     `;
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      systemInstruction,
-    });
-
     const base64Image = imageData.includes(',') ? imageData.split(',')[1] : imageData;
-    
+
     const prompt = `
 Correct answer: ${JSON.stringify(question.correctAnswer)}
 Question: ${question.question}
@@ -278,17 +272,21 @@ Question: ${question.question}
 Please interpret the handwritten answer in the image and determine if it's correct.
     `;
 
-    const result = await model.generateContent([
-      prompt,
-      {
-        inlineData: {
-          data: base64Image,
-          mimeType: 'image/jpeg',
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        { text: prompt },
+        {
+          inlineData: {
+            data: base64Image,
+            mimeType: 'image/jpeg',
+          },
         },
-      },
-    ]);
+      ],
+      config: { systemInstruction },
+    });
 
-    const responseText = result.response.text();
+    const responseText = result.text || '';
     
     // Parse the JSON response from the AI
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);

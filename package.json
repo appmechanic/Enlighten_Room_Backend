@@ -13,7 +13,7 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.978.0",
-    "@google/generative-ai": "^0.21.0",
+    "@google/genai": "^2.3.0",
     "@paypal/checkout-server-sdk": "^1.0.3",
     "axios": "^1.13.2",
     "bcrypt": "^6.0.0",

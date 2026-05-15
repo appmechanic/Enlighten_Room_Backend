@@ -1,13 +1,13 @@
 import { Parser as Json2csvParser } from 'json2csv';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 import ClassworkModel from '../models/ClassworkModel.js';
 import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
@@ -637,11 +637,6 @@ export const saveAiHintUsage = async (req, res) => {
       - Provide hints to guide the student to the correct answer
     `;
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
-      systemInstruction,
-    });
-
     let inputArr = [];
     if (image) {
       const base64Image = image.includes(',') ? image.split(',')[1] : image;
@@ -652,17 +647,21 @@ export const saveAiHintUsage = async (req, res) => {
         },
       });
     }
-    
+
     const questionText = `Question: ${question.question}`;
     const answerText = currentAnswer ? `Student's current answer: ${typeof currentAnswer === 'string' ? currentAnswer : JSON.stringify(currentAnswer)}` : '';
-    const promptText = studentName 
-      ? `${studentName}: ${questionText}. ${answerText}` 
+    const promptText = studentName
+      ? `${studentName}: ${questionText}. ${answerText}`
       : `${questionText}. ${answerText}`;
 
-    inputArr.push(promptText);
+    inputArr.push({ text: promptText });
 
-    const result = await model.generateContent(inputArr);
-    const hint = (result.response && result.response.text && result.response.text()) || 'No hint available';
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: inputArr,
+      config: { systemInstruction },
+    });
+    const hint = result.text || 'No hint available';
 
     // Find or create submission for this student
     const existingSubmissionIndex = question.submitted.findIndex(
