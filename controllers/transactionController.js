@@ -453,15 +453,15 @@ export async function startSubscription(req, res) {
           invoice_now: false,
         });
 
-        // Mark all transactions for the old subscription as expired in our DB
-        // so the admin/teacher tables reflect the replacement immediately.
+        // Mark all transactions for the old subscription as canceled (user
+        // explicitly replaced their plan — distinct from natural expiry).
         try {
           await Transaction.updateMany(
             { "stripe.subscriptionId": upgradeFromSubscriptionId },
-            { $set: { subscriptionStatus: "expired", status: "canceled" } }
+            { $set: { subscriptionStatus: "canceled", status: "canceled" } }
           );
         } catch (e) {
-          console.error("Failed to mark old Stripe sub expired:", e?.message);
+          console.error("Failed to mark old Stripe sub canceled:", e?.message);
         }
       }
 
@@ -1314,9 +1314,12 @@ async function upsertFromPaymentIntent(pi, eventId) {
 // Recompute live subscriptionStatus for each loaded transaction, persist any
 // drift to MongoDB, and return a Map<txnIdString, status> for the response.
 //
-// Rule: a teacher can have at most ONE "active" row at any time — the latest
-// transaction for that teacher, AND only if its billing period still covers
-// today. Everything older for the same teacher is "expired".
+// Rules:
+//  - A teacher can have at most ONE "active" row — the latest transaction,
+//    only if its billing period still covers today.
+//  - Older rows that would otherwise be "active" become "canceled" (user
+//    replaced the plan before it lapsed).
+//  - Older rows whose period has already passed are "expired".
 async function refreshSubscriptionStatuses(items) {
   if (!items?.length) return new Map();
 
@@ -1340,7 +1343,11 @@ async function refreshSubscriptionStatuses(items) {
   const live = new Map();
   for (const t of items) {
     const isLatest = latestIds.has(String(t._id));
-    const computed = isLatest ? computeSubscriptionStatus(t) : "expired";
+    let computed = computeSubscriptionStatus(t);
+    if (!isLatest && computed === "active") {
+      // Newer transaction exists for this teacher — this row was replaced.
+      computed = "canceled";
+    }
     live.set(String(t._id), computed);
     if (t.subscriptionStatus !== computed) {
       ops.push({

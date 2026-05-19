@@ -64,12 +64,11 @@ export function computeExpiry(txn) {
 export function computeSubscriptionStatus(txn) {
   if (!txn) return "unknown";
   const status = String(txn?.status || "").toLowerCase();
-  if (
-    status === "refunded" ||
-    status === "failed" ||
-    status === "canceled" ||
-    status === "cancelled"
-  ) {
+  if (status === "canceled" || status === "cancelled") {
+    // Explicit cancellation (user replaced plan) — distinct from natural expiry.
+    return "canceled";
+  }
+  if (status === "refunded" || status === "failed") {
     return "expired";
   }
   const exp = computeExpiry(txn);

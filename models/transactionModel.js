@@ -95,10 +95,10 @@ const transactionSchema = new mongoose.Schema(
     status: { type: String, default: "paid" }, // paid | failed | refunded...
     subscriptionStatus: {
       type: String,
-      enum: ["active", "expired", "unknown"],
+      enum: ["active", "canceled", "expired", "unknown"],
       default: "unknown",
       index: true,
-    }, // derived from periodEnd; refreshed on read
+    }, // active = period covers now; canceled = replaced by upgrade; expired = period lapsed naturally
 
     customerName: String,
     customerAddress: addressSchema,

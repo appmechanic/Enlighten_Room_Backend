@@ -67,12 +67,14 @@ async function cancelOnProvider(sub) {
   }
 }
 
-// Mark any non-terminal Transaction rows tied to the replaced subscription as
-// expired so the transactions list stops showing them as Active. Match by the
-// provider's subscription ID when available; otherwise fall back to expiring
-// the user's other active subscription transactions on the same provider.
+// Mark non-terminal Transaction rows tied to the replaced subscription as
+// canceled (user upgraded/replaced, distinct from natural period lapse).
+// Match by the provider's subscription ID when available; otherwise fall
+// back to the user's transactions on the same provider.
 async function expirePriorTransactions(sub, userId) {
-  const filter = { subscriptionStatus: { $ne: "expired" } };
+  const filter = {
+    subscriptionStatus: { $nin: ["canceled", "expired"] },
+  };
   const providerSubId = sub?.providerSubscriptionId;
   const userMatch = [{ customerUserId: userId }, { teacherId: userId }];
 
@@ -87,11 +89,11 @@ async function expirePriorTransactions(sub, userId) {
 
   try {
     await Transaction.updateMany(filter, {
-      $set: { subscriptionStatus: "expired", status: "canceled" },
+      $set: { subscriptionStatus: "canceled", status: "canceled" },
     });
   } catch (err) {
     console.error(
-      "Failed to expire prior transactions on subscription cancel:",
+      "Failed to mark prior transactions canceled on subscription replace:",
       err?.message || err
     );
   }
