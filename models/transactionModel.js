@@ -93,6 +93,12 @@ const transactionSchema = new mongoose.Schema(
     amount: { type: Number, default: 0 }, // minor units (cents)
     currency: { type: String, default: "usd" },
     status: { type: String, default: "paid" }, // paid | failed | refunded...
+    subscriptionStatus: {
+      type: String,
+      enum: ["active", "expired", "unknown"],
+      default: "unknown",
+      index: true,
+    }, // derived from periodEnd; refreshed on read
 
     customerName: String,
     customerAddress: addressSchema,

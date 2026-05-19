@@ -8,6 +8,7 @@ import transactionModel from "../models/transactionModel.js";
 import User from "../models/user.js";
 import { addSendEmail } from "../utils/addSendEmail.js";
 import { expandSessionOccurrences } from "../utils/expandSessionRecurrence.js";
+import { computeSubscriptionStatus } from "../utils/subscriptionStatus.js";
 
 // Create new teacher
 // export const createTeacher = async (req, res) => {
@@ -123,7 +124,45 @@ export const getAllTeachers = async (req, res) => {
     const teachers = await User.find({ userRole: "teacher" }).select(
       "image firstName lastName userName email phone userRole city province is_active is_verified country language settings"
     );
-    res.json(teachers);
+
+    // For each teacher, pick the latest transaction, recompute live status,
+    // persist any drift, and attach the status to the response.
+    const ids = teachers.map((t) => t._id);
+    const latestIds = await transactionModel.aggregate([
+      { $match: { teacherId: { $in: ids } } },
+      { $sort: { createdAt: -1 } },
+      { $group: { _id: "$teacherId", txId: { $first: "$_id" } } },
+    ]);
+    const latestDocs = await transactionModel.find({
+      _id: { $in: latestIds.map((r) => r.txId) },
+    });
+    const bulkOps = [];
+    const statusByTeacher = new Map();
+    for (const doc of latestDocs) {
+      const live = computeSubscriptionStatus(doc);
+      statusByTeacher.set(String(doc.teacherId), live);
+      if (doc.subscriptionStatus !== live) {
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: doc._id },
+            update: { $set: { subscriptionStatus: live } },
+          },
+        });
+      }
+    }
+    if (bulkOps.length) {
+      try {
+        await transactionModel.bulkWrite(bulkOps, { ordered: false });
+      } catch (e) {
+        console.error("subscriptionStatus bulkWrite failed:", e?.message);
+      }
+    }
+
+    const withStatus = teachers.map((t) => ({
+      ...t.toObject(),
+      subscriptionStatus: statusByTeacher.get(String(t._id)) || "none",
+    }));
+    res.json(withStatus);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

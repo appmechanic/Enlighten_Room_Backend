@@ -9,6 +9,8 @@ import {
 import Discount from "../models/PromotionModel.js";
 import User from "../models/user.js";
 import CurrencyRate from "../models/CurrencyRate.js";
+import { computeSubscriptionStatus } from "../utils/subscriptionStatus.js";
+import { cancelPreviousSubscription } from "../utils/cancelPreviousSubscription.js";
 
 // ---- helpers ----
 
@@ -423,47 +425,52 @@ export async function startSubscription(req, res) {
         });
       }
 
-      // ---------- UPGRADE FLOW (restart cycle, charge new minus credit) ----------
+      // ---------- REPLACE FLOW: cancel previous immediately, NO refund/credit ----------
+      // Policy: when a teacher buys a new plan while an active subscription exists,
+      // the old one ends right away and we do NOT credit or refund the unused time.
       const upgradeFromSubscriptionId = req.body.upgradeFromSubscriptionId;
       const upgradeCouponMode = (
         req.body.upgradeCouponMode || "auto"
       ).toLowerCase(); // "auto" | "stack" | "never"
-      let creditCents = 0;
+      const creditCents = 0; // intentionally zero — no proration, no refund
 
       if (upgradeFromSubscriptionId) {
-        // 1) Read the old subscription
         const oldSub = await stripe.subscriptions.retrieve(
           upgradeFromSubscriptionId,
           { expand: ["items.data.price.product"] }
         );
 
-        // Safety: old sub must belong to this customer
         if (oldSub.customer !== customerId) {
           return res
             .status(400)
             .json({ error: "Subscription/customer mismatch" });
         }
 
-        // 2) Remaining-time credit (in cents) from old sub
-        creditCents = computeUpgradeCreditCents(oldSub, finalCents);
-
-        console.log("creditCents", creditCents);
-
-        // 3) Negative invoice item (credit) for the NEXT invoice
-        if (creditCents > 0) {
-          await stripe.invoiceItems.create({
-            customer: customerId,
-            currency,
-            amount: -creditCents,
-            description: `Credit for unused time on ${planNameFromSub(oldSub)}`,
-          });
-        }
-
-        // 4) Cancel old sub immediately WITHOUT Stripe proration
+        // Cancel old sub immediately with no proration and no final invoice.
         await stripe.subscriptions.cancel(upgradeFromSubscriptionId, {
           prorate: false,
           invoice_now: false,
         });
+
+        // Mark all transactions for the old subscription as expired in our DB
+        // so the admin/teacher tables reflect the replacement immediately.
+        try {
+          await Transaction.updateMany(
+            { "stripe.subscriptionId": upgradeFromSubscriptionId },
+            { $set: { subscriptionStatus: "expired", status: "canceled" } }
+          );
+        } catch (e) {
+          console.error("Failed to mark old Stripe sub expired:", e?.message);
+        }
+      }
+
+      // Defensive: if any other active subscription is still on file for this
+      // user (different provider, or client didn't pass upgradeFromSubscriptionId),
+      // cancel it now with no refund.
+      try {
+        await cancelPreviousSubscription(userId);
+      } catch (e) {
+        console.error("cancelPreviousSubscription failed:", e?.message);
       }
 
       // Coupon application policy
@@ -1303,6 +1310,33 @@ async function upsertFromPaymentIntent(pi, eventId) {
   );
 }
 
+// Recompute live subscriptionStatus for each loaded transaction, persist any
+// drift to MongoDB, and return a Map<txnIdString, status> for the response.
+async function refreshSubscriptionStatuses(items) {
+  const ops = [];
+  const live = new Map();
+  for (const t of items) {
+    const computed = computeSubscriptionStatus(t);
+    live.set(String(t._id), computed);
+    if (t.subscriptionStatus !== computed) {
+      ops.push({
+        updateOne: {
+          filter: { _id: t._id },
+          update: { $set: { subscriptionStatus: computed } },
+        },
+      });
+    }
+  }
+  if (ops.length) {
+    try {
+      await Transaction.bulkWrite(ops, { ordered: false });
+    } catch (e) {
+      console.error("subscriptionStatus bulkWrite failed:", e?.message);
+    }
+  }
+  return live;
+}
+
 // ---------- GET: all transactions of a teacher ----------
 export const getTeacherTransactions = async (req, res) => {
   try {
@@ -1320,6 +1354,8 @@ export const getTeacherTransactions = async (req, res) => {
         .limit(limit),
       Transaction.countDocuments({ teacherId }),
     ]);
+
+    const liveStatus = await refreshSubscriptionStatuses(items);
 
     const data = items.map((t) => {
       const hasPayPal = !!(t?.paypal?.orderId || t?.paypal?.captureId);
@@ -1357,6 +1393,8 @@ export const getTeacherTransactions = async (req, res) => {
         createdAt: t?.createdAt || null,
         provider,
         method: t?.method || provider,
+        subscriptionStatus:
+          liveStatus.get(String(t._id)) || t?.subscriptionStatus || "unknown",
         stripe: hasStripe
           ? {
               invoiceId: t?.stripe?.invoiceId || "",
@@ -1406,6 +1444,8 @@ export const getAllTransactions = async (req, res) => {
       Transaction.countDocuments(),
     ]);
 
+    const liveStatus = await refreshSubscriptionStatuses(items);
+
     const data = items.map((t) => {
       const hasPayPal = !!(t?.paypal?.orderId || t?.paypal?.captureId);
       const hasStripe = !!(
@@ -1444,8 +1484,11 @@ export const getAllTransactions = async (req, res) => {
         userAddress: t?.customerAddress || null,
         amount: t?.amount ?? null,
         currency: t?.currency || "USD",
+        createdAt: t?.createdAt || null,
         provider,
         method: t?.method || provider,
+        subscriptionStatus:
+          liveStatus.get(String(t._id)) || t?.subscriptionStatus || "unknown",
         stripe: hasStripe
           ? {
               invoiceId: t?.stripe?.invoiceId || "",
