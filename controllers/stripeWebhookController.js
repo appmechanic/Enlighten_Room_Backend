@@ -14,6 +14,20 @@ import User from "../models/user.js";
 import Plan from "../models/PlanModel.js";
 import Subscription from "../models/SubscriptionModel.js";
 import PaymentLog from "../models/PaymentLogModel.js";
+import { cancelPreviousSubscription } from "../utils/cancelPreviousSubscription.js";
+
+// Map a Stripe subscription.status to our SubscriptionModel enum
+// ("active" | "inactive" | "cancelled").
+const mapStripeStatus = (s) => {
+  if (s === "active" || s === "trialing") return "active";
+  if (s === "canceled" || s === "incomplete_expired") return "cancelled";
+  return "inactive";
+};
+
+// Map a Stripe recurring interval ("month" | "year" | ...) to our schema
+// frequency enum ("monthly" | "yearly"). Defaults to monthly.
+const mapStripeFrequency = (interval) =>
+  interval === "year" ? "yearly" : "monthly";
 
 // ==================== HELPERS ====================
 
@@ -252,23 +266,32 @@ async function handleInvoicePaymentSucceeded(event) {
       { upsert: true, new: true }
     );
 
-    // Update subscription status if exists
+    // Update subscription status if a local row exists for this user.
+    // Don't upsert here — the schema requires planType/currency/frequency,
+    // which the checkout-completion path sets. If the local row points at a
+    // different Stripe sub, cancel it (no refund) before flipping to active.
     if (subscriptionId) {
-      await Subscription.findOneAndUpdate(
-        { externalId: subscriptionId },
-        {
-          status: "active",
-          lastPaymentDate: new Date(),
-          totalBilled:
-            (
-              await Transaction.aggregate([
-                { $match: { subscriptionId, status: "completed" } },
-                { $group: { _id: null, total: { $sum: "$amount" } } },
-              ])
-            )[0]?.total || 0,
-        },
-        { upsert: true }
-      );
+      const existing = await Subscription.findOne({ userId: user._id });
+      if (existing) {
+        if (
+          existing.status === "active" &&
+          existing.providerSubscriptionId &&
+          existing.providerSubscriptionId !== subscriptionId
+        ) {
+          await cancelPreviousSubscription(user._id);
+        }
+        await Subscription.updateOne(
+          { userId: user._id },
+          {
+            $set: {
+              status: "active",
+              provider: "stripe",
+              providerSubscriptionId: subscriptionId,
+              cancelledAt: null,
+            },
+          }
+        );
+      }
     }
 
     // Mark user as paid
@@ -378,24 +401,49 @@ async function handleSubscriptionCreated(event) {
     const item = subscription.items?.data?.[0];
     const priceId = item?.price?.id;
     const plan = await Plan.findOne({ stripePriceId: priceId });
+    const mappedStatus = mapStripeStatus(subscription.status);
+    const frequency = mapStripeFrequency(item?.price?.recurring?.interval);
 
-    const subscriptionDoc = {
-      userId: user._id,
-      externalId: subscription.id,
-      status: subscription.status,
-      planId: plan?._id || null,
-      stripePriceId: priceId,
-      currentPeriodStart: new Date(subscription.current_period_start * 1000),
-      currentPeriodEnd: new Date(subscription.current_period_end * 1000),
-      cancelAtPeriodEnd: subscription.cancel_at_period_end,
-      metadata: subscription.metadata || {},
-    };
+    // The checkout-completion handler in paymentController already upserts
+    // the local Subscription with all required fields. If a row exists for
+    // this user with the same provider subscription ID, just sync mutable
+    // fields. If it points at a different provider subscription ID, the
+    // user is being switched — cancel the old one first. Only create a new
+    // row when no prior row exists (e.g., Customer Portal flows that bypass
+    // our checkout endpoint), and only if we have the Plan to satisfy the
+    // schema's required fields.
+    const existing = await Subscription.findOne({ userId: user._id });
 
-    const saved = await Subscription.findOneAndUpdate(
-      { externalId: subscription.id },
-      subscriptionDoc,
-      { upsert: true, new: true }
-    );
+    let saved = null;
+    if (existing) {
+      if (
+        existing.providerSubscriptionId &&
+        existing.providerSubscriptionId !== subscription.id
+      ) {
+        await cancelPreviousSubscription(user._id);
+      }
+      existing.status = mappedStatus;
+      existing.provider = "stripe";
+      existing.providerSubscriptionId = subscription.id;
+      if (plan?._id) existing.planType = plan._id;
+      existing.frequency = frequency;
+      existing.cancelledAt = mappedStatus === "cancelled" ? new Date() : null;
+      saved = await existing.save();
+    } else if (plan?._id) {
+      saved = await Subscription.create({
+        userId: user._id,
+        planType: plan._id,
+        currency: (subscription.currency || "usd").toLowerCase(),
+        status: mappedStatus,
+        frequency,
+        provider: "stripe",
+        providerSubscriptionId: subscription.id,
+      });
+    } else {
+      console.warn(
+        `customer.subscription.created: no Plan for priceId ${priceId}; skipping local insert for user ${user._id}`
+      );
+    }
 
     await logWebhookEvent(
       "customer.subscription.created",
@@ -404,7 +452,7 @@ async function handleSubscriptionCreated(event) {
       {
         subscriptionId: subscription.id,
         userId: user._id,
-        status: subscription.status,
+        status: mappedStatus,
       }
     );
 
@@ -443,21 +491,26 @@ async function handleSubscriptionUpdated(event) {
     const item = subscription.items?.data?.[0];
     const priceId = item?.price?.id;
     const plan = await Plan.findOne({ stripePriceId: priceId });
+    const mappedStatus = mapStripeStatus(subscription.status);
+    const frequency = mapStripeFrequency(item?.price?.recurring?.interval);
+
+    const update = {
+      status: mappedStatus,
+      provider: "stripe",
+      providerSubscriptionId: subscription.id,
+      frequency,
+      cancelledAt: subscription.canceled_at
+        ? new Date(subscription.canceled_at * 1000)
+        : mappedStatus === "cancelled"
+          ? new Date()
+          : null,
+    };
+    if (plan?._id) update.planType = plan._id;
 
     const updated = await Subscription.findOneAndUpdate(
-      { externalId: subscription.id },
-      {
-        status: subscription.status,
-        planId: plan?._id || null,
-        currentPeriodStart: new Date(subscription.current_period_start * 1000),
-        currentPeriodEnd: new Date(subscription.current_period_end * 1000),
-        cancelAtPeriodEnd: subscription.cancel_at_period_end,
-        canceledAt: subscription.canceled_at
-          ? new Date(subscription.canceled_at * 1000)
-          : null,
-        metadata: subscription.metadata || {},
-      },
-      { upsert: true, new: true }
+      { userId: user._id },
+      { $set: update },
+      { new: true }
     );
 
     await logWebhookEvent(
@@ -467,7 +520,7 @@ async function handleSubscriptionUpdated(event) {
       {
         subscriptionId: subscription.id,
         userId: user._id,
-        status: subscription.status,
+        status: mappedStatus,
       }
     );
 
@@ -504,10 +557,12 @@ async function handleSubscriptionDeleted(event) {
     }
 
     const updated = await Subscription.findOneAndUpdate(
-      { externalId: subscription.id },
+      { userId: user._id, providerSubscriptionId: subscription.id },
       {
-        status: "canceled",
-        canceledAt: new Date(),
+        $set: {
+          status: "cancelled",
+          cancelledAt: new Date(),
+        },
       },
       { new: true }
     );

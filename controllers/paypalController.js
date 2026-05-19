@@ -445,7 +445,8 @@ export const capturePayPalOrder = async (req, res) => {
             captureId,
             planId: plan?.paypalPlans?.[interval] || plan?.paypalProductId,
             planName: plan?.name,
-            interval,
+            // Normalize to "month"/"year" — computeExpiry uses Stripe vocabulary.
+            interval: interval === "yearly" ? "year" : "month",
             intervalCount: 1,
           },
           planId,

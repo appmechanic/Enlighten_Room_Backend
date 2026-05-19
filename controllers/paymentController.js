@@ -235,6 +235,11 @@ export const createPaymentIntent = async (req, res) => {
         endDate.setMonth(endDate.getMonth() + 1);
       }
 
+      // Cancel any previously active subscription before activating the new
+      // one; otherwise the unique userId index on Subscription would reject
+      // this create and the user could be left double-subscribed.
+      await cancelPreviousSubscription(userId);
+
       // Create subscription with free coupon
       const subscription = await Subscription.create({
         userId: user._id,
@@ -954,6 +959,18 @@ async function handleInvoicePaymentSucceededEnhanced(
       // Map interval to frequency field required by schema
       const frequency = interval === "year" ? "yearly" : "monthly";
 
+      // If this invoice is for a different Stripe sub than the one we have
+      // on file, the user upgraded between providers/plans — cancel the old
+      // one with no refund before activating the new one.
+      const existing = await Subscription.findOne({ userId });
+      if (
+        existing?.status === "active" &&
+        existing.providerSubscriptionId &&
+        existing.providerSubscriptionId !== subscriptionId
+      ) {
+        await cancelPreviousSubscription(userId);
+      }
+
       await Subscription.findOneAndUpdate(
         { userId },
         {
@@ -964,6 +981,9 @@ async function handleInvoicePaymentSucceededEnhanced(
             frequency: frequency,
             currency: fullInvoice.currency || "usd",
             promoCode: metadata.couponCode || null,
+            provider: "stripe",
+            providerSubscriptionId: subscriptionId,
+            cancelledAt: null,
           },
         },
         { upsert: true, new: true }

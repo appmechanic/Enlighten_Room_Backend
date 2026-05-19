@@ -1,6 +1,7 @@
 import axios from "axios";
 import stripe from "../config/stripe.js";
 import Subscription from "../models/SubscriptionModel.js";
+import Transaction from "../models/transactionModel.js";
 
 async function getPayPalAccessToken() {
   const auth = Buffer.from(
@@ -66,6 +67,36 @@ async function cancelOnProvider(sub) {
   }
 }
 
+// Mark any non-terminal Transaction rows tied to the replaced subscription as
+// expired so the transactions list stops showing them as Active. Match by the
+// provider's subscription ID when available; otherwise fall back to expiring
+// the user's other active subscription transactions on the same provider.
+async function expirePriorTransactions(sub, userId) {
+  const filter = { subscriptionStatus: { $ne: "expired" } };
+  const providerSubId = sub?.providerSubscriptionId;
+  const userMatch = [{ customerUserId: userId }, { teacherId: userId }];
+
+  if (providerSubId && sub.provider === "stripe") {
+    filter["stripe.subscriptionId"] = providerSubId;
+  } else if (providerSubId && sub.provider === "paypal") {
+    filter["paypal.subscriptionId"] = providerSubId;
+  } else {
+    filter.$or = userMatch;
+    if (sub?.provider) filter.provider = sub.provider;
+  }
+
+  try {
+    await Transaction.updateMany(filter, {
+      $set: { subscriptionStatus: "expired", status: "canceled" },
+    });
+  } catch (err) {
+    console.error(
+      "Failed to expire prior transactions on subscription cancel:",
+      err?.message || err
+    );
+  }
+}
+
 /**
  * Cancel the user's current active subscription with the payment provider
  * (no refund issued). Marks the local row as cancelled so the next upsert
@@ -86,6 +117,8 @@ export async function cancelPreviousSubscription(userId) {
   existing.status = "cancelled";
   existing.cancelledAt = new Date();
   await existing.save();
+
+  await expirePriorTransactions(existing, userId);
 
   return existing;
 }

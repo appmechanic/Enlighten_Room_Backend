@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import stripe from "../config/stripe.js";
 import Plan from "../models/PlanModel.js";
 import Transaction from "../models/transactionModel.js";
@@ -1312,11 +1313,34 @@ async function upsertFromPaymentIntent(pi, eventId) {
 
 // Recompute live subscriptionStatus for each loaded transaction, persist any
 // drift to MongoDB, and return a Map<txnIdString, status> for the response.
+//
+// Rule: a teacher can have at most ONE "active" row at any time — the latest
+// transaction for that teacher, AND only if its billing period still covers
+// today. Everything older for the same teacher is "expired".
 async function refreshSubscriptionStatuses(items) {
+  if (!items?.length) return new Map();
+
+  const teacherIdStrings = [
+    ...new Set(items.map((t) => String(t.teacherId)).filter(Boolean)),
+  ];
+  const teacherObjectIds = teacherIdStrings
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+
+  // Latest transaction id per teacher across the WHOLE collection (not just
+  // this page) — that's the only one eligible to be "active".
+  const latestPerTeacher = await Transaction.aggregate([
+    { $match: { teacherId: { $in: teacherObjectIds } } },
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: "$teacherId", txId: { $first: "$_id" } } },
+  ]);
+  const latestIds = new Set(latestPerTeacher.map((r) => String(r.txId)));
+
   const ops = [];
   const live = new Map();
   for (const t of items) {
-    const computed = computeSubscriptionStatus(t);
+    const isLatest = latestIds.has(String(t._id));
+    const computed = isLatest ? computeSubscriptionStatus(t) : "expired";
     live.set(String(t._id), computed);
     if (t.subscriptionStatus !== computed) {
       ops.push({
