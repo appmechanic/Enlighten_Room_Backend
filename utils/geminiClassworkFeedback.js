@@ -105,6 +105,36 @@ async function buildTeacherSection(teacherId) {
   }
 }
 
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const BASE_DELAY_MS = 500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function generateContentWithRetry(request) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await ai.models.generateContent(request);
+    } catch (err) {
+      lastErr = err;
+      const status = err?.status ?? err?.error?.code;
+      if (!RETRYABLE_STATUSES.has(status) || attempt === MAX_ATTEMPTS) {
+        throw err;
+      }
+      const backoff = BASE_DELAY_MS * 2 ** (attempt - 1);
+      const jitter = Math.floor(Math.random() * BASE_DELAY_MS);
+      console.warn(
+        `[ClassworkFeedback] Gemini ${status} on attempt ${attempt}/${MAX_ATTEMPTS}; retrying in ${backoff + jitter}ms`
+      );
+      await sleep(backoff + jitter);
+    }
+  }
+  throw lastErr;
+}
+
 function parseJsonResponse(text) {
   if (!text) return null;
   const match = text.match(/\{[\s\S]*\}/);
@@ -170,7 +200,7 @@ export async function getClassworkAiFeedback({
 
   parts.push({ text: promptLines.join("\n") });
 
-  const result = await ai.models.generateContent({
+  const result = await generateContentWithRetry({
     model: "gemini-2.5-flash",
     contents: [{ role: "user", parts }],
     config: { systemInstruction, responseMimeType: "application/json" },

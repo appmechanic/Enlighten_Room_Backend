@@ -483,6 +483,7 @@ export const submitAnswer = async (req, res) => {
       part3: '',
       newQuestion: '',
     };
+    let aiFailed = false;
 
     if (!aiExpired) {
       try {
@@ -497,7 +498,19 @@ export const submitAnswer = async (req, res) => {
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
+        aiFailed = true;
       }
+    }
+
+    // If AI failed entirely, don't penalize the student: skip saving the submission
+    // and let the frontend roll back the hint count / cooldown.
+    if (aiFailed) {
+      return res.status(503).json({
+        message: 'AI feedback is temporarily unavailable. Please try again shortly.',
+        aiFailed: true,
+        aiAllowed,
+        aiExpired,
+      });
     }
 
     const isCorrect = Boolean(aiResult.correct);
