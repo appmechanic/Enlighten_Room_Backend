@@ -1,13 +1,11 @@
 import { Parser as Json2csvParser } from 'json2csv';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
-import { GoogleGenAI } from "@google/genai";
 import ClassworkModel from '../models/ClassworkModel.js';
-import { getGeminiScoreAndFeedback } from '../utils/geminiScoreFeedback.js';
+import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
+import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
@@ -421,24 +419,34 @@ export const addQuestion = async (req, res) => {
   }
 };
 
-// Submit answer (student side)
+// Submit answer + get AI feedback (single merged endpoint replacing /submit + /ai-hint)
 export const submitAnswer = async (req, res) => {
   try {
-    const { id , questionId, studentId, studentName, answer, roomId, aiUsed } = req.body;
-    const lookup = roomId ? { _id: id,  id: questionId, roomId } : { id: questionId };
+    const {
+      id,
+      questionId,
+      studentId,
+      studentName,
+      answer,
+      roomId,
+      aiUsed,
+      teacherId,
+      overrideQuestionText,
+    } = req.body;
+
+    const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
     const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
-    
+
     if (!question) {
       return res.status(404).json({
-        message: roomId ? 'Question not found for this room' : 'Question not found'
+        message: roomId ? 'Question not found for this room' : 'Question not found',
       });
     }
     if (!question.roomId && roomId) question.roomId = roomId;
 
-    // Check if question has expired
     const answerExpiryState = getExpiryState(question.createdAt, getQuestionExpirySeconds(question));
     if (answerExpiryState.isExpired) {
-        return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
+      return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
     }
 
     if (question.format === 'textbox') {
@@ -449,61 +457,127 @@ export const submitAnswer = async (req, res) => {
       }
     }
 
-    // Get AI-based score, feedback, and correctness
-    let aiScore = 0;
-    let feedback = '';
-    let isCorrect = false;
-    let aiExpired = false;
     const aiAllowed = question.aiAllowed !== false;
+    const aiExpiryState = aiAllowed
+      ? getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question))
+      : { isExpired: true };
+    const aiExpired = !aiAllowed || aiExpiryState.isExpired;
+
     const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
       roomId: question.roomId || roomId,
       questionId: question.id || questionId,
       studentId,
     });
-   
-    try {
-      const aiResult = await getGeminiScoreAndFeedback(
-        question.question,
-        normalizedAnswer,
-        question.image,
-        question.correctAnswer,
-        question.format
-      );
-      aiScore = aiResult.aiScore;
-      feedback = aiResult.feedback;
-      isCorrect = aiResult.isCorrect;
-    } catch (aiErr) {
-      console.error('AI scoring failed:', aiErr);
-    }
-    
 
-    // Check if student already submitted an answer
-    const existingSubmissionIndex = question.submitted.findIndex(
-      (s) => s.studentId === studentId
-    );
+    // When the student is iterating on an AI-generated follow-up question (case b),
+    // the frontend sends `overrideQuestionText` so AI sees the new question, not the original.
+    const questionTextForAi = (typeof overrideQuestionText === 'string' && overrideQuestionText.trim())
+      ? overrideQuestionText.trim()
+      : question.question;
+    const isFollowUp = questionTextForAi !== question.question;
+
+    let aiResult = {
+      correct: false,
+      part1: '',
+      part2: '',
+      part3: '',
+      newQuestion: '',
+    };
+
+    if (!aiExpired) {
+      try {
+        aiResult = await getClassworkAiFeedback({
+          questionText: questionTextForAi,
+          answer: normalizedAnswer,
+          correctAnswer: isFollowUp ? '' : question.correctAnswer,
+          questionImage: isFollowUp ? null : question.image,
+          format: question.format,
+          studentName,
+          teacherId,
+        });
+      } catch (aiErr) {
+        console.error('[Classwork] AI feedback failed:', aiErr);
+      }
+    }
+
+    const isCorrect = Boolean(aiResult.correct);
+    const feedback = aiResult.part2 || '';
+
+    const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
     if (existingSubmissionIndex !== -1) {
-      // Update existing answer
-      question.submitted[existingSubmissionIndex].answer = normalizedAnswer;
-      question.submitted[existingSubmissionIndex].isCorrect = isCorrect;
-      question.submitted[existingSubmissionIndex].aiUsed = aiUsed;
-      question.submitted[existingSubmissionIndex].studentName = studentName;
-      question.submitted[existingSubmissionIndex].aiScore = aiScore;
-      question.submitted[existingSubmissionIndex].feedback = feedback;
-      question.submitted[existingSubmissionIndex].submittedAt = new Date();
+      const submission = question.submitted[existingSubmissionIndex];
+      submission.answer = normalizedAnswer;
+      submission.isCorrect = isCorrect;
+      submission.aiUsed = aiUsed;
+      submission.studentName = studentName;
+      submission.feedback = feedback;
+      submission.submittedAt = new Date();
     } else {
-      // Add new answer
-      question.submitted.push({ studentId, studentName, answer: normalizedAnswer, isCorrect, aiUsed, aiScore, feedback, submittedAt: new Date() });
+      question.submitted.push({
+        studentId,
+        studentName,
+        answer: normalizedAnswer,
+        isCorrect,
+        aiUsed,
+        feedback,
+        submittedAt: new Date(),
+      });
     }
     await question.save();
+
+    // Persist case-c report data: questions, latest answer, latest part 2, full part-3 history.
+    try {
+      await ClassworkAiReport.findOneAndUpdate(
+        { roomId: question.roomId, questionId: question.id, studentId },
+        {
+          $setOnInsert: {
+            roomId: question.roomId,
+            questionId: question.id,
+            studentId,
+            originalQuestion: question.question,
+          },
+          $set: {
+            studentName: studentName || 'Unknown',
+            lastAnswer: normalizedAnswer,
+            lastPart2: aiResult.part2 || '',
+          },
+          $push: {
+            interactions: {
+              questionText: questionTextForAi,
+              studentAnswer: normalizedAnswer,
+              aiPart1: aiResult.part1 || '',
+              aiPart2: aiResult.part2 || '',
+              aiPart3: aiResult.part3 || '',
+              correct: isCorrect,
+              newQuestion: aiResult.newQuestion || '',
+              timestamp: new Date(),
+            },
+            ...(aiResult.part3 ? { allPart3: aiResult.part3 } : {}),
+          },
+        },
+        { upsert: true, new: true }
+      );
+    } catch (reportErr) {
+      console.error('[Classwork] Failed to upsert AI report:', reportErr);
+    }
+
     res.status(200).json({
       message: 'Answer submitted',
       isCorrect,
-      aiScore,
       aiAllowed,
       aiExpired,
+      // Case a (incorrect): student sees part1 + part2; teacher sees student answer + part2 replacing prior.
+      // Case b (correct): student sees part2 confirmation + newQuestion; teacher sees the final answer marked correct.
+      // Part 3 is intentionally NOT returned — it belongs only in the report.
+      ai: {
+        correct: isCorrect,
+        part1: aiResult.part1 || '',
+        part2: aiResult.part2 || '',
+        newQuestion: aiResult.newQuestion || '',
+      },
       feedback,
       correctAnswer: question.correctAnswer,
-      data: question.submitted
+      data: question.submitted,
     });
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
@@ -593,116 +667,3 @@ export const getQuestions = async (req, res) => {
   }
 };
 
-// Save AI Hint Usage (before final answer submission)
-export const saveAiHintUsage = async (req, res) => {
-  try {
-    const { questionId, roomId, studentId, studentName, currentAnswer, image } = req.body;
-
-    if (!questionId || !roomId || !studentId) {
-      return res.status(400).json({ message: 'questionId, roomId, and studentId are required.' });
-    }
-
-    if (!currentAnswer && !image) {
-      return res.status(400).json({ message: 'Either currentAnswer or image is required.' });
-    }
-
-    // Find the question
-    const question = await ClassworkModel.findOne({ id: questionId, roomId }).sort({ createdAt: -1 });
-
-    if (!question) {
-      return res.status(404).json({ message: 'Question not found for this room.' });
-    }
-
-    // Check if AI is allowed
-    if (question.aiAllowed === false) {
-      return res.status(403).json({ message: 'AI hints are disabled for this question.' });
-    }
-
-    // Check if AI hint time has expired
-    const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
-    if (aiExpiryState.isExpired) {
-      return res.status(403).json({ message: 'AI hint time expired for this question.' });
-    }
-
-    // Generate AI hint using Gemini
-    const systemInstruction = `
-      You are a warm, patient, and encouraging tutor (like a caring parent)
-      who reads a student's classwork attempt and provides short, supportive,
-      and educational guidance.
-
-      Rules:
-      - Start advice with the student's name if provided
-      - Never give final answers unless the student has failed 3 times
-      - Be concise, child-friendly, and encouraging
-      - Provide hints to guide the student to the correct answer
-    `;
-
-    let inputArr = [];
-    if (image) {
-      const base64Image = image.includes(',') ? image.split(',')[1] : image;
-      inputArr.push({
-        inlineData: {
-          data: base64Image,
-          mimeType: 'image/jpeg',
-        },
-      });
-    }
-
-    const questionText = `Question: ${question.question}`;
-    const answerText = currentAnswer ? `Student's current answer: ${typeof currentAnswer === 'string' ? currentAnswer : JSON.stringify(currentAnswer)}` : '';
-    const promptText = studentName
-      ? `${studentName}: ${questionText}. ${answerText}`
-      : `${questionText}. ${answerText}`;
-
-    inputArr.push({ text: promptText });
-
-    const result = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: inputArr,
-      config: { systemInstruction },
-    });
-    const hint = result.text || 'No hint available';
-
-    // Find or create submission for this student
-    const existingSubmissionIndex = question.submitted.findIndex(
-      (s) => s.studentId === studentId
-    );
-
-    if (existingSubmissionIndex !== -1) {
-      // Update existing submission
-      const submission = question.submitted[existingSubmissionIndex];
-      
-      // Add current answer to preSubmitAnswers if it's different
-      if (currentAnswer && JSON.stringify(submission.answer) !== JSON.stringify(currentAnswer)) {
-        submission.preSubmitAnswers.push(currentAnswer);
-      }
-      
-      // Add hint to aiHintsUsed
-      submission.aiHintsUsed.push(hint);
-    } else {
-      // Create new submission with pre-submit data
-      question.submitted.push({
-        studentId,
-        studentName: studentName || 'Unknown',
-        answer: currentAnswer || '',
-        isCorrect: false,
-        aiScore: 0,
-        aiUsed: '0x',
-        feedback: '',
-        preSubmitAnswers: currentAnswer ? [currentAnswer] : [],
-        aiHintsUsed: [hint],
-      });
-    }
-
-    await question.save();
-
-    res.status(200).json({
-      message: 'AI hint saved',
-      hint,
-      aiExpiryState,
-    });
-  } catch (err) {
-    console.error('Error in saveAiHintUsage:', err);
-    res.status(500).json({ message: 'Error generating AI hint', error: err.message });
-  }
-};
