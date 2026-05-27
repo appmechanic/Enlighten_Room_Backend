@@ -9,21 +9,40 @@ const TeacherAIConfigSchema = new mongoose.Schema(
       index: true, // teacher / tutor
     },
 
-    // WHAT to say to AI (criteria / focus)
+    // Classwork and Assignment AI Feedback Prompt
     prompt: {
       type: String,
       required: true,
       trim: true,
     },
 
-    // HOW reports & replies should sound (tone / format)
+    // Generating Assignment Prompt
+    assignmentPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
+    // Generating Test Prompt
+    generatingTestPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
+    // Generating Report Prompt
+    reportPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
     style: {
       type: String,
       trim: true,
       default: "",
     },
 
-    // WHICH features / behaviour to use (questions, hints, examples, etc.)
     features: {
       type: String,
       trim: true,

@@ -43,6 +43,7 @@ export const upsertMyAIConfig = asyncHandler(async (req, res) => {
   const {
     prompt,
     assignmentPrompt,
+    generatingTestPrompt,
     reportPrompt,
     style = "",
     features = "",
@@ -70,6 +71,7 @@ export const upsertMyAIConfig = asyncHandler(async (req, res) => {
     {
       prompt: prompt.trim(),
       assignmentPrompt: (assignmentPrompt || "").trim(),
+      generatingTestPrompt: (generatingTestPrompt || "").trim(),
       reportPrompt: (reportPrompt || "").trim(),
       style: (style || "").trim(),
       features: (features || "").trim(),
