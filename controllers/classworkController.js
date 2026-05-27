@@ -1,5 +1,6 @@
 import { Parser as Json2csvParser } from 'json2csv';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
+import mongoose from 'mongoose';
 import ClassworkModel from '../models/ClassworkModel.js';
 import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
 import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
@@ -545,8 +546,33 @@ export const submitAnswer = async (req, res) => {
     }
     await question.save();
 
-    // Persist case-c report data: questions, latest answer, latest part 2, full part-3 history.
+    // Persist case-c report data: questions, latest answer, latest part 2, full
+    // part-3 history. Each interaction is assigned its own ObjectId here so the
+    // matching `allPart3` entry can reference it via `interactionId`.
     try {
+      const interactionId = new mongoose.Types.ObjectId();
+      const interactionAt = new Date();
+      const interaction = {
+        _id: interactionId,
+        questionText: questionTextForAi,
+        studentAnswer: normalizedAnswer,
+        aiPart1: aiResult.part1 || '',
+        aiPart2: aiResult.part2 || '',
+        aiPart3: aiResult.part3 || '',
+        correct: isCorrect,
+        newQuestion: aiResult.newQuestion || '',
+        timestamp: interactionAt,
+      };
+
+      const pushOps = { interactions: interaction };
+      if (aiResult.part3) {
+        pushOps.allPart3 = {
+          interactionId,
+          text: aiResult.part3,
+          timestamp: interactionAt,
+        };
+      }
+
       await ClassworkAiReport.findOneAndUpdate(
         { roomId: question.roomId, questionId: question.id, studentId },
         {
@@ -561,19 +587,7 @@ export const submitAnswer = async (req, res) => {
             lastAnswer: normalizedAnswer,
             lastPart2: aiResult.part2 || '',
           },
-          $push: {
-            interactions: {
-              questionText: questionTextForAi,
-              studentAnswer: normalizedAnswer,
-              aiPart1: aiResult.part1 || '',
-              aiPart2: aiResult.part2 || '',
-              aiPart3: aiResult.part3 || '',
-              correct: isCorrect,
-              newQuestion: aiResult.newQuestion || '',
-              timestamp: new Date(),
-            },
-            ...(aiResult.part3 ? { allPart3: aiResult.part3 } : {}),
-          },
+          $push: pushOps,
         },
         { upsert: true, new: true }
       );
@@ -625,7 +639,11 @@ export const viewAnswers = async (req, res) => {
   }
 };
 
-// View all answers overview for a room (teacher side)
+// View all answers overview for a room (teacher side).
+// Merges ClassworkModel.submitted (the live answer slice) with the
+// ClassworkAiReport persisted history so the report modal can show the
+// question image, AI Part 3 history, per-interaction trail, and any bonus
+// question generated when the student answered correctly.
 export const viewAllAnswers = async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -633,6 +651,14 @@ export const viewAllAnswers = async (req, res) => {
     const filter = { roomId };
     if (lessonName !== undefined) filter.lessonName = lessonName;
     const questions = await ClassworkModel.find(filter);
+
+    // Batch-load all AI reports for this room so we don't hit the DB once per
+    // (question, student) pair. Index by `${questionId}::${studentId}`.
+    const aiReports = await ClassworkAiReport.find({ roomId }).lean();
+    const reportIndex = new Map();
+    aiReports.forEach((r) => {
+      reportIndex.set(`${r.questionId}::${r.studentId}`, r);
+    });
 
     const data = questions.map((q) => {
       const submitted = q.submitted.map((s) => {
@@ -643,9 +669,27 @@ export const viewAllAnswers = async (req, res) => {
           .join('')
           .slice(0, 2)
           .toUpperCase();
+
+        const report = reportIndex.get(`${q.id}::${s.studentId}`) || null;
+
+        // Pull the latest bonus question (newQuestion) by walking interactions
+        // in reverse — the most recent non-empty value wins.
+        let latestNewQuestion = '';
+        if (report && Array.isArray(report.interactions)) {
+          for (let i = report.interactions.length - 1; i >= 0; i -= 1) {
+            const nq = report.interactions[i]?.newQuestion;
+            if (nq) {
+              latestNewQuestion = nq;
+              break;
+            }
+          }
+        }
+
         return {
+          // Existing shape — kept verbatim for backwards compatibility.
           name,
           initials,
+          studentId: s.studentId,
           answer: formatSubmittedAnswerText(s.answer),
           answerImage: getSubmittedAnswerImage(s.answer),
           isCorrect: s.isCorrect || false,
@@ -654,10 +698,47 @@ export const viewAllAnswers = async (req, res) => {
           feedback: s.feedback || '',
           preSubmitAnswers: s.preSubmitAnswers || [],
           submittedAt: s.submittedAt || null,
+
+          // AI report fields (case-c storage). Empty defaults when no AI
+          // history exists for this student/question.
+          aiReport: report
+            ? {
+                lastPart2: report.lastPart2 || '',
+                // `allPart3` is now [{ interactionId, text, timestamp }]. Old
+                // documents may still hold plain strings — normalize both
+                // shapes so the frontend never has to branch.
+                allPart3: (report.allPart3 || []).map((entry) =>
+                  typeof entry === 'string'
+                    ? { interactionId: null, text: entry, timestamp: null }
+                    : {
+                        interactionId: entry.interactionId || null,
+                        text: entry.text || '',
+                        timestamp: entry.timestamp || null,
+                      }
+                ),
+                interactions: (report.interactions || []).map((it) => ({
+                  interactionId: it._id || null,
+                  questionText: it.questionText || '',
+                  studentAnswer: it.studentAnswer,
+                  aiPart1: it.aiPart1 || '',
+                  aiPart2: it.aiPart2 || '',
+                  aiPart3: it.aiPart3 || '',
+                  newQuestion: it.newQuestion || '',
+                  correct: Boolean(it.correct),
+                  timestamp: it.timestamp || null,
+                })),
+                newQuestion: latestNewQuestion,
+                originalQuestion: report.originalQuestion || '',
+              }
+            : {
+                lastPart2: '',
+                allPart3: [],
+                interactions: [],
+                newQuestion: '',
+                originalQuestion: '',
+              },
         };
       });
-
-      const submittedStudentNames = submitted.map((s) => s.name);
 
       return {
         id: q.id,
@@ -665,6 +746,11 @@ export const viewAllAnswers = async (req, res) => {
         label: q.label,
         title: q.title,
         question: q.question,
+        // The question image is stored once on the Classwork document and
+        // referenced by `q.id`. The frontend can use `questionImageId` as a
+        // stable handle (per spec #9: avoid duplicating images).
+        image: q.image || '',
+        questionImageId: q.image ? q.id : '',
         lessonName: q.lessonName || '',
         format: q.format || q.formatLabel || '',
         aiAllowed: q.aiAllowed !== false,
