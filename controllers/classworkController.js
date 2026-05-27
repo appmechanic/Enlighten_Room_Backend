@@ -319,8 +319,15 @@ export const sendClassworkReportToStudentsAndParents = async (req, res) => {
 
 export const clearAllClasswork = async (req, res) => {
   try {
-    await ClassworkModel.deleteMany({});
-    res.status(200).json({ message: 'All classwork cleared.' });
+    const [questions, reports] = await Promise.all([
+      ClassworkModel.deleteMany({}),
+      ClassworkAiReport.deleteMany({}),
+    ]);
+    res.status(200).json({
+      message: 'All classwork cleared.',
+      deletedQuestions: questions.deletedCount ?? 0,
+      deletedAiReports: reports.deletedCount ?? 0,
+    });
   } catch (err) {
     res.status(500).json({ message: 'Error clearing classwork', error: err.message });
   }

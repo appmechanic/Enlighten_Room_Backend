@@ -6,7 +6,7 @@ import { uploadClasswork } from "../utils/multer.js";
 // Download per-student classwork report as CSV
 const router = express.Router();
 
-router.get("/", clearAllClasswork)
+router.get("/clear-all", clearAllClasswork);
 router.post("/submit", submitAnswer);
 router.get("/questions/:roomId", getQuestions);
 router.get("/answers-overview/:roomId", viewAllAnswers);
