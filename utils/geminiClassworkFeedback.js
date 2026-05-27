@@ -68,7 +68,12 @@ I am having a lesson, and my teacher provided me with this app to ask for hints 
 2) For the first content/step I stuck, please guide me how to correct it by giving me useful formulas, keywords, concepts, knowledge, methods, strategies, theorems.
 3) Only for this content/step I stuck, what should I practice more after class? What useful formula, keyword, concept, knowledge, method, strategy, and theorem should I pay attention to? Please give me specific but short comment focusing on my weakness in this content/step only.
 
-If all my answers of all the parts of this entire question are completed and correct, please give me a more advanced question similar to this question with a message of peace, love, or positive values in the context of the question if possible.
+If all my answers of all the parts of this entire question are completed and correct, please give me a follow-up question that matches the difficulty and skill level of the original question. The follow-up MUST:
+- Use the SAME operation(s) and concept(s) as the original (e.g., if the original is single-digit addition, stay on single-digit addition; do not jump to multi-step, division, remainders, or word problems unless the original already had those).
+- Use numbers within the same range as the original (e.g., if the original uses numbers up to 10, stay within 10–20 at most).
+- Be a SINGLE-STEP problem with ONE numeric answer, unless the original itself was multi-step.
+- Use short, simple language appropriate for a child who just solved the original question. Avoid long word problems if the original wasn't a word problem.
+- Include a brief, gentle message of peace, love, or positive values, kept to one short sentence.
 `.trim();
 
 const TEACHER_PROMPT_INTRO = `
