@@ -457,11 +457,11 @@ export const submitAnswer = async (req, res) => {
       }
     }
 
+    // aiExpiryTime on the question is the per-click AI cooldown enforced by the FE,
+    // not a total window since createdAt. The answer-window check above already gates
+    // whether the student can submit at all. So AI runs whenever aiAllowed is true.
     const aiAllowed = question.aiAllowed !== false;
-    const aiExpiryState = aiAllowed
-      ? getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question))
-      : { isExpired: true };
-    const aiExpired = !aiAllowed || aiExpiryState.isExpired;
+    const aiExpired = !aiAllowed;
 
     const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
       roomId: question.roomId || roomId,
@@ -566,6 +566,15 @@ export const submitAnswer = async (req, res) => {
       isCorrect,
       aiAllowed,
       aiExpired,
+      // Debug echo — surface exactly what the AI saw so we can verify the inputs.
+      debug: {
+        originalQuestion: question.question,
+        questionTextForAi,
+        isFollowUp,
+        studentAnswer: normalizedAnswer,
+        format: question.format,
+        expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
+      },
       // Case a (incorrect): student sees part1 + part2; teacher sees student answer + part2 replacing prior.
       // Case b (correct): student sees part2 confirmation + newQuestion; teacher sees the final answer marked correct.
       // Part 3 is intentionally NOT returned — it belongs only in the report.
