@@ -447,9 +447,11 @@ export const submitAnswer = async (req, res) => {
     let resolvedTeacherId = teacherId;
     if (!resolvedTeacherId && roomId) {
       try {
-        const session = await Session.findOne({ sessionUrl: roomId })
-          .select("classroomId")
-          .lean();
+        const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        const session = await Session.findOne({
+            sessionUrl: { $regex: escapedRoomId, $options: "i" }
+        });
         if (session?.classroomId) {
           const classroom = await Classroom.findById(session.classroomId)
             .select("teacherId")
