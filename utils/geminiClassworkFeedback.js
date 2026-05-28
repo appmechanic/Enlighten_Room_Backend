@@ -61,20 +61,6 @@ async function sourceToInlineData(source) {
   return { base64: Buffer.from(buffer).toString("base64"), mimeType: "image/jpeg" };
 }
 
-const STANDARD_STUDENT_PROMPT = `
-I am having a lesson, and my teacher provided me with this app to ask for hints from you. If not all my contents/steps and answers are correct, please tell me:
-
-1) Which one content/step is correct just before I stuck?
-2) For the first content/step I stuck, please guide me how to correct it by giving me useful formulas, keywords, concepts, knowledge, methods, strategies, theorems.
-3) Only for this content/step I stuck, what should I practice more after class? What useful formula, keyword, concept, knowledge, method, strategy, and theorem should I pay attention to? Please give me specific but short comment focusing on my weakness in this content/step only.
-
-If all my answers of all the parts of this entire question are completed and correct, please give me a MORE ADVANCED question similar to this one — one that pushes me one small step further (e.g., a slightly larger range, an extra step, or a closely related concept), while still being solvable based on what I just demonstrated. Include a brief, gentle message of peace, love, or positive values in the context of the question when possible. Keep the language short and appropriate for a child who just solved the original question.
-`.trim();
-
-const TEACHER_PROMPT_INTRO = `
-The following is my teacher's personalized prompt. Please follow his/her advice and the above structure to give me feedback if the personalized prompt is good to my learning. But please ignore it if it doesn't fit my needs.
-`.trim();
-
 const JSON_RESPONSE_RULES = `
 You MUST respond with a single JSON object only (no prose, no markdown fences). Schema:
 {
@@ -90,15 +76,11 @@ Use the student's name when given. Keep each field child-friendly and concise.
 async function buildTeacherSection(teacherId) {
   if (!teacherId) return "";
   try {
-    const config = await TeacherAIConfig.findOne({ user: teacherId }).lean();
-    if (!config) return "";
-    const { prompt, style, features } = config;
-    const parts = [];
-    if (prompt) parts.push(`Teacher prompt: ${prompt}`);
-    if (style) parts.push(`Preferred style: ${style}`);
-    if (features) parts.push(`Requested features: ${features}`);
-    if (!parts.length) return "";
-    return `${TEACHER_PROMPT_INTRO}\n\n${parts.join("\n")}`;
+    const config = await TeacherAIConfig.findOne({ user: teacherId })
+      .select("prompt")
+      .lean();
+    const prompt = (config?.prompt || "").trim();
+    return prompt ? `Teacher prompt: ${prompt}` : "";
   } catch (err) {
     console.error("[ClassworkFeedback] Failed to load TeacherAIConfig:", err);
     return "";
@@ -159,7 +141,6 @@ export async function getClassworkAiFeedback({
   const teacherSection = await buildTeacherSection(teacherId);
 
   const systemInstruction = [
-    STANDARD_STUDENT_PROMPT,
     teacherSection,
     JSON_RESPONSE_RULES,
   ]
