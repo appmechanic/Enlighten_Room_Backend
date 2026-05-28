@@ -1,5 +1,8 @@
 import { GoogleGenAI } from "@google/genai";
 import ClassworkModel from '../models/ClassworkModel.js';
+import Classroom from "../models/classroomModel.js";
+import TeacherAIConfig from "../models/teacherAiConfigModel.js";
+import StandardPrompt from "../models/standardPromptModel.js";
 import { getExpiryState, getQuestionAiExpirySeconds } from '../utils/classworkExpiry.js';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -137,7 +140,30 @@ const getGeminiHint = async (req, res) => {
     }
 
     // Answer is incorrect - generate a personalized hint
-    const systemInstruction = `
+    let standardPromptText = "";
+    let assistantPromptText = "";
+
+    try {
+      const [standardDoc, classroom] = await Promise.all([
+        StandardPrompt.findOne({ key: "global" }).lean(),
+        roomId ? Classroom.findById(roomId).select("teacherId").lean() : null,
+      ]);
+
+      standardPromptText = (standardDoc?.aiHintPrompt || "").trim();
+
+      if (classroom?.teacherId) {
+        const teacherConfig = await TeacherAIConfig.findOne({
+          user: classroom.teacherId,
+        })
+          .select("prompt")
+          .lean();
+        assistantPromptText = (teacherConfig?.prompt || "").trim();
+      }
+    } catch (err) {
+      console.error("[GeminiHint] Failed to load standard/assistant prompt:", err);
+    }
+
+    const baseRules = `
       You are a warm, patient, and encouraging tutor (like a caring parent).
       A student has answered a question incorrectly. Your job is to provide a short, 
       supportive, and personalized hint that addresses their specific mistake.
@@ -150,6 +176,17 @@ const getGeminiHint = async (req, res) => {
       - Start with the student's name if provided
       ${studentName ? `- Address the student as "${studentName}"` : ''}
       `;
+
+    const standardBlock = standardPromptText
+      ? `Standard prompt:\n${standardPromptText}`
+      : "";
+    const assistantBlock = assistantPromptText
+      ? `Assistant prompt:\n${assistantPromptText}`
+      : "";
+
+    const systemInstruction = [standardBlock, assistantBlock, baseRules]
+      .filter(Boolean)
+      .join("\n\n");
 
     // Build the prompt with question and student's incorrect answer
     let hintPrompt = `

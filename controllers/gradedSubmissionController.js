@@ -6,6 +6,7 @@ import { OpenAI } from "openai";
 import GradeSetting from "../models/GradeSetting.js";
 import Assignment from "../models/AssignmentModel.js";
 import Classroom from "../models/classroomModel.js";
+import StandardPrompt from "../models/standardPromptModel.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 export const getAllGradedSubmissions = async (req, res) => {
@@ -449,15 +450,27 @@ export const getAssignmentsReport = async (req, res) => {
 
     const grade = getGrade(percentage);
 
+    let reportPrompt = "";
+    try {
+      const standardDoc = await StandardPrompt.findOne({ key: "global" }).lean();
+      reportPrompt = (standardDoc?.reportPrompt || "").trim();
+    } catch (err) {
+      console.error("[Reports] Failed to load standard report prompt:", err);
+    }
+
     // 4. AI summary
     const prompt = `You are an academic evaluator. Based on the following assignment remarks, generate a performance summary for the student using simple words :\n\n${allRemarks.join(
       "\n\n"
     )}\n\nThe student's overall percentage is ${percentage}%, and their grade is ${grade}. Provide a concise and encouraging summary with in 2-4 lines.`;
 
+    const systemInstruction = reportPrompt
+      ? `${reportPrompt}\n\nYou are an academic assistant.`
+      : "You are an academic assistant.";
+
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4",
       messages: [
-        { role: "system", content: "You are an academic assistant." },
+        { role: "system", content: systemInstruction },
         { role: "user", content: prompt },
       ],
       temperature: 0.3,

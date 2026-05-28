@@ -1,6 +1,7 @@
 // utils/emailAssignmentReport.js
 import User from "../models/user.js";
 import Question from "../models/QuestionModel.js"; // adjust path if needed
+import StandardPrompt from "../models/standardPromptModel.js";
 import { sendEmail } from "./sendEmail.js";
 import {
   displayName,
@@ -93,6 +94,17 @@ export async function sendAssignmentReportEmails({
   grade,
   includeRemarks,
 }) {
+  let emailPromptHtml = "";
+  try {
+    const standardDoc = await StandardPrompt.findOne({ key: "global" }).lean();
+    const emailPrompt = (standardDoc?.emailPrompt || "").trim();
+    if (emailPrompt) {
+      emailPromptHtml = escapeHtml(emailPrompt).replace(/\n/g, "<br />");
+    }
+  } catch (err) {
+    console.error("[EmailReport] Failed to load standard email prompt:", err);
+  }
+
   const student = await User.findById(studentId, {
     _id: 1,
     firstName: 1,
@@ -175,6 +187,10 @@ export async function sendAssignmentReportEmails({
     ).toFixed(2)}%${grade ? ` (${escapeHtml(grade)})` : ""}</strong>`;
 
     const metaLine = `Questions: <strong>${stats.totalQuestions}</strong> &nbsp;•&nbsp; Attempted: <strong>${stats.attempted}</strong> &nbsp;•&nbsp; Correct: <strong>${stats.correct}</strong>`;
+
+    const standardPromptSection = emailPromptHtml
+      ? `<p style="margin:0 0 12px;font-size:14px;line-height:1.5;color:#374151;">${emailPromptHtml}</p>`
+      : "";
 
     // Build table rows with mobile labels included inside each cell (shown on mobile)
     const rows = stats.questions.length
@@ -287,6 +303,7 @@ export async function sendAssignmentReportEmails({
               <tr>
                 <td class="content">
                   <h2 class="title">${title}</h2>
+                  ${standardPromptSection}
                   <p style="margin:0 0 8px;">${scoreLine}</p>
                   <p class="muted" style="margin:0 0 12px;">${metaLine}</p>
 
