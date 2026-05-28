@@ -207,10 +207,21 @@ export async function getClassworkAiFeedback({
 
   parts.push({ text: promptLines.join("\n") });
 
+  console.log("[ClassworkFeedback] Gemini request:", {
+    model: "gemini-2.5-flash",
+    contents: [{ role: "user", parts }],
+    config: { systemInstruction, responseMimeType: "application/json" },
+  });
+
   const result = await generateContentWithRetry({
     model: "gemini-2.5-flash",
     contents: [{ role: "user", parts }],
     config: { systemInstruction, responseMimeType: "application/json" },
+  });
+
+  console.log("[ClassworkFeedback] Gemini raw response:", {
+    text: result?.text || "",
+    response: result?.response || null,
   });
 
   const responseText = result.text || "";
