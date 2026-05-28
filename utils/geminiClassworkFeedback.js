@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
+import StandardPrompt from "../models/standardPromptModel.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -87,6 +88,17 @@ async function buildTeacherSection(teacherId) {
   }
 }
 
+async function buildStandardSection() {
+  try {
+    const doc = await StandardPrompt.findOne({ key: "global" }).lean();
+    const prompt = (doc?.aiHintPrompt || "").trim();
+    return prompt ? `Standard prompt: ${prompt}` : "";
+  } catch (err) {
+    console.error("[ClassworkFeedback] Failed to load StandardPrompt:", err);
+    return "";
+  }
+}
+
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
@@ -138,9 +150,22 @@ export async function getClassworkAiFeedback({
   studentName,
   teacherId,
 }) {
-  const teacherSection = await buildTeacherSection(teacherId);
+  const [standardSection, teacherSection] = await Promise.all([
+    buildStandardSection(),
+    buildTeacherSection(teacherId),
+  ]);
+
+  console.log(
+    "[ClassworkFeedback] Using standard prompt:",
+    standardSection ? "yes" : "no"
+  );
+  console.log(
+    "[ClassworkFeedback] Using teacher prompt:",
+    teacherSection ? "yes" : "no"
+  );
 
   const systemInstruction = [
+    standardSection,
     teacherSection,
     JSON_RESPONSE_RULES,
   ]
