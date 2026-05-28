@@ -150,6 +150,7 @@ export async function getClassworkAiFeedback({
   studentName,
   teacherId,
 }) {
+  console.log("[ClassworkFeedback] teacherId:", teacherId || "(missing)");
   const [standardSection, teacherSection] = await Promise.all([
     buildStandardSection(),
     buildTeacherSection(teacherId),

@@ -3,6 +3,8 @@ import { PutObjectCommand } from '@aws-sdk/client-s3';
 import mongoose from 'mongoose';
 import ClassworkModel from '../models/ClassworkModel.js';
 import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
+import Classroom from '../models/classroomModel.js';
+import Session from '../models/SessionModel.js';
 import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
@@ -442,6 +444,23 @@ export const submitAnswer = async (req, res) => {
       overrideQuestionText,
     } = req.body;
 
+    let resolvedTeacherId = teacherId;
+    if (!resolvedTeacherId && roomId) {
+      try {
+        const session = await Session.findOne({ sessionUrl: roomId })
+          .select("classroomId")
+          .lean();
+        if (session?.classroomId) {
+          const classroom = await Classroom.findById(session.classroomId)
+            .select("teacherId")
+            .lean();
+          resolvedTeacherId = classroom?.teacherId || null;
+        }
+      } catch (err) {
+        console.error("[Classwork] Failed to resolve teacherId from roomId:", err);
+      }
+    }
+
     const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
     const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
 
@@ -502,7 +521,7 @@ export const submitAnswer = async (req, res) => {
           questionImage: isFollowUp ? null : question.image,
           format: question.format,
           studentName,
-          teacherId,
+          teacherId: resolvedTeacherId,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
