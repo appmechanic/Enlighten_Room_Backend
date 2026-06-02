@@ -31,6 +31,8 @@ const ClassworkSchema = new mongoose.Schema({
   aiAllowed: { type: Boolean, default: true },
   aiExpiryTime: { type: Number, default: 30 },
   createdAt: { type: Date, default: Date.now },
+  released: { type: Boolean, default: true },
+  releasedAt: { type: Date, default: null },
   submitted: { type: [SubmittedSchema], default: [] },
 });
 

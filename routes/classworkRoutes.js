@@ -1,5 +1,5 @@
 import express from "express";
-import { clearAllClasswork, addQuestion, submitAnswer, viewAnswers, viewAllAnswers, getQuestions, sendClassworkReportToStudentsAndParents, downloadAllAnswersCsvReport } from "../controllers/classworkController.js";
+import { clearAllClasswork, addQuestion, submitAnswer, viewAnswers, viewAllAnswers, getQuestions, getStagedQuestions, releaseQuestion, sendClassworkReportToStudentsAndParents, downloadAllAnswersCsvReport, startLessonForRoom, renameLessonForRoom, endLessonForRoom, getActiveLessonForRoom, updateStagedQuestion } from "../controllers/classworkController.js";
 import { uploadClasswork } from "../utils/multer.js";
 
 // Download all answers as a detailed CSV report
@@ -7,16 +7,23 @@ import { uploadClasswork } from "../utils/multer.js";
 const router = express.Router();
 
 router.get("/clear-all", clearAllClasswork);
+router.post("/start-lesson/:roomId", startLessonForRoom);
+router.post("/end-lesson/:roomId", endLessonForRoom);
+router.patch("/rename-lesson/:roomId", renameLessonForRoom);
+router.get("/active-lesson/:roomId", getActiveLessonForRoom);
 router.post("/submit", submitAnswer);
 router.get("/questions/:roomId", getQuestions);
+router.get("/staged/:roomId", getStagedQuestions);
+router.patch("/:questionId/release", releaseQuestion);
 router.get("/answers-overview/:roomId", viewAllAnswers);
 // Download all answers as a report (JSON)
 router.get("/download-csv-report/:roomId", downloadAllAnswersCsvReport);
 router.post("/send-report", sendClassworkReportToStudentsAndParents);
 router.get("/answers/:questionId", viewAnswers);
-router.post("/question", 
-    uploadClasswork, 
+router.post("/question",
+    uploadClasswork,
     addQuestion
 );
+router.put("/question/:questionId", uploadClasswork, updateStagedQuestion);
 
 export default router;

@@ -3,7 +3,7 @@ import ClassworkModel from '../models/ClassworkModel.js';
 import Classroom from "../models/classroomModel.js";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
-import { getExpiryState, getQuestionAiExpirySeconds } from '../utils/classworkExpiry.js';
+import { getExpiryState, getQuestionAiExpirySeconds, getQuestionTimerStart } from '../utils/classworkExpiry.js';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -46,7 +46,10 @@ const getGeminiHint = async (req, res) => {
       return res.status(403).json({ error: 'AI hints are disabled for this question.' });
     }
 
-    const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
+    if (!question.released) {
+      return res.status(403).json({ error: 'This question has not been released yet.' });
+    }
+    const aiExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionAiExpirySeconds(question));
     // if (aiExpiryState.isExpired) {
     //   return res.status(403).json({ error: 'AI hint time expired for this question.' });
     // }
@@ -103,7 +106,7 @@ const getGeminiHint = async (req, res) => {
       }
 
       // Check if classwork is expired
-      const aiExpiryState = getExpiryState(question.createdAt, getQuestionAiExpirySeconds(question));
+      const aiExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionAiExpirySeconds(question));
       if (aiExpiryState.isExpired) {
         return res.json({ correct: true, message: 'Classwork expired. No more questions.' });
       }

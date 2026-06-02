@@ -56,3 +56,11 @@ export function getExpiryState(createdAt, durationSeconds) {
 export function isValidExpirySeconds(value) {
   return isPositiveSeconds(value);
 }
+
+// The expiry clock should run from when students can actually see the
+// question. For staged-and-released questions that is `releasedAt`; for
+// questions created live (legacy flow) it falls back to `createdAt`.
+export function getQuestionTimerStart(question) {
+  if (!question || typeof question !== 'object') return null;
+  return question.releasedAt || question.createdAt || null;
+}

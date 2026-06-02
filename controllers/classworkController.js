@@ -5,8 +5,9 @@ import ClassworkModel from '../models/ClassworkModel.js';
 import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
 import Classroom from '../models/classroomModel.js';
 import Session from '../models/SessionModel.js';
+import Lesson from '../models/LessonModel.js';
 import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
-import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, isValidExpirySeconds } from '../utils/classworkExpiry.js';
+import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
 
@@ -320,6 +321,179 @@ export const sendClassworkReportToStudentsAndParents = async (req, res) => {
 };
 
 
+// Resolve the Session + Classroom for a given roomId (derived from sessionUrl).
+// Returns { sessionId, classroomId } or nulls when no Session matches the room.
+async function resolveSessionContext(roomId) {
+  if (!roomId) return { sessionId: null, classroomId: null };
+  try {
+    const escaped = roomId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const session = await Session.findOne({
+      sessionUrl: { $regex: escaped, $options: 'i' },
+    })
+      .select('_id classroomId')
+      .lean();
+    return {
+      sessionId: session?._id || null,
+      classroomId: session?.classroomId || null,
+    };
+  } catch (err) {
+    console.warn('[Lesson] resolveSessionContext failed:', err.message);
+    return { sessionId: null, classroomId: null };
+  }
+}
+
+// Start a lesson for a room: adopt any pre-staged classwork (lessonName === "")
+// into the new lesson, and remove classwork belonging to any prior lesson so
+// the new lesson starts clean while preserving pre-created questions. Also
+// persists a Lesson document so we can track the active lesson per room and
+// keep a history for reporting.
+export const startLessonForRoom = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { lessonName, previousLessonName, sessionId, classroomId } =
+      req.body || {};
+    if (!roomId || !lessonName) {
+      return res.status(400).json({ message: 'roomId and lessonName are required.' });
+    }
+    const newName = String(lessonName);
+
+    // Defensive: any lesson still marked active for this room from a prior
+    // run gets closed before we open the new one. Keeps the "only one active
+    // lesson per room" invariant intact even if a previous end call was lost.
+    await Lesson.updateMany(
+      { roomId, status: 'active' },
+      { $set: { status: 'ended', endedAt: new Date() } }
+    );
+
+    // Resolve Session/Classroom from the room when the caller didn't pass them
+    // — keeps the API friendly to the existing client which only knows roomId.
+    let resolvedSessionId = sessionId || null;
+    let resolvedClassroomId = classroomId || null;
+    if (!resolvedSessionId || !resolvedClassroomId) {
+      const ctx = await resolveSessionContext(roomId);
+      resolvedSessionId = resolvedSessionId || ctx.sessionId;
+      resolvedClassroomId = resolvedClassroomId || ctx.classroomId;
+    }
+
+    const lesson = await Lesson.create({
+      name: newName,
+      roomId,
+      sessionId: resolvedSessionId,
+      classroomId: resolvedClassroomId,
+      startedAt: new Date(),
+      status: 'active',
+    });
+
+    // Delete classwork tied to any other lesson in this room. Empty
+    // lessonName === "" means "pre-staged, not yet assigned" and is preserved.
+    const removed = await ClassworkModel.deleteMany({
+      roomId,
+      lessonName: { $nin: ['', newName] },
+    });
+    // Adopt staged questions into the new lesson.
+    const adopted = await ClassworkModel.updateMany(
+      { roomId, lessonName: '' },
+      { $set: { lessonName: newName } }
+    );
+    return res.status(200).json({
+      message: 'Lesson started.',
+      lesson,
+      lessonName: newName,
+      removedPrior: removed?.deletedCount ?? 0,
+      adoptedStaged: adopted?.modifiedCount ?? 0,
+      previousLessonName: previousLessonName || '',
+    });
+  } catch (err) {
+    console.error('startLessonForRoom error:', err);
+    res.status(500).json({ message: 'Error starting lesson', error: err.message });
+  }
+};
+
+// End the active lesson in a room. Marks the Lesson row ended and clears
+// the staged classwork buffer (lessonName === '') so the next session starts
+// with an empty tray. Classwork already tagged with this lesson's name is
+// preserved for reporting.
+export const endLessonForRoom = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!roomId) {
+      return res.status(400).json({ message: 'roomId is required.' });
+    }
+    const ended = await Lesson.findOneAndUpdate(
+      { roomId, status: 'active' },
+      { $set: { status: 'ended', endedAt: new Date() } },
+      { new: true, sort: { startedAt: -1 } }
+    );
+    const clearedStaged = await ClassworkModel.deleteMany({
+      roomId,
+      lessonName: '',
+    });
+    return res.status(200).json({
+      message: ended ? 'Lesson ended.' : 'No active lesson found; staged buffer cleared.',
+      lesson: ended,
+      clearedStaged: clearedStaged?.deletedCount ?? 0,
+    });
+  } catch (err) {
+    console.error('endLessonForRoom error:', err);
+    res.status(500).json({ message: 'Error ending lesson', error: err.message });
+  }
+};
+
+// Rename the active lesson in a room. Updates all classwork tagged with the
+// previous lesson name so reports/filters still resolve, and renames the
+// active Lesson document.
+export const renameLessonForRoom = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { from, to } = req.body || {};
+    if (!roomId || !to) {
+      return res.status(400).json({ message: 'roomId and `to` are required.' });
+    }
+    const trimmedTo = String(to).trim();
+    if (!trimmedTo) {
+      return res.status(400).json({ message: '`to` cannot be empty.' });
+    }
+    const fromName = typeof from === 'string' ? from : '';
+    const updated = await ClassworkModel.updateMany(
+      { roomId, lessonName: fromName },
+      { $set: { lessonName: trimmedTo } }
+    );
+    const renamedLesson = await Lesson.findOneAndUpdate(
+      { roomId, status: 'active' },
+      { $set: { name: trimmedTo } },
+      { new: true, sort: { startedAt: -1 } }
+    );
+    return res.status(200).json({
+      message: 'Lesson renamed.',
+      from: fromName,
+      to: trimmedTo,
+      updated: updated?.modifiedCount ?? 0,
+      lesson: renamedLesson,
+    });
+  } catch (err) {
+    console.error('renameLessonForRoom error:', err);
+    res.status(500).json({ message: 'Error renaming lesson', error: err.message });
+  }
+};
+
+// Return the currently-active Lesson for a room, if any. Useful for the
+// React side to check whether students can join (item 3 in the spec).
+export const getActiveLessonForRoom = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!roomId) {
+      return res.status(400).json({ message: 'roomId is required.' });
+    }
+    const lesson = await Lesson.findOne({ roomId, status: 'active' }).sort({
+      startedAt: -1,
+    });
+    return res.status(200).json({ lesson });
+  } catch (err) {
+    console.error('getActiveLessonForRoom error:', err);
+    res.status(500).json({ message: 'Error fetching active lesson', error: err.message });
+  }
+};
+
 export const clearAllClasswork = async (req, res) => {
   try {
     const [questions, reports] = await Promise.all([
@@ -390,11 +564,18 @@ export const addQuestion = async (req, res) => {
       });
     }
 
+    // Staged questions are created with released:false and have no
+    // releasedAt until the teacher hits the release endpoint. Live-created
+    // questions (legacy flow) default to released:true and get a releasedAt
+    // stamp now so the expiry timer matches the createdAt window.
+    const stagedAsDraft = question?.released === false;
     const newQuestion = await ClassworkModel.create({
       ...question,
       roomId,
       aiAllowed: resolvedAiAllowed,
       aiExpiryTime: resolvedAiAllowed ? resolvedAiExpiryTime : question?.expiryTime,
+      released: !stagedAsDraft,
+      releasedAt: stagedAsDraft ? null : new Date(),
     });
     if (req.file){
       newQuestion.image = req.file.location;
@@ -426,6 +607,37 @@ export const addQuestion = async (req, res) => {
   } catch (err) {
     console.error('Error in addQuestion:', err);
     res.status(500).json({ message: 'Error adding question', error: err.message });
+  }
+};
+
+// Release a staged question. Flips released=true and stamps releasedAt so
+// the expiry timer starts from now, while createdAt stays as the original
+// staging time (preserves audit trail).
+export const releaseQuestion = async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    const { roomId } = req.body || {};
+    const filter = roomId ? { id: questionId, roomId } : { id: questionId };
+    const question = await ClassworkModel.findOneAndUpdate(
+      filter,
+      { $set: { released: true, releasedAt: new Date() } },
+      { new: true }
+    );
+    if (!question) {
+      return res.status(404).json({ message: 'Question not found' });
+    }
+    res.status(200).json({
+      message: 'Question released',
+      question: {
+        ...question.toObject(),
+        // Mirror addQuestion's response shape so the teacher UI can reuse
+        // the same client-side render path.
+        image: question.image,
+      },
+    });
+  } catch (err) {
+    console.error('Error in releaseQuestion:', err);
+    res.status(500).json({ message: 'Error releasing question', error: err.message });
   }
 };
 
@@ -473,7 +685,10 @@ export const submitAnswer = async (req, res) => {
     }
     if (!question.roomId && roomId) question.roomId = roomId;
 
-    const answerExpiryState = getExpiryState(question.createdAt, getQuestionExpirySeconds(question));
+    if (!question.released) {
+      return res.status(403).json({ message: 'This question has not been released yet.' });
+    }
+    const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
     if (answerExpiryState.isExpired) {
       return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
     }
@@ -789,17 +1004,73 @@ export const viewAllAnswers = async (req, res) => {
   }
 };
 
-// Get questions for a room (student side)
+// Get questions for a room (student side). Only released questions are
+// returned — staged-but-not-yet-released drafts stay hidden.
 export const getQuestions = async (req, res) => {
   try {
     const { roomId } = req.params;
     const { lessonName } = req.query;
-    const filter = { roomId };
+    const filter = { roomId, released: true };
     if (lessonName !== undefined) filter.lessonName = lessonName;
     const questions = await ClassworkModel.find(filter).select('-submitted -correctAnswer');
     res.status(200).json(questions);
   } catch (err) {
     res.status(500).json({ message: 'Error fetching questions', error: err.message });
+  }
+};
+
+// Update an existing classwork question. Intended for the staged (pre-lesson)
+// editor — refuses to mutate a question that has already been released so we
+// don't change the wording out from under students who are mid-answer.
+export const updateStagedQuestion = async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    const patch = req.body?.question ? JSON.parse(req.body.question) : (req.body || {});
+    const existing = await ClassworkModel.findOne({ id: questionId });
+    if (!existing) {
+      return res.status(404).json({ message: 'Question not found' });
+    }
+    if (existing.released) {
+      return res.status(409).json({ message: 'Released questions cannot be edited' });
+    }
+    const editable = [
+      'label', 'title', 'question', 'format', 'formatLabel',
+      'options', 'blanks', 'maxLength', 'correctAnswer',
+      'expiryTime', 'aiAllowed', 'aiExpiryTime',
+    ];
+    for (const key of editable) {
+      if (patch[key] !== undefined) existing[key] = patch[key];
+    }
+    if (existing.aiAllowed && existing.aiExpiryTime == null) {
+      existing.aiExpiryTime = existing.expiryTime;
+    }
+    if (req.file) {
+      existing.image = req.file.location;
+    } else if (patch.removeImage === true) {
+      existing.image = undefined;
+    }
+    await existing.save();
+    res.status(200).json(existing.toObject());
+  } catch (err) {
+    console.error('Error in updateStagedQuestion:', err);
+    res.status(500).json({ message: 'Error updating question', error: err.message });
+  }
+};
+
+// Get the full queue for a room (teacher side) — includes both released
+// questions and staged drafts so the teacher can manage their lineup.
+export const getStagedQuestions = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { lessonName } = req.query;
+    const filter = { roomId };
+    if (lessonName !== undefined) filter.lessonName = lessonName;
+    const questions = await ClassworkModel.find(filter)
+      .select('-submitted')
+      .sort({ createdAt: 1 });
+    res.status(200).json(questions);
+  } catch (err) {
+    res.status(500).json({ message: 'Error fetching staged questions', error: err.message });
   }
 };
 
