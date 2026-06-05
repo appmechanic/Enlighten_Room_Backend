@@ -7,6 +7,7 @@ import Classroom from '../models/classroomModel.js';
 import Session from '../models/SessionModel.js';
 import Lesson from '../models/LessonModel.js';
 import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
+import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
@@ -428,6 +429,13 @@ export const endLessonForRoom = async (req, res) => {
       roomId,
       lessonName: '',
     });
+
+    if (ended) {
+      generateAndStoreClassReport(ended).catch((err) => {
+        console.error('[endLessonForRoom] background class report failed:', err);
+      });
+    }
+
     return res.status(200).json({
       message: ended ? 'Lesson ended.' : 'No active lesson found; staged buffer cleared.',
       lesson: ended,
@@ -491,6 +499,116 @@ export const getActiveLessonForRoom = async (req, res) => {
   } catch (err) {
     console.error('getActiveLessonForRoom error:', err);
     res.status(500).json({ message: 'Error fetching active lesson', error: err.message });
+  }
+};
+
+// Gather a lesson's classwork + teacherId, run the AI summary, and persist
+// the result onto the Lesson document. Used both by the end-lesson hook
+// (fire-and-forget) and by the manual regenerate endpoint. Throws on
+// terminal failure so callers can log/respond appropriately.
+async function generateAndStoreClassReport(lessonDoc) {
+  if (!lessonDoc) return null;
+  const lessonQuestions = await ClassworkModel.find({
+    roomId: lessonDoc.roomId,
+    lessonName: lessonDoc.name,
+  }).lean();
+
+  const teacherId = lessonDoc.classroomId
+    ? (await Classroom.findById(lessonDoc.classroomId).select('teacherId').lean())?.teacherId
+    : null;
+
+  const classReport = await generateClassReportSummary({
+    lessonName: lessonDoc.name,
+    questions: lessonQuestions,
+    teacherId,
+  });
+
+  if (!classReport) return null;
+
+  lessonDoc.classReport = classReport;
+  await lessonDoc.save();
+  return classReport;
+}
+
+// Manual regenerate endpoint. POST /api/classwork/class-report/:roomId/regenerate
+// Body may include { lessonName } to retry a single lesson; otherwise every
+// ended lesson in the room whose classReport.summary is missing is retried.
+// Each retry runs in the background — the response returns immediately with
+// the list of lessons that were queued.
+export const regenerateClassReportForRoom = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!roomId) {
+      return res.status(400).json({ message: 'roomId is required.' });
+    }
+    const { lessonName } = req.body || {};
+
+    const query = { roomId, status: 'ended' };
+    if (lessonName && typeof lessonName === 'string') {
+      query.name = lessonName;
+    }
+    const lessons = await Lesson.find(query).sort({ endedAt: -1 });
+
+    const queued = [];
+    for (const lesson of lessons) {
+      if (!lessonName && lesson.classReport && lesson.classReport.summary) {
+        // Already has a summary — skip unless explicitly named.
+        continue;
+      }
+      queued.push({
+        lessonId: lesson._id,
+        name: lesson.name,
+        endedAt: lesson.endedAt,
+      });
+      generateAndStoreClassReport(lesson).catch((err) => {
+        console.error(
+          `[regenerateClassReportForRoom] failed for lesson ${lesson._id} (${lesson.name}):`,
+          err,
+        );
+      });
+    }
+
+    return res.status(202).json({
+      message:
+        queued.length === 0
+          ? 'No lessons needed regeneration.'
+          : `Queued ${queued.length} lesson(s) for regeneration.`,
+      queued,
+    });
+  } catch (err) {
+    console.error('regenerateClassReportForRoom error:', err);
+    res.status(500).json({ message: 'Error queuing regeneration', error: err.message });
+  }
+};
+
+// Returns the lesson-level "Class Report" summaries for a room, newest first.
+// Each lesson item carries the AI-generated classReport (summary/generatedAt/
+// model), the lesson name, and endedAt. The React SessionReportModal calls
+// this endpoint to show the class summary by default, before the teacher
+// picks a specific student.
+export const getClassReportForRoom = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!roomId) {
+      return res.status(400).json({ message: 'roomId is required.' });
+    }
+    const lessons = await Lesson.find({ roomId })
+      .sort({ endedAt: -1, startedAt: -1 })
+      .select('name status startedAt endedAt classReport')
+      .lean();
+
+    return res.status(200).json({
+      lessons: lessons.map((l) => ({
+        name: l.name,
+        status: l.status,
+        startedAt: l.startedAt,
+        endedAt: l.endedAt,
+        classReport: l.classReport || null,
+      })),
+    });
+  } catch (err) {
+    console.error('getClassReportForRoom error:', err);
+    res.status(500).json({ message: 'Error fetching class report', error: err.message });
   }
 };
 

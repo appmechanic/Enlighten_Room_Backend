@@ -26,6 +26,14 @@ const LessonSchema = new mongoose.Schema(
       default: "active",
       index: true,
     },
+    // Lesson-level AI summary generated when the teacher ends the lesson.
+    // Stored separately from per-student ClassworkAiReport docs — this is
+    // the "Class Report" the teacher sees by default in the View Report UI.
+    classReport: {
+      summary: { type: String, default: "" },
+      generatedAt: { type: Date, default: null },
+      model: { type: String, default: "" },
+    },
   },
   { timestamps: true }
 );
