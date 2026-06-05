@@ -6,10 +6,11 @@ import StandardPrompt from "../models/standardPromptModel.js";
 // default on the View Report page. Distinct from getClassworkAiFeedback, which
 // runs per student submission and produces individual feedback.
 //
-// Prompt source priority: TeacherAIConfig.reportPrompt (per-teacher override)
-// → StandardPrompt.reportPrompt (global). The lesson's classwork questions and
-// the students' submitted answers are passed in as the user content so Gemini
-// has the material to summarize.
+// Both StandardPrompt.reportPrompt (global) and TeacherAIConfig.reportPrompt
+// (per-teacher) are included in the system instruction — labeled and joined —
+// mirroring the per-student feedback flow. The lesson's classwork questions
+// and the students' submitted answers are passed in as the user content so
+// Gemini has the material to summarize.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -74,27 +75,27 @@ function normalizeAnswerText(value) {
   return String(value);
 }
 
-async function buildPromptSection(teacherId) {
-  // Per-teacher override wins over global. Both fall back to "" silently if
-  // the docs aren't there yet (early bootstrap).
-  let teacherPrompt = "";
-  if (teacherId) {
-    try {
-      const cfg = await TeacherAIConfig.findOne({ user: teacherId })
-        .select("reportPrompt")
-        .lean();
-      teacherPrompt = (cfg?.reportPrompt || "").trim();
-    } catch (err) {
-      console.error("[ClassReportSummary] Failed to load TeacherAIConfig:", err);
-    }
+async function buildTeacherSection(teacherId) {
+  if (!teacherId) return "";
+  try {
+    const cfg = await TeacherAIConfig.findOne({ user: teacherId })
+      .select("reportPrompt")
+      .lean();
+    const prompt = (cfg?.reportPrompt || "").trim();
+    return prompt ? `Teacher prompt: ${prompt}` : "";
+  } catch (err) {
+    console.error("[ClassReportSummary] Failed to load TeacherAIConfig:", err);
+    return "";
   }
-  if (teacherPrompt) return teacherPrompt;
+}
 
+async function buildStandardSection() {
   try {
     const doc = await StandardPrompt.findOne({ key: "global" })
       .select("reportPrompt")
       .lean();
-    return (doc?.reportPrompt || "").trim();
+    const prompt = (doc?.reportPrompt || "").trim();
+    return prompt ? `Standard prompt: ${prompt}` : "";
   } catch (err) {
     console.error("[ClassReportSummary] Failed to load StandardPrompt:", err);
     return "";
@@ -157,8 +158,22 @@ export async function generateClassReportSummary({
     return null;
   }
 
-  const promptSection = await buildPromptSection(teacherId);
-  const systemInstruction = promptSection || FALLBACK_REPORT_PROMPT;
+  const [standardSection, teacherSection] = await Promise.all([
+    buildStandardSection(),
+    buildTeacherSection(teacherId),
+  ]);
+
+  console.log(
+    "[ClassReportSummary] Using standard prompt:",
+    standardSection ? "yes" : "no"
+  );
+  console.log(
+    "[ClassReportSummary] Using teacher prompt:",
+    teacherSection ? "yes" : "no"
+  );
+
+  const combined = [standardSection, teacherSection].filter(Boolean).join("\n\n");
+  const systemInstruction = combined || FALLBACK_REPORT_PROMPT;
 
   const snapshot = buildLessonSnapshot({ lessonName, questions });
 
