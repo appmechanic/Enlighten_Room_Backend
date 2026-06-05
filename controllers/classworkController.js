@@ -689,9 +689,9 @@ export const submitAnswer = async (req, res) => {
       return res.status(403).json({ message: 'This question has not been released yet.' });
     }
     const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
-    if (answerExpiryState.isExpired) {
-      return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
-    }
+    // if (answerExpiryState.isExpired) {
+    //   return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
+    // }
 
     if (question.format === 'textbox') {
       const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
