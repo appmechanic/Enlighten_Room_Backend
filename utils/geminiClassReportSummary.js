@@ -243,14 +243,29 @@ export async function generateClassReportSummary({
   });
 
   const text = (result?.text || "").trim();
-  if (!text) return null;
+  if (!text) {
+    console.warn("[ClassReportSummary] Gemini returned empty text.");
+    return null;
+  }
 
+  // responseMimeType=application/json should guarantee raw JSON, but in
+  // practice the model occasionally still wraps output in ```json fences
+  // or leaks a leading note. Extract the first { ... } block defensively.
   let parsed;
   try {
     parsed = JSON.parse(text);
-  } catch (err) {
-    console.error("[ClassReportSummary] JSON parse failed:", err, text);
-    return null;
+  } catch {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) {
+      console.error("[ClassReportSummary] No JSON object in response:", text);
+      return null;
+    }
+    try {
+      parsed = JSON.parse(match[0]);
+    } catch (err) {
+      console.error("[ClassReportSummary] JSON parse failed:", err, text);
+      return null;
+    }
   }
 
   const studentBreakdown = Array.isArray(parsed?.studentBreakdown)

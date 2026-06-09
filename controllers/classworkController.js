@@ -513,6 +513,14 @@ async function generateAndStoreClassReport(lessonDoc) {
     lessonName: lessonDoc.name,
   }).lean();
 
+  const submissionCount = lessonQuestions.reduce(
+    (n, q) => n + (Array.isArray(q.submitted) ? q.submitted.length : 0),
+    0,
+  );
+  console.log(
+    `[ClassReport] lesson=${lessonDoc._id} name="${lessonDoc.name}" questions=${lessonQuestions.length} submissions=${submissionCount}`,
+  );
+
   const teacherId = lessonDoc.classroomId
     ? (await Classroom.findById(lessonDoc.classroomId).select('teacherId').lean())?.teacherId
     : null;
@@ -523,10 +531,26 @@ async function generateAndStoreClassReport(lessonDoc) {
     teacherId,
   });
 
-  if (!classReport) return null;
+  if (!classReport) {
+    console.warn(
+      `[ClassReport] generation returned null for lesson=${lessonDoc._id} (no submissions or empty AI response).`,
+    );
+    return null;
+  }
 
-  lessonDoc.classReport = classReport;
-  await lessonDoc.save();
+  // Use updateOne with $set rather than doc.save() so the new nested
+  // subdocument array (studentBreakdown) writes through cleanly regardless
+  // of any in-memory path-tracking state on the loaded doc.
+  await Lesson.updateOne(
+    { _id: lessonDoc._id },
+    { $set: { classReport } },
+  );
+  console.log(
+    `[ClassReport] stored for lesson=${lessonDoc._id}: ` +
+      `${classReport.studentBreakdown.length} friction points, ` +
+      `${classReport.nextLessonPivot.length} pivots, ` +
+      `focusSkill="${classReport.targetedHomeworkFocus.focusSkill}"`,
+  );
   return classReport;
 }
 

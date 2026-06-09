@@ -1,5 +1,26 @@
 import mongoose from "mongoose";
 
+// One row of the AI class report's friction-point breakdown.
+// _id is disabled via schema options — it can't be done inside the inline
+// object literal because Mongoose treats `_id: false` there as a path
+// declaration of type Boolean, which conflicts with the auto-generated
+// ObjectId and silently breaks saves.
+const StudentBreakdownSchema = new mongoose.Schema(
+  {
+    frictionPoint: { type: String, default: "" },
+    affectedStudents: { type: [String], default: [] },
+  },
+  { _id: false }
+);
+
+const TargetedHomeworkFocusSchema = new mongoose.Schema(
+  {
+    focusSkill: { type: String, default: "" },
+    pedagogicalReason: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
 // A Lesson is a single occurrence of a Session. Only one Lesson per
 // roomId can be `active` at a time; `endedAt` is stamped when the
 // teacher ends the call (or leaves), and the row is preserved for
@@ -30,17 +51,11 @@ const LessonSchema = new mongoose.Schema(
     // Stored separately from per-student ClassworkAiReport docs — this is
     // the "Class Report" the teacher sees by default in the View Report UI.
     classReport: {
-      studentBreakdown: [
-        {
-          _id: false,
-          frictionPoint: { type: String, default: "" },
-          affectedStudents: { type: [String], default: [] },
-        },
-      ],
+      studentBreakdown: { type: [StudentBreakdownSchema], default: [] },
       nextLessonPivot: { type: [String], default: [] },
       targetedHomeworkFocus: {
-        focusSkill: { type: String, default: "" },
-        pedagogicalReason: { type: String, default: "" },
+        type: TargetedHomeworkFocusSchema,
+        default: () => ({}),
       },
       generatedAt: { type: Date, default: null },
       model: { type: String, default: "" },
