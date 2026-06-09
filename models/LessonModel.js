@@ -30,7 +30,18 @@ const LessonSchema = new mongoose.Schema(
     // Stored separately from per-student ClassworkAiReport docs — this is
     // the "Class Report" the teacher sees by default in the View Report UI.
     classReport: {
-      summary: { type: String, default: "" },
+      studentBreakdown: [
+        {
+          _id: false,
+          frictionPoint: { type: String, default: "" },
+          affectedStudents: { type: [String], default: [] },
+        },
+      ],
+      nextLessonPivot: { type: [String], default: [] },
+      targetedHomeworkFocus: {
+        focusSkill: { type: String, default: "" },
+        pedagogicalReason: { type: String, default: "" },
+      },
       generatedAt: { type: Date, default: null },
       model: { type: String, default: "" },
     },

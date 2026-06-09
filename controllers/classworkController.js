@@ -532,7 +532,7 @@ async function generateAndStoreClassReport(lessonDoc) {
 
 // Manual regenerate endpoint. POST /api/classwork/class-report/:roomId/regenerate
 // Body may include { lessonName } to retry a single lesson; otherwise every
-// ended lesson in the room whose classReport.summary is missing is retried.
+// ended lesson in the room whose classReport is empty is retried.
 // Each retry runs in the background — the response returns immediately with
 // the list of lessons that were queued.
 export const regenerateClassReportForRoom = async (req, res) => {
@@ -551,8 +551,14 @@ export const regenerateClassReportForRoom = async (req, res) => {
 
     const queued = [];
     for (const lesson of lessons) {
-      if (!lessonName && lesson.classReport && lesson.classReport.summary) {
-        // Already has a summary — skip unless explicitly named.
+      const cr = lesson.classReport;
+      const alreadyGenerated =
+        cr &&
+        ((Array.isArray(cr.studentBreakdown) && cr.studentBreakdown.length > 0) ||
+          (Array.isArray(cr.nextLessonPivot) && cr.nextLessonPivot.length > 0) ||
+          (cr.targetedHomeworkFocus && cr.targetedHomeworkFocus.focusSkill));
+      if (!lessonName && alreadyGenerated) {
+        // Already has a report — skip unless explicitly named.
         continue;
       }
       queued.push({

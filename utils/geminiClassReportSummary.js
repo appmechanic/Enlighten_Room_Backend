@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 
@@ -102,15 +102,61 @@ async function buildStandardSection() {
   }
 }
 
-// Fallback prompt used if neither the teacher-specific nor the global
-// reportPrompt is configured. Without this the AI call would still happen
-// but with an empty system instruction.
-const FALLBACK_REPORT_PROMPT = `
-You are summarizing one classroom lesson for the teacher. Produce a concise
-class-level report (not per-student): how the class engaged with each
-question, common strengths, common misconceptions, and one or two suggested
-follow-up actions. Plain text, a few short paragraphs, no markdown.
+// Always-on guidance describing WHAT each field of the structured response
+// means. responseSchema below enforces the JSON shape; this section anchors
+// the model on the semantics of each field. The admin's standard prompt and
+// the teacher's prompt are layered on top — they express pedagogical tone
+// and preferences but do not need to know about the schema.
+const SCHEMA_GUIDANCE = `
+You are summarizing one classroom lesson for the teacher. Use the submitted
+answers to populate this structured class report:
+- studentBreakdown: each item is one concrete friction point observed in the
+  submissions (e.g. "Finding common denominators") plus the real student
+  names affected by it. Only include students who actually struggled with
+  that point — do not invent or pad.
+- nextLessonPivot: 1-3 tactical recommendations the teacher should apply in
+  the next lesson, grounded in what tripped students up here.
+- targetedHomeworkFocus.focusSkill: the single highest-leverage skill to
+  assign as homework practice (e.g. "Balancing chemical equations").
+- targetedHomeworkFocus.pedagogicalReason: a brief justification for that
+  skill choice, tied to the observed gaps.
+Keep every field concrete and grounded in the actual submissions provided.
 `.trim();
+
+// Gemini structured-output schema mirroring the Mongoose classReport subdoc.
+// Forces the model to return valid JSON in the exact shape we persist.
+const CLASS_REPORT_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    studentBreakdown: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          frictionPoint: { type: Type.STRING },
+          affectedStudents: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
+        },
+        required: ["frictionPoint", "affectedStudents"],
+      },
+    },
+    nextLessonPivot: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    targetedHomeworkFocus: {
+      type: Type.OBJECT,
+      properties: {
+        focusSkill: { type: Type.STRING },
+        pedagogicalReason: { type: Type.STRING },
+      },
+      required: ["focusSkill", "pedagogicalReason"],
+    },
+  },
+  required: ["studentBreakdown", "nextLessonPivot", "targetedHomeworkFocus"],
+};
 
 // Compact the lesson's classwork + submissions into a textual snapshot the
 // model can summarize. Per-student answers are listed under each question so
@@ -172,8 +218,12 @@ export async function generateClassReportSummary({
     teacherSection ? "yes" : "no"
   );
 
-  const combined = [standardSection, teacherSection].filter(Boolean).join("\n\n");
-  const systemInstruction = combined || FALLBACK_REPORT_PROMPT;
+  // SCHEMA_GUIDANCE is always sent so the model knows what to put in each
+  // structured field; admin standard prompt and teacher prompt are appended
+  // as additional pedagogical guidance.
+  const systemInstruction = [SCHEMA_GUIDANCE, standardSection, teacherSection]
+    .filter(Boolean)
+    .join("\n\n");
 
   const snapshot = buildLessonSnapshot({ lessonName, questions });
 
@@ -185,14 +235,48 @@ export async function generateClassReportSummary({
         parts: [{ text: snapshot }],
       },
     ],
-    config: { systemInstruction },
+    config: {
+      systemInstruction,
+      responseMimeType: "application/json",
+      responseSchema: CLASS_REPORT_RESPONSE_SCHEMA,
+    },
   });
 
   const text = (result?.text || "").trim();
   if (!text) return null;
 
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    console.error("[ClassReportSummary] JSON parse failed:", err, text);
+    return null;
+  }
+
+  const studentBreakdown = Array.isArray(parsed?.studentBreakdown)
+    ? parsed.studentBreakdown
+        .map((entry) => ({
+          frictionPoint: String(entry?.frictionPoint || "").trim(),
+          affectedStudents: Array.isArray(entry?.affectedStudents)
+            ? entry.affectedStudents.map((s) => String(s).trim()).filter(Boolean)
+            : [],
+        }))
+        .filter((entry) => entry.frictionPoint)
+    : [];
+  const nextLessonPivot = Array.isArray(parsed?.nextLessonPivot)
+    ? parsed.nextLessonPivot.map((s) => String(s).trim()).filter(Boolean)
+    : [];
+  const targetedHomeworkFocus = {
+    focusSkill: String(parsed?.targetedHomeworkFocus?.focusSkill || "").trim(),
+    pedagogicalReason: String(
+      parsed?.targetedHomeworkFocus?.pedagogicalReason || ""
+    ).trim(),
+  };
+
   return {
-    summary: text,
+    studentBreakdown,
+    nextLessonPivot,
+    targetedHomeworkFocus,
     generatedAt: new Date(),
     model: MODEL,
   };
