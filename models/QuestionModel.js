@@ -34,9 +34,23 @@ const questionSchema = new mongoose.Schema(
       enum: ["pending", "approved", "rejected"],
       default: "pending",
     },
-    type: { type: String, enum: ["mcq", "input"], default: "input" },
+    // "input" is the legacy bucket for descriptive answers. New assignments
+    // emit one of the 4 classwork formats so the student form can render the
+    // matching widget (radio / blanks / canvas / textarea).
+    type: {
+      type: String,
+      enum: ["mcq", "input", "fill-blanks", "handwriting", "textbox"],
+      default: "input",
+    },
     options: [String], // for MCQs
+    // Per-blank answers for fill-blanks (one string per blank).
+    blanks: { type: [String], default: [] },
     correctAnswer: [{ type: String }],
+    // Per-question image URL (DO Spaces) when image generation is on.
+    image: { type: String, default: "" },
+    // Cap on AI hints copied from the parent assignment task. Enforced by the
+    // student answer endpoint, surfaced in the student UI.
+    maxAiHints: { type: Number, default: 0, min: 0, max: 10 },
     hints: [{ type: String }],
     answer: [{ type: String }],
     metadata: {

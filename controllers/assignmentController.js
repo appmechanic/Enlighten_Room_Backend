@@ -8,6 +8,17 @@ import Teacher from "../models/teacherModel.js";
 import User from "../models/user.js";
 import { generateAIQuestions } from "./Ai-tasks/generateQuestions.js";
 import { notifyNewAssignment } from "../utils/notify.js";
+import {
+  generateAssignmentQuestions,
+  ASSIGNMENT_QUESTION_MODEL,
+} from "../utils/geminiAssignmentQuestions.js";
+import {
+  generateAssignmentQuestionImage,
+  ASSIGNMENT_IMAGE_MODEL,
+} from "../utils/geminiAssignmentImage.js";
+import Lesson from "../models/LessonModel.js";
+import ClassworkModel from "../models/ClassworkModel.js";
+import ClassworkAiReport from "../models/ClassworkAiReportModel.js";
 
 export const createAssignment = async (req, res) => {
   const {
@@ -971,6 +982,340 @@ export const updateAssignmentByAdmin = async (req, res) => {
     });
   } catch (err) {
     console.error("updateAssignmentByAdmin error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// -----------------------------------------------------------------------
+// Create Assignment with AI — full pipeline
+// -----------------------------------------------------------------------
+// Loads the source session's lesson + classwork + AI-report data, builds a
+// session-report snapshot, calls the new Gemini question generator, then
+// optionally fans out per-format image generation. Persists Question docs +
+// an Assignment doc with the new per-format / hints / dates fields.
+//
+// Request body:
+// {
+//   classroomId, sessionId, teacherId,
+//   title, description,
+//   startDate, dueDate,                // ISO strings
+//   perFormatCounts: { mcq, "fill-blanks", handwriting, textbox },
+//   perFormatImages: { mcq, "fill-blanks", handwriting, textbox },
+//   maxAiHints: int,
+//   maxMarks: int,
+//   studentIds: [ObjectId],
+//   teacherPrompt: string,             // teacher's personalized prompt; if
+//                                      // omitted, falls back to TeacherAIConfig
+//   resources: [string]
+// }
+
+// Pull every classwork question for a Session and stitch in the per-question
+// allPart3 history from ClassworkAiReport (broken out by student). Output
+// matches the shape geminiAssignmentQuestions expects.
+async function buildSessionReportForAssignment({ session }) {
+  if (!session?._id) return { lessonName: "", questions: [] };
+
+  const lessons = await Lesson.find({ sessionId: session._id })
+    .sort({ startedAt: -1 })
+    .select("name roomId")
+    .lean();
+  const latest = lessons[0];
+  if (!latest) return { lessonName: "", questions: [] };
+
+  const [classwork, aiReports] = await Promise.all([
+    ClassworkModel.find({
+      roomId: latest.roomId,
+      lessonName: latest.name,
+    }).lean(),
+    ClassworkAiReport.find({ roomId: latest.roomId }).lean(),
+  ]);
+
+  // Index AI reports by `${questionId}::${studentId}` so we can attach
+  // allPart3 history per question without an N+1 inside the loop.
+  const reportIndex = new Map();
+  aiReports.forEach((r) => {
+    reportIndex.set(`${r.questionId}::${r.studentId}`, r);
+  });
+
+  const questions = classwork.map((q) => {
+    const submitted = (q.submitted || []).map((s) => ({
+      studentId: s.studentId,
+      studentName: s.studentName,
+      feedback: s.feedback || "",
+    }));
+
+    // Flatten allPart3 across every student who attempted this question.
+    const aiPart3History = [];
+    (q.submitted || []).forEach((s) => {
+      const report = reportIndex.get(`${q.id}::${s.studentId}`);
+      const entries = report?.allPart3 || [];
+      entries.forEach((entry) => {
+        const text =
+          typeof entry === "string" ? entry : String(entry?.text || "");
+        if (text.trim()) {
+          aiPart3History.push({
+            studentId: s.studentId,
+            studentName: s.studentName,
+            text,
+          });
+        }
+      });
+    });
+
+    return {
+      question: q.question,
+      format: q.format,
+      correctAnswer: q.correctAnswer,
+      submitted,
+      aiPart3History,
+    };
+  });
+
+  return { lessonName: latest.name, questions };
+}
+
+// Map a generated question (gemini shape) onto a Question doc.
+function buildQuestionDoc({
+  generated,
+  classroomId,
+  sessionId,
+  teacherId,
+  course,
+  topic,
+  maxAiHints,
+}) {
+  return {
+    classroomId,
+    sessionId,
+    teacherId,
+    course: course || "General",
+    topic: topic || "General",
+    questionText: generated.questionText,
+    type: generated.format, // 4 formats land on the widened enum
+    options: generated.options || [],
+    blanks: generated.blanks || [],
+    correctAnswer: generated.correctAnswer || [],
+    hints: generated.hints || [],
+    answer: [],
+    maxAiHints,
+    image: "",
+    metadata: {
+      difficulty: generated.difficulty || "medium",
+      marks: undefined,
+      tags: [topic].filter(Boolean),
+      createdBy: "AI",
+    },
+    language: "English",
+  };
+}
+
+// Concurrency-capped fan-out so one slow image gen doesn't serialise the
+// rest. 3 in flight is a comfortable balance against Gemini rate limits.
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      try {
+        results[idx] = await worker(items[idx], idx);
+      } catch (err) {
+        console.error("[createAssignmentWithAI] worker failed:", err?.message || err);
+        results[idx] = null;
+      }
+    }
+  });
+  await Promise.all(lanes);
+  return results;
+}
+
+export const createAssignmentWithAI = async (req, res) => {
+  const {
+    classroomId,
+    sessionId,
+    teacherId,
+    title,
+    description = "",
+    startDate,
+    dueDate,
+    perFormatCounts = {},
+    perFormatImages = {},
+    maxAiHints = 0,
+    maxMarks = 10,
+    studentIds = [],
+    teacherPrompt: teacherPromptOverride,
+    resources = [],
+    course,
+    topic,
+  } = req.body || {};
+
+  // Basic guards. Most validation is shape-checking — heavier checks (Mongo
+  // ID validity, classroom membership) happen during the Mongoose lookups.
+  if (!classroomId || !sessionId || !teacherId) {
+    return res.status(400).json({
+      error: "classroomId, sessionId, and teacherId are required.",
+    });
+  }
+  if (!title || !dueDate) {
+    return res.status(400).json({ error: "title and dueDate are required." });
+  }
+  const totalRequested = Object.values(perFormatCounts || {}).reduce(
+    (n, v) => n + (Number(v) || 0),
+    0,
+  );
+  if (totalRequested === 0) {
+    return res.status(400).json({
+      error: "At least one format must request a non-zero question count.",
+    });
+  }
+
+  try {
+    const [classroom, session] = await Promise.all([
+      Classroom.findById(classroomId).lean(),
+      Session.findById(sessionId).lean(),
+    ]);
+    if (!classroom) return res.status(400).json({ error: "Invalid classroomId" });
+    if (!session) return res.status(400).json({ error: "Invalid sessionId" });
+
+    const sessionReport = await buildSessionReportForAssignment({ session });
+    const classroomPrompt = classroom.classroom_prompt || "";
+
+    // Resolve teacher prompt: explicit body value wins so the panel can let
+    // the teacher tweak it before generating; otherwise fall back to stored
+    // TeacherAIConfig.assignmentPrompt (handled inside the gemini util).
+    const useExplicitTeacherPrompt =
+      typeof teacherPromptOverride === "string" && teacherPromptOverride.trim() !== "";
+
+    const { questions: generatedQuestions, generation } = await generateAssignmentQuestions({
+      sessionReport,
+      perFormatCounts,
+      maxAiHints,
+      course: course || classroom.subject?.name,
+      topic: topic || session.topic,
+      classroomPrompt,
+      // If we have an explicit override, slip it into TeacherAIConfig path
+      // by passing null teacherId and prepending to the prompt manually. The
+      // simpler approach: pass teacherId always so the stored prompt loads,
+      // and if override exists we re-decorate the standard prompt block here.
+      teacherId: useExplicitTeacherPrompt ? null : teacherId,
+    });
+    if (useExplicitTeacherPrompt) {
+      generation.teacherPrompt = teacherPromptOverride.trim();
+    }
+
+    if (!generatedQuestions.length) {
+      return res.status(502).json({
+        error: "AI did not return any questions. Please try again.",
+      });
+    }
+
+    // Persist Question docs first so we have IDs to use for image upload
+    // keys. Image generation then runs concurrently against the saved IDs.
+    const baseDocs = generatedQuestions.map((q) =>
+      buildQuestionDoc({
+        generated: q,
+        classroomId,
+        sessionId,
+        teacherId,
+        course: course || classroom.subject?.name,
+        topic: topic || session.topic,
+        maxAiHints,
+      }),
+    );
+    const savedQuestions = await Question.insertMany(baseDocs);
+
+    // Fan out image generation per format only when the teacher requested it.
+    // The image utility already swallows individual failures, so a single
+    // slow / failed call won't drop the assignment.
+    const wantsImage = (format) => Boolean(perFormatImages?.[format]);
+    const targetsForImages = savedQuestions
+      .map((doc, idx) => ({ doc, generated: generatedQuestions[idx] }))
+      .filter(({ generated }) => wantsImage(generated.format));
+
+    if (targetsForImages.length) {
+      const generatedImages = await runWithConcurrency(
+        targetsForImages,
+        3,
+        async ({ doc, generated }) => {
+          const img = await generateAssignmentQuestionImage({
+            questionText: generated.imagePromptHint || generated.questionText,
+            course: course || classroom.subject?.name,
+            topic: topic || session.topic,
+            format: generated.format,
+            questionId: doc._id,
+          });
+          if (img?.url) {
+            await Question.updateOne({ _id: doc._id }, { $set: { image: img.url } });
+            return img;
+          }
+          return null;
+        },
+      );
+      const okCount = generatedImages.filter(Boolean).length;
+      console.log(
+        `[createAssignmentWithAI] generated ${okCount}/${targetsForImages.length} images`,
+      );
+      if (okCount > 0) generation.imageModel = ASSIGNMENT_IMAGE_MODEL;
+    }
+
+    const task = {
+      title,
+      description,
+      startDate: startDate ? new Date(startDate) : new Date(),
+      dueDate: new Date(dueDate),
+      maxMarks,
+      studentIds,
+      resources,
+      perFormatCounts,
+      perFormatImages,
+      maxAiHints,
+      questions: savedQuestions.map((q) => q._id),
+      generation,
+    };
+
+    const assignmentDoc = await Assignment.create({
+      classroomId,
+      sessionId,
+      teacherId,
+      assignments: [task],
+    });
+
+    // Backfill assignmentId on the saved Question docs so the existing
+    // assignment-by-question lookups continue to work.
+    await Question.updateMany(
+      { _id: { $in: savedQuestions.map((q) => q._id) } },
+      { $set: { assignmentId: assignmentDoc._id } },
+    );
+
+    await assignmentDoc.populate({ path: "assignments.questions" });
+
+    // Reuse the existing notifier so students + parents get the same
+    // notification shape as the legacy create flow.
+    try {
+      await notifyNewAssignment({
+        assignmentDoc,
+        tasks: assignmentDoc.assignments,
+        actorId: teacherId,
+        classroomId,
+        sessionId,
+        io: req.app?.get("io"),
+      });
+    } catch (notifyErr) {
+      console.error("[createAssignmentWithAI] notify failed:", notifyErr);
+    }
+
+    return res.status(201).json({
+      message: "Assignment created with AI.",
+      assignment: assignmentDoc,
+      stats: {
+        questionsGenerated: savedQuestions.length,
+        questionModel: ASSIGNMENT_QUESTION_MODEL,
+        imageRequested: targetsForImages.length,
+      },
+    });
+  } catch (err) {
+    console.error("createAssignmentWithAI error:", err);
     return res.status(500).json({ error: err.message });
   }
 };

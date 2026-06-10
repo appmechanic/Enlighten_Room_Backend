@@ -3,6 +3,7 @@ import {
   assignStudentsToAssignment,
   createAssignment,
   createnewAssignment,
+  createAssignmentWithAI,
   deleteAssignmentById,
   deleteSubAssignmentById,
   getAllAssignedAssignments,
@@ -32,6 +33,8 @@ const allowTeacherOrAdmin = (req, res, next) => {
 };
 router.post("/create", auth_key_header, auth_token, createAssignment);
 router.post("/new", auth_key_header, auth_token, createnewAssignment);
+// AI-generated assignment from a previous session (Create Assignment panel).
+router.post("/with-ai", auth_key_header, auth_token, createAssignmentWithAI);
 // GET /api/assignments/assigned
 router.get("/assigned", getAllAssignedAssignments);
 router.get("/get-All", getAllAssignments);

@@ -60,6 +60,13 @@ const SessionSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // When true, students see a "View My Report" button on their session card
+    // that opens the per-lesson individual classwork report for this room.
+    // Defaults to false so reports stay hidden until the teacher opts in.
+    studentReportVisible: {
+      type: Boolean,
+      default: false,
+    },
     // studentIds: [
     //   {
     //     type: mongoose.Schema.Types.ObjectId,

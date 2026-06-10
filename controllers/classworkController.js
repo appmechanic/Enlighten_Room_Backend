@@ -642,6 +642,109 @@ export const getClassReportForRoom = async (req, res) => {
   }
 };
 
+// Per-student lesson report. Returns every lesson for the given room with
+// only the requesting student's submission attached to each question — so a
+// student can see their own answers/AI feedback without exposing peers.
+// Mirrors the per-lesson shape the React modal already understands; the
+// class-level summary, range queries, and other students' answers are
+// intentionally omitted (spec: "no class general report, no range-of-days
+// report").
+export const getStudentLessonReport = async (req, res) => {
+  try {
+    const { roomId, studentId } = req.params;
+    if (!roomId || !studentId) {
+      return res
+        .status(400)
+        .json({ message: 'roomId and studentId are required.' });
+    }
+
+    const lessons = await Lesson.find({ roomId })
+      .sort({ startedAt: 1 })
+      .select('name status startedAt endedAt')
+      .lean();
+
+    // Pull every question in the room once; we'll bucket by lessonName below.
+    const questions = await ClassworkModel.find({ roomId }).lean();
+
+    // Index the student's AI-report rows so per-question AI history (Part 3,
+    // interaction trail) is available the same way the teacher report uses it.
+    const aiReports = await ClassworkAiReport.find({ roomId, studentId }).lean();
+    const reportIndex = new Map();
+    aiReports.forEach((r) => {
+      reportIndex.set(String(r.questionId), r);
+    });
+
+    const projectQuestion = (q) => {
+      const submission = (q.submitted || []).find(
+        (s) => String(s.studentId) === String(studentId)
+      );
+      const aiReport = reportIndex.get(String(q.id)) || null;
+      return {
+        id: q.id,
+        _id: q._id,
+        label: q.label,
+        title: q.title,
+        question: q.question,
+        image: q.image || '',
+        format: q.format || q.formatLabel || '',
+        correctAnswer: q.correctAnswer,
+        lessonName: q.lessonName || '',
+        submission: submission
+          ? {
+              answer: formatSubmittedAnswerText(submission.answer),
+              answerImage: getSubmittedAnswerImage(submission.answer),
+              isCorrect: Boolean(submission.isCorrect),
+              feedback: submission.feedback || '',
+              submittedAt: submission.submittedAt || null,
+            }
+          : null,
+        aiReport: aiReport
+          ? {
+              lastPart2: aiReport.lastPart2 || '',
+              allPart3: (aiReport.allPart3 || []).map((entry) =>
+                typeof entry === 'string'
+                  ? { text: entry, timestamp: null }
+                  : { text: entry.text || '', timestamp: entry.timestamp || null }
+              ),
+              interactions: (aiReport.interactions || []).map((it) => ({
+                questionText: it.questionText || '',
+                aiPart1: it.aiPart1 || '',
+                aiPart2: it.aiPart2 || '',
+                aiPart3: it.aiPart3 || '',
+                correct: Boolean(it.correct),
+                timestamp: it.timestamp || null,
+              })),
+            }
+          : null,
+      };
+    };
+
+    // Group questions by lessonName so we can emit one report block per lesson.
+    const byLessonName = new Map();
+    questions.forEach((q) => {
+      const key = q.lessonName || '';
+      if (!key) return; // staged drafts (no lesson yet) are skipped
+      if (!byLessonName.has(key)) byLessonName.set(key, []);
+      byLessonName.get(key).push(projectQuestion(q));
+    });
+
+    const data = lessons.map((l) => ({
+      name: l.name,
+      status: l.status,
+      startedAt: l.startedAt,
+      endedAt: l.endedAt,
+      questions: byLessonName.get(l.name) || [],
+    }));
+
+    return res.status(200).json({ lessons: data });
+  } catch (err) {
+    console.error('getStudentLessonReport error:', err);
+    res
+      .status(500)
+      .json({ message: 'Error fetching student lesson report', error: err.message });
+  }
+};
+
 export const clearAllClasswork = async (req, res) => {
   try {
     const [questions, reports] = await Promise.all([
