@@ -1149,11 +1149,21 @@ export const submitAnswer = async (req, res) => {
 // opens, so the client error path stays identical to /submit. Once the stream
 // is open the response is always 200; downstream failures are surfaced via
 // the 'error' event.
+// SSE comment line (prefixed with ":") that browsers ignore but PaaS routers
+// (DigitalOcean App Platform, Heroku, etc.) treat as response bytes. Sending
+// a ~2KB padding comment immediately after headers forces the proxy buffer
+// past its flush threshold, so subsequent small SSE events are forwarded to
+// the client as they arrive instead of being held until the upstream closes.
+const SSE_BUFFER_PRIMER = `:${" ".repeat(2048)}\n\n`;
+
 export const submitAnswerStream = async (req, res) => {
   const sseOpen = { value: false };
   const writeEvent = (payload) => {
     if (!sseOpen.value) return;
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    // Disable Nagle's algorithm so each small write goes out immediately
+    // rather than waiting for more data to coalesce into a larger TCP packet.
+    res.socket?.setNoDelay?.(true);
   };
 
   try {
@@ -1232,6 +1242,13 @@ export const submitAnswerStream = async (req, res) => {
       'X-Accel-Buffering': 'no', // disable nginx response buffering if present
     });
     res.flushHeaders?.();
+    res.socket?.setNoDelay?.(true);
+    res.socket?.setKeepAlive?.(true);
+    // Prime the proxy buffer so small SSE events aren't held back. App
+    // Platform's router only forwards bytes once its buffer crosses a
+    // threshold; this 2KB comment crosses it immediately. The leading ":"
+    // marks it as a comment, so the browser ignores it.
+    res.write(SSE_BUFFER_PRIMER);
     sseOpen.value = true;
 
     let aiResult = { correct: false, part1: '', part2: '', part3: '', newQuestion: '' };

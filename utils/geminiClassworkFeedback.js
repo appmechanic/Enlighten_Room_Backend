@@ -6,6 +6,15 @@ import StandardPrompt from "../models/standardPromptModel.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
+// Latency knobs applied to every classwork-feedback call.
+//   - thinkingConfig.thinkingBudget = 0 disables 2.5-flash's internal
+//     reasoning pass, which otherwise adds ~2–4s before the first token.
+//     Hint-quality is good enough without it for short classroom Q&A.
+//   - maxOutputTokens caps total response length so the model can't ramble;
+//     full latency scales with output token count, so this directly
+//     shortens both time-to-last-token and overall student wait.
+const FEEDBACK_THINKING_CONFIG = { thinkingBudget: 0 };
+const FEEDBACK_MAX_OUTPUT_TOKENS = 500;
 
 function normalizeAnswerText(value) {
   if (Array.isArray(value)) {
@@ -332,16 +341,23 @@ export async function getClassworkAiFeedback({
     lastSentStandardPromptHash,
   });
 
+  const config = {
+    systemInstruction,
+    responseMimeType: "application/json",
+    thinkingConfig: FEEDBACK_THINKING_CONFIG,
+    maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
+  };
+
   console.log("[ClassworkFeedback] Gemini request:", {
     model: MODEL,
     contents,
-    config: { systemInstruction, responseMimeType: "application/json" },
+    config,
   });
 
   const result = await generateContentWithRetry({
     model: MODEL,
     contents,
-    config: { systemInstruction, responseMimeType: "application/json" },
+    config,
   });
 
   const cachedTokens = result?.usageMetadata?.cachedContentTokenCount;
@@ -430,10 +446,18 @@ export async function* getClassworkAiFeedbackStream(input) {
     rulesSection: STREAM_RESPONSE_RULES,
   });
 
+  const config = {
+    systemInstruction,
+    responseMimeType: "application/json",
+    responseSchema: FEEDBACK_RESPONSE_SCHEMA,
+    thinkingConfig: FEEDBACK_THINKING_CONFIG,
+    maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
+  };
+
   console.log("[ClassworkFeedback] Gemini stream request:", {
     model: MODEL,
     contents,
-    config: { systemInstruction, responseMimeType: "application/json" },
+    config,
   });
 
   let stream;
@@ -441,11 +465,7 @@ export async function* getClassworkAiFeedbackStream(input) {
     stream = await ai.models.generateContentStream({
       model: MODEL,
       contents,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: FEEDBACK_RESPONSE_SCHEMA,
-      },
+      config,
     });
   } catch (err) {
     console.error("[ClassworkFeedback] generateContentStream failed:", err);
