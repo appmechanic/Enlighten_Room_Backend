@@ -6,7 +6,7 @@ import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
 import Classroom from '../models/classroomModel.js';
 import Session from '../models/SessionModel.js';
 import Lesson from '../models/LessonModel.js';
-import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
+import { getClassworkAiFeedback, getClassworkAiFeedbackStream } from '../utils/geminiClassworkFeedback.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
@@ -980,6 +980,20 @@ export const submitAnswer = async (req, res) => {
     };
     let aiFailed = false;
 
+    // Look up the hash of the standard prompt last sent to Gemini for THIS
+    // (room, question, student) interaction. Empty on the very first call.
+    // If it matches the current standard prompt hash, the helper will send a
+    // short reminder; otherwise it will send the full standard prompt body.
+    let lastSentStandardPromptHash = '';
+    try {
+      const existingReport = await ClassworkAiReport.findOne(
+        { roomId: question.roomId, questionId: question.id, studentId },
+      ).select('standardPromptHash').lean();
+      lastSentStandardPromptHash = existingReport?.standardPromptHash || '';
+    } catch (lookupErr) {
+      console.error('[Classwork] Failed to read prior standardPromptHash:', lookupErr);
+    }
+
     if (!aiExpired) {
       try {
         aiResult = await getClassworkAiFeedback({
@@ -990,6 +1004,7 @@ export const submitAnswer = async (req, res) => {
           format: question.format,
           studentName,
           teacherId: resolvedTeacherId,
+          lastSentStandardPromptHash,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
@@ -1060,6 +1075,19 @@ export const submitAnswer = async (req, res) => {
         };
       }
 
+      const reportSet = {
+        studentName: studentName || 'Unknown',
+        lastAnswer: normalizedAnswer,
+        lastPart2: aiResult.part2 || '',
+      };
+      // Record which standard-prompt version Gemini just saw so the next call
+      // for this interaction can send the short reminder instead of the full
+      // body. Skip if Gemini wasn't actually called (aiExpired) — we have no
+      // new state to record.
+      if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
+        reportSet.standardPromptHash = aiResult.standardPromptHash;
+      }
+
       await ClassworkAiReport.findOneAndUpdate(
         { roomId: question.roomId, questionId: question.id, studentId },
         {
@@ -1069,11 +1097,7 @@ export const submitAnswer = async (req, res) => {
             studentId,
             originalQuestion: question.question,
           },
-          $set: {
-            studentName: studentName || 'Unknown',
-            lastAnswer: normalizedAnswer,
-            lastPart2: aiResult.part2 || '',
-          },
+          $set: reportSet,
           $push: pushOps,
         },
         { upsert: true, new: true }
@@ -1111,6 +1135,273 @@ export const submitAnswer = async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
+  }
+};
+
+// Streaming counterpart to submitAnswer. Same validation + persistence, but
+// the AI feedback is streamed back as Server-Sent Events so the student sees
+// part2 character-by-character. Events:
+//   data: { type: 'part2-delta', text }
+//   data: { type: 'done', isCorrect, ai: {...}, debug, aiAllowed, aiExpired }
+//   data: { type: 'error', message, aiFailed? }
+//
+// Validation errors are returned as plain JSON 4xx/5xx before the SSE stream
+// opens, so the client error path stays identical to /submit. Once the stream
+// is open the response is always 200; downstream failures are surfaced via
+// the 'error' event.
+export const submitAnswerStream = async (req, res) => {
+  const sseOpen = { value: false };
+  const writeEvent = (payload) => {
+    if (!sseOpen.value) return;
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  try {
+    const {
+      id,
+      questionId,
+      studentId,
+      studentName,
+      answer,
+      roomId,
+      aiUsed,
+      teacherId,
+      overrideQuestionText,
+    } = req.body;
+
+    let resolvedTeacherId = teacherId;
+    if (!resolvedTeacherId && roomId) {
+      try {
+        const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const session = await Session.findOne({
+          sessionUrl: { $regex: escapedRoomId, $options: 'i' },
+        });
+        if (session?.classroomId) {
+          const classroom = await Classroom.findById(session.classroomId)
+            .select('teacherId')
+            .lean();
+          resolvedTeacherId = classroom?.teacherId || null;
+        }
+      } catch (err) {
+        console.error('[Classwork] Failed to resolve teacherId from roomId:', err);
+      }
+    }
+
+    const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
+    const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
+
+    if (!question) {
+      return res.status(404).json({
+        message: roomId ? 'Question not found for this room' : 'Question not found',
+      });
+    }
+    if (!question.roomId && roomId) question.roomId = roomId;
+
+    if (!question.released) {
+      return res.status(403).json({ message: 'This question has not been released yet.' });
+    }
+
+    if (question.format === 'textbox') {
+      const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
+      const answerText = typeof answer === 'string' ? answer : '';
+      if (answerText.length > textboxLimit) {
+        return res.status(400).json({ message: `Answer exceeds ${textboxLimit} character limit.` });
+      }
+    }
+
+    const aiAllowed = question.aiAllowed !== false;
+    const aiExpired = !aiAllowed;
+
+    const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
+      roomId: question.roomId || roomId,
+      questionId: question.id || questionId,
+      studentId,
+    });
+
+    const questionTextForAi = (typeof overrideQuestionText === 'string' && overrideQuestionText.trim())
+      ? overrideQuestionText.trim()
+      : question.question;
+    const isFollowUp = questionTextForAi !== question.question;
+
+    // Open SSE stream now — all validation has passed. From here on, errors
+    // are surfaced as SSE 'error' events, not HTTP status codes.
+    res.status(200).set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no', // disable nginx response buffering if present
+    });
+    res.flushHeaders?.();
+    sseOpen.value = true;
+
+    let aiResult = { correct: false, part1: '', part2: '', part3: '', newQuestion: '' };
+    let aiFailed = false;
+
+    // Look up the hash of the standard prompt last sent to Gemini for THIS
+    // (room, question, student) interaction. Empty on first call; on a match
+    // the helper sends a short reminder instead of the full standard prompt.
+    let lastSentStandardPromptHash = '';
+    try {
+      const existingReport = await ClassworkAiReport.findOne(
+        { roomId: question.roomId, questionId: question.id, studentId },
+      ).select('standardPromptHash').lean();
+      lastSentStandardPromptHash = existingReport?.standardPromptHash || '';
+    } catch (lookupErr) {
+      console.error('[Classwork] Failed to read prior standardPromptHash:', lookupErr);
+    }
+
+    if (aiExpired) {
+      // AI gated off for this question — skip the model call but still record
+      // the submission below so the answer counts.
+    } else {
+      try {
+        for await (const event of getClassworkAiFeedbackStream({
+          questionText: questionTextForAi,
+          answer: normalizedAnswer,
+          correctAnswer: isFollowUp ? '' : question.correctAnswer,
+          questionImage: isFollowUp ? null : question.image,
+          format: question.format,
+          studentName,
+          teacherId: resolvedTeacherId,
+          lastSentStandardPromptHash,
+        })) {
+          if (event.type === 'part2-delta') {
+            writeEvent({ type: 'part2-delta', text: event.text });
+          } else if (event.type === 'done') {
+            aiResult = event.feedback;
+          } else if (event.type === 'error') {
+            aiFailed = true;
+            console.error('[Classwork] AI stream error:', event.message);
+          }
+        }
+      } catch (aiErr) {
+        console.error('[Classwork] AI feedback failed:', aiErr);
+        aiFailed = true;
+      }
+    }
+
+    if (aiFailed) {
+      writeEvent({
+        type: 'error',
+        aiFailed: true,
+        aiAllowed,
+        aiExpired,
+        message: 'AI feedback is temporarily unavailable. Please try again shortly.',
+      });
+      res.end();
+      return;
+    }
+
+    const isCorrect = Boolean(aiResult.correct);
+    const feedback = aiResult.part2 || '';
+
+    const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
+    if (existingSubmissionIndex !== -1) {
+      const submission = question.submitted[existingSubmissionIndex];
+      submission.answer = normalizedAnswer;
+      submission.isCorrect = isCorrect;
+      submission.aiUsed = aiUsed;
+      submission.studentName = studentName;
+      submission.feedback = feedback;
+      submission.submittedAt = new Date();
+    } else {
+      question.submitted.push({
+        studentId,
+        studentName,
+        answer: normalizedAnswer,
+        isCorrect,
+        aiUsed,
+        feedback,
+        submittedAt: new Date(),
+      });
+    }
+    await question.save();
+
+    try {
+      const interactionId = new mongoose.Types.ObjectId();
+      const interactionAt = new Date();
+      const interaction = {
+        _id: interactionId,
+        questionText: questionTextForAi,
+        studentAnswer: normalizedAnswer,
+        aiPart1: aiResult.part1 || '',
+        aiPart2: aiResult.part2 || '',
+        aiPart3: aiResult.part3 || '',
+        correct: isCorrect,
+        newQuestion: aiResult.newQuestion || '',
+        timestamp: interactionAt,
+      };
+
+      const pushOps = { interactions: interaction };
+      if (aiResult.part3) {
+        pushOps.allPart3 = {
+          interactionId,
+          text: aiResult.part3,
+          timestamp: interactionAt,
+        };
+      }
+
+      const reportSet = {
+        studentName: studentName || 'Unknown',
+        lastAnswer: normalizedAnswer,
+        lastPart2: aiResult.part2 || '',
+      };
+      // Persist which standard-prompt version Gemini just saw. Next call for
+      // this interaction will compare against this hash; match → reminder,
+      // mismatch (admin edited the prompt) → full body again.
+      if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
+        reportSet.standardPromptHash = aiResult.standardPromptHash;
+      }
+
+      await ClassworkAiReport.findOneAndUpdate(
+        { roomId: question.roomId, questionId: question.id, studentId },
+        {
+          $setOnInsert: {
+            roomId: question.roomId,
+            questionId: question.id,
+            studentId,
+            originalQuestion: question.question,
+          },
+          $set: reportSet,
+          $push: pushOps,
+        },
+        { upsert: true, new: true }
+      );
+    } catch (reportErr) {
+      console.error('[Classwork] Failed to upsert AI report:', reportErr);
+    }
+
+    writeEvent({
+      type: 'done',
+      isCorrect,
+      aiAllowed,
+      aiExpired,
+      debug: {
+        originalQuestion: question.question,
+        questionTextForAi,
+        isFollowUp,
+        studentAnswer: normalizedAnswer,
+        format: question.format,
+        expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
+      },
+      ai: {
+        correct: isCorrect,
+        part1: aiResult.part1 || '',
+        part2: aiResult.part2 || '',
+        newQuestion: aiResult.newQuestion || '',
+      },
+      feedback,
+      correctAnswer: question.correctAnswer,
+    });
+    res.end();
+  } catch (err) {
+    console.error('[Classwork] submitAnswerStream failed:', err);
+    if (sseOpen.value) {
+      writeEvent({ type: 'error', message: err.message || 'Error submitting answer' });
+      res.end();
+    } else {
+      res.status(500).json({ message: 'Error submitting answer', error: err.message });
+    }
   }
 };
 

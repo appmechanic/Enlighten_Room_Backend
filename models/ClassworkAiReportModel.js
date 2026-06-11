@@ -38,6 +38,14 @@ const ClassworkAiReportSchema = new mongoose.Schema(
     lastPart2: { type: String, default: '' },
     // Part-3 history paired with the interaction it belongs to.
     allPart3: { type: [Part3EntrySchema], default: [] },
+    // Hash of the StandardPrompt aiHintPrompt last sent to Gemini for this
+    // (room, question, student) exchange. Subsequent AI calls compare this to
+    // the current hash: match → send a short reminder; mismatch (or empty) →
+    // send the full standard prompt again and update this field. Admin edits
+    // to the standard prompt change its content and therefore its hash, which
+    // automatically forces every report to resend the full prompt on its next
+    // call — no separate invalidation pass needed.
+    standardPromptHash: { type: String, default: '' },
   },
   { timestamps: true }
 );
