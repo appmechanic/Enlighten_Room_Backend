@@ -16,8 +16,8 @@ import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 //     appended after the standard prompt per spec.
 //
 // The user content is the session report snapshot: every classwork question
-// from the source session, plus each student's lastPart2 feedback and the
-// full allPart3 detailed-explanation history. That's exactly the attachment
+// from the source session, plus each student's latest hint feedback and the
+// full diagnostic-training history. That's exactly the attachment
 // the spec calls for.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -167,18 +167,20 @@ function buildSessionReportSnapshot({ lessonName, questions }) {
     submitted.forEach((s, si) => {
       const who = s?.studentName || s?.studentId || `Student ${si + 1}`;
       if (s?.feedback) {
-        lines.push(`     - ${who} | lastPart2 feedback: ${s.feedback}`);
+        lines.push(`     - ${who} | latest hint feedback: ${s.feedback}`);
       }
     });
-    // Per-question allPart3 (detailed explanation history) is the strongest
-    // signal of where the cohort got stuck — that's the spec's "weaknesses".
-    const part3 = Array.isArray(q.aiPart3History) ? q.aiPart3History : [];
-    if (part3.length) {
-      lines.push(`   Detailed-explanation history (allPart3) for this Q:`);
-      part3.forEach((entry, i) => {
+    // Per-question diagnostic-training history is the strongest signal of
+    // where the cohort got stuck — that's the spec's "weaknesses".
+    const training = Array.isArray(q.trainingHistory) ? q.trainingHistory : [];
+    if (training.length) {
+      lines.push(`   Diagnostic-training history for this Q:`);
+      training.forEach((entry, i) => {
         const who = entry?.studentName || entry?.studentId || `Student ${i + 1}`;
-        const text = String(entry?.text || "").trim();
-        if (text) lines.push(`     - ${who}: ${text}`);
+        const underlying = String(entry?.underlyingGap || "").trim();
+        const todays = String(entry?.todaysDifficulty || "").trim();
+        if (underlying) lines.push(`     - ${who} (underlying gap): ${underlying}`);
+        if (todays) lines.push(`     - ${who} (today's difficulty): ${todays}`);
       });
     }
     lines.push("");
@@ -210,7 +212,7 @@ function formatCountsBlock(perFormatCounts) {
 // captures the prompts and model used so the caller can persist a snapshot
 // on the Assignment doc.
 export async function generateAssignmentQuestions({
-  sessionReport, // { lessonName, questions: [{ question, format, correctAnswer, submitted: [{studentName, feedback}], aiPart3History: [{studentName, text}] }] }
+  sessionReport, // { lessonName, questions: [{ question, format, correctAnswer, submitted: [{studentName, feedback}], trainingHistory: [{studentName, underlyingGap, todaysDifficulty}] }] }
   perFormatCounts, // { mcq, "fill-blanks", handwriting, textbox } -> int
   maxAiHints,
   course,

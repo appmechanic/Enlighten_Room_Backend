@@ -15,6 +15,124 @@ import nodemailer from "nodemailer";
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
 
+// Default shape returned when the AI is skipped (aiExpired) or fails. Mirrors
+// the structure produced by `getClassworkAiFeedback` / `...Stream` so the
+// downstream persistence and response-shaping code can read every field
+// without branching on undefined nested objects.
+function emptyAiFeedback() {
+  return {
+    correct: false,
+    hintStream: '',
+    studentCanDo: { subjectTrack: 'STEM', message: '' },
+    nextStep: {
+      dont: '',
+      what: '',
+      how: '',
+      explanation: { gradeBand: 'G4_TO_G8', text: '' },
+    },
+    diagnosticTraining: { underlyingGap: '', todaysDifficulty: '' },
+    advancedChallenge: {
+      congratulations: '',
+      question: '',
+      useImage: false,
+      positiveContext: { theme: '', message: '' },
+    },
+  };
+}
+
+// Projects a stored ClassworkAiReport document into the wire shape consumed
+// by the teacher/student report renderers. Mirrors the nested feedback shape
+// so the frontend never has to branch on missing sub-objects, and walks
+// `interactions` backwards once to surface the latest advanced-challenge
+// question (the mastery-mode bonus prompt).
+function projectAiReport(report, { includeStudentAnswer = false } = {}) {
+  const interactions = Array.isArray(report?.interactions) ? report.interactions : [];
+
+  let latestAdvancedQuestion = '';
+  for (let i = interactions.length - 1; i >= 0; i -= 1) {
+    const q = interactions[i]?.advancedChallenge?.question;
+    if (q) { latestAdvancedQuestion = q; break; }
+  }
+
+  return {
+    lastHintStream: report?.lastHintStream || '',
+    originalQuestion: report?.originalQuestion || '',
+    latestAdvancedQuestion,
+    trainingHistory: (report?.trainingHistory || []).map((entry) => ({
+      interactionId: entry.interactionId || null,
+      underlyingGap: entry.underlyingGap || '',
+      todaysDifficulty: entry.todaysDifficulty || '',
+      timestamp: entry.timestamp || null,
+    })),
+    interactions: interactions.map((it) => ({
+      interactionId: it._id || null,
+      questionText: it.questionText || '',
+      ...(includeStudentAnswer ? { studentAnswer: it.studentAnswer } : {}),
+      hintStream: it.hintStream || '',
+      studentCanDo: {
+        subjectTrack: it.studentCanDo?.subjectTrack || 'STEM',
+        message: it.studentCanDo?.message || '',
+      },
+      nextStep: {
+        dont: it.nextStep?.dont || '',
+        what: it.nextStep?.what || '',
+        how: it.nextStep?.how || '',
+        explanation: {
+          gradeBand: it.nextStep?.explanation?.gradeBand || 'G4_TO_G8',
+          text: it.nextStep?.explanation?.text || '',
+        },
+      },
+      diagnosticTraining: {
+        underlyingGap: it.diagnosticTraining?.underlyingGap || '',
+        todaysDifficulty: it.diagnosticTraining?.todaysDifficulty || '',
+      },
+      advancedChallenge: {
+        congratulations: it.advancedChallenge?.congratulations || '',
+        question: it.advancedChallenge?.question || '',
+        useImage: Boolean(it.advancedChallenge?.useImage),
+        positiveContext: {
+          theme: it.advancedChallenge?.positiveContext?.theme || '',
+          message: it.advancedChallenge?.positiveContext?.message || '',
+        },
+      },
+      correct: Boolean(it.correct),
+      timestamp: it.timestamp || null,
+    })),
+  };
+}
+
+// Pulled-down view of the AI feedback that we ship to the student frontend
+// in the `ai` field on /submit and on the SSE `done` event. Keeps Part 3
+// (diagnosticTraining) off the wire — it belongs only on the teacher report.
+function projectAiForStudent(aiResult) {
+  return {
+    correct: Boolean(aiResult?.correct),
+    hintStream: aiResult?.hintStream || '',
+    studentCanDo: {
+      subjectTrack: aiResult?.studentCanDo?.subjectTrack || 'STEM',
+      message: aiResult?.studentCanDo?.message || '',
+    },
+    nextStep: {
+      dont: aiResult?.nextStep?.dont || '',
+      what: aiResult?.nextStep?.what || '',
+      how: aiResult?.nextStep?.how || '',
+      explanation: {
+        gradeBand: aiResult?.nextStep?.explanation?.gradeBand || 'G4_TO_G8',
+        text: aiResult?.nextStep?.explanation?.text || '',
+      },
+    },
+    advancedChallenge: {
+      congratulations: aiResult?.advancedChallenge?.congratulations || '',
+      question: aiResult?.advancedChallenge?.question || '',
+      useImage: Boolean(aiResult?.advancedChallenge?.useImage),
+      positiveContext: {
+        theme: aiResult?.advancedChallenge?.positiveContext?.theme || '',
+        message: aiResult?.advancedChallenge?.positiveContext?.message || '',
+      },
+    },
+  };
+}
+
 const transporter = nodemailer.createTransport({
   service: "gmail", // or your SMTP provider
   auth: {
@@ -698,24 +816,7 @@ export const getStudentLessonReport = async (req, res) => {
               submittedAt: submission.submittedAt || null,
             }
           : null,
-        aiReport: aiReport
-          ? {
-              lastPart2: aiReport.lastPart2 || '',
-              allPart3: (aiReport.allPart3 || []).map((entry) =>
-                typeof entry === 'string'
-                  ? { text: entry, timestamp: null }
-                  : { text: entry.text || '', timestamp: entry.timestamp || null }
-              ),
-              interactions: (aiReport.interactions || []).map((it) => ({
-                questionText: it.questionText || '',
-                aiPart1: it.aiPart1 || '',
-                aiPart2: it.aiPart2 || '',
-                aiPart3: it.aiPart3 || '',
-                correct: Boolean(it.correct),
-                timestamp: it.timestamp || null,
-              })),
-            }
-          : null,
+        aiReport: aiReport ? projectAiReport(aiReport, { includeStudentAnswer: false }) : null,
       };
     };
 
@@ -971,13 +1072,7 @@ export const submitAnswer = async (req, res) => {
       : question.question;
     const isFollowUp = questionTextForAi !== question.question;
 
-    let aiResult = {
-      correct: false,
-      part1: '',
-      part2: '',
-      part3: '',
-      newQuestion: '',
-    };
+    let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
     // Look up the hash of the standard prompt last sent to Gemini for THIS
@@ -1024,7 +1119,7 @@ export const submitAnswer = async (req, res) => {
     }
 
     const isCorrect = Boolean(aiResult.correct);
-    const feedback = aiResult.part2 || '';
+    const feedback = aiResult.hintStream || '';
 
     const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
     if (existingSubmissionIndex !== -1) {
@@ -1048,9 +1143,10 @@ export const submitAnswer = async (req, res) => {
     }
     await question.save();
 
-    // Persist case-c report data: questions, latest answer, latest part 2, full
-    // part-3 history. Each interaction is assigned its own ObjectId here so the
-    // matching `allPart3` entry can reference it via `interactionId`.
+    // Persist case-c report data: questions, latest answer, latest hint
+    // string, full diagnostic-training history. Each interaction is assigned
+    // its own ObjectId so the matching `trainingHistory` entry can reference
+    // it via `interactionId`.
     try {
       const interactionId = new mongoose.Types.ObjectId();
       const interactionAt = new Date();
@@ -1058,19 +1154,22 @@ export const submitAnswer = async (req, res) => {
         _id: interactionId,
         questionText: questionTextForAi,
         studentAnswer: normalizedAnswer,
-        aiPart1: aiResult.part1 || '',
-        aiPart2: aiResult.part2 || '',
-        aiPart3: aiResult.part3 || '',
+        hintStream: aiResult.hintStream || '',
+        studentCanDo: aiResult.studentCanDo,
+        nextStep: aiResult.nextStep,
+        diagnosticTraining: aiResult.diagnosticTraining,
+        advancedChallenge: aiResult.advancedChallenge,
         correct: isCorrect,
-        newQuestion: aiResult.newQuestion || '',
         timestamp: interactionAt,
       };
 
       const pushOps = { interactions: interaction };
-      if (aiResult.part3) {
-        pushOps.allPart3 = {
+      const dt = aiResult.diagnosticTraining || {};
+      if (dt.underlyingGap || dt.todaysDifficulty) {
+        pushOps.trainingHistory = {
           interactionId,
-          text: aiResult.part3,
+          underlyingGap: dt.underlyingGap || '',
+          todaysDifficulty: dt.todaysDifficulty || '',
           timestamp: interactionAt,
         };
       }
@@ -1078,7 +1177,7 @@ export const submitAnswer = async (req, res) => {
       const reportSet = {
         studentName: studentName || 'Unknown',
         lastAnswer: normalizedAnswer,
-        lastPart2: aiResult.part2 || '',
+        lastHintStream: aiResult.hintStream || '',
       };
       // Record which standard-prompt version Gemini just saw so the next call
       // for this interaction can send the short reminder instead of the full
@@ -1120,15 +1219,13 @@ export const submitAnswer = async (req, res) => {
         format: question.format,
         expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
       },
-      // Case a (incorrect): student sees part1 + part2; teacher sees student answer + part2 replacing prior.
-      // Case b (correct): student sees part2 confirmation + newQuestion; teacher sees the final answer marked correct.
-      // Part 3 is intentionally NOT returned — it belongs only in the report.
-      ai: {
-        correct: isCorrect,
-        part1: aiResult.part1 || '',
-        part2: aiResult.part2 || '',
-        newQuestion: aiResult.newQuestion || '',
-      },
+      // DIAGNOSTIC: student sees studentCanDo.message + nextStep blocks +
+      //             hintStream. teacher sees student answer + hintStream.
+      // MASTERY: student sees advancedChallenge (congratulations + question);
+      //          teacher sees the final answer marked correct.
+      // diagnosticTraining is intentionally NOT returned — it belongs only in
+      // the report.
+      ai: projectAiForStudent(aiResult),
       feedback,
       correctAnswer: question.correctAnswer,
       data: question.submitted,
@@ -1140,8 +1237,8 @@ export const submitAnswer = async (req, res) => {
 
 // Streaming counterpart to submitAnswer. Same validation + persistence, but
 // the AI feedback is streamed back as Server-Sent Events so the student sees
-// part2 character-by-character. Events:
-//   data: { type: 'part2-delta', text }
+// the live hint character-by-character. Events:
+//   data: { type: 'hint-delta', text }
 //   data: { type: 'done', isCorrect, ai: {...}, debug, aiAllowed, aiExpired }
 //   data: { type: 'error', message, aiFailed? }
 //
@@ -1251,7 +1348,7 @@ export const submitAnswerStream = async (req, res) => {
     res.write(SSE_BUFFER_PRIMER);
     sseOpen.value = true;
 
-    let aiResult = { correct: false, part1: '', part2: '', part3: '', newQuestion: '' };
+    let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
     // Look up the hash of the standard prompt last sent to Gemini for THIS
@@ -1282,8 +1379,8 @@ export const submitAnswerStream = async (req, res) => {
           teacherId: resolvedTeacherId,
           lastSentStandardPromptHash,
         })) {
-          if (event.type === 'part2-delta') {
-            writeEvent({ type: 'part2-delta', text: event.text });
+          if (event.type === 'hint-delta') {
+            writeEvent({ type: 'hint-delta', text: event.text });
           } else if (event.type === 'done') {
             aiResult = event.feedback;
           } else if (event.type === 'error') {
@@ -1310,7 +1407,7 @@ export const submitAnswerStream = async (req, res) => {
     }
 
     const isCorrect = Boolean(aiResult.correct);
-    const feedback = aiResult.part2 || '';
+    const feedback = aiResult.hintStream || '';
 
     const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
     if (existingSubmissionIndex !== -1) {
@@ -1341,19 +1438,22 @@ export const submitAnswerStream = async (req, res) => {
         _id: interactionId,
         questionText: questionTextForAi,
         studentAnswer: normalizedAnswer,
-        aiPart1: aiResult.part1 || '',
-        aiPart2: aiResult.part2 || '',
-        aiPart3: aiResult.part3 || '',
+        hintStream: aiResult.hintStream || '',
+        studentCanDo: aiResult.studentCanDo,
+        nextStep: aiResult.nextStep,
+        diagnosticTraining: aiResult.diagnosticTraining,
+        advancedChallenge: aiResult.advancedChallenge,
         correct: isCorrect,
-        newQuestion: aiResult.newQuestion || '',
         timestamp: interactionAt,
       };
 
       const pushOps = { interactions: interaction };
-      if (aiResult.part3) {
-        pushOps.allPart3 = {
+      const dt = aiResult.diagnosticTraining || {};
+      if (dt.underlyingGap || dt.todaysDifficulty) {
+        pushOps.trainingHistory = {
           interactionId,
-          text: aiResult.part3,
+          underlyingGap: dt.underlyingGap || '',
+          todaysDifficulty: dt.todaysDifficulty || '',
           timestamp: interactionAt,
         };
       }
@@ -1361,7 +1461,7 @@ export const submitAnswerStream = async (req, res) => {
       const reportSet = {
         studentName: studentName || 'Unknown',
         lastAnswer: normalizedAnswer,
-        lastPart2: aiResult.part2 || '',
+        lastHintStream: aiResult.hintStream || '',
       };
       // Persist which standard-prompt version Gemini just saw. Next call for
       // this interaction will compare against this hash; match → reminder,
@@ -1401,12 +1501,7 @@ export const submitAnswerStream = async (req, res) => {
         format: question.format,
         expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
       },
-      ai: {
-        correct: isCorrect,
-        part1: aiResult.part1 || '',
-        part2: aiResult.part2 || '',
-        newQuestion: aiResult.newQuestion || '',
-      },
+      ai: projectAiForStudent(aiResult),
       feedback,
       correctAnswer: question.correctAnswer,
     });
@@ -1467,19 +1562,6 @@ export const viewAllAnswers = async (req, res) => {
 
         const report = reportIndex.get(`${q.id}::${s.studentId}`) || null;
 
-        // Pull the latest bonus question (newQuestion) by walking interactions
-        // in reverse — the most recent non-empty value wins.
-        let latestNewQuestion = '';
-        if (report && Array.isArray(report.interactions)) {
-          for (let i = report.interactions.length - 1; i >= 0; i -= 1) {
-            const nq = report.interactions[i]?.newQuestion;
-            if (nq) {
-              latestNewQuestion = nq;
-              break;
-            }
-          }
-        }
-
         return {
           // Existing shape — kept verbatim for backwards compatibility.
           name,
@@ -1497,39 +1579,12 @@ export const viewAllAnswers = async (req, res) => {
           // AI report fields (case-c storage). Empty defaults when no AI
           // history exists for this student/question.
           aiReport: report
-            ? {
-                lastPart2: report.lastPart2 || '',
-                // `allPart3` is now [{ interactionId, text, timestamp }]. Old
-                // documents may still hold plain strings — normalize both
-                // shapes so the frontend never has to branch.
-                allPart3: (report.allPart3 || []).map((entry) =>
-                  typeof entry === 'string'
-                    ? { interactionId: null, text: entry, timestamp: null }
-                    : {
-                        interactionId: entry.interactionId || null,
-                        text: entry.text || '',
-                        timestamp: entry.timestamp || null,
-                      }
-                ),
-                interactions: (report.interactions || []).map((it) => ({
-                  interactionId: it._id || null,
-                  questionText: it.questionText || '',
-                  studentAnswer: it.studentAnswer,
-                  aiPart1: it.aiPart1 || '',
-                  aiPart2: it.aiPart2 || '',
-                  aiPart3: it.aiPart3 || '',
-                  newQuestion: it.newQuestion || '',
-                  correct: Boolean(it.correct),
-                  timestamp: it.timestamp || null,
-                })),
-                newQuestion: latestNewQuestion,
-                originalQuestion: report.originalQuestion || '',
-              }
+            ? projectAiReport(report, { includeStudentAnswer: true })
             : {
-                lastPart2: '',
-                allPart3: [],
+                lastHintStream: '',
+                trainingHistory: [],
                 interactions: [],
-                newQuestion: '',
+                latestAdvancedQuestion: '',
                 originalQuestion: '',
               },
         };

@@ -73,45 +73,172 @@ async function sourceToInlineData(source) {
   return { base64: Buffer.from(buffer).toString("base64"), mimeType: "image/jpeg" };
 }
 
+// Shared rules text describing the two-mode response shape. Used for both the
+// non-streaming (responseMimeType: application/json) and streaming
+// (responseSchema) paths. `hintStream` MUST be emitted first so the live
+// stream scanner can tail it.
 const JSON_RESPONSE_RULES = `
-You MUST respond with a single JSON object only (no prose, no markdown fences). Schema:
-{
-  "correct": boolean,           // true only if every content/step and answer is complete and correct
-  "part1": string,              // (incorrect case) which step is correct just before the student got stuck; "" if correct
-  "part2": string,              // (incorrect case) guidance for the first stuck step; (correct case) a brief confirmation that the student's answer is correct
-  "part3": string,              // (incorrect case) practice recommendations for after class; "" if correct
-  "newQuestion": string         // (correct case) the more advanced similar question with a positive message; "" if incorrect
-}
-Use the student's name when given. Keep each field child-friendly and concise.
+You MUST respond with a single JSON object only (no prose, no markdown fences).
+
+Set "correct" to true ONLY if every step and the final answer are complete and correct.
+Choose ONE of two modes based on "correct":
+
+DIAGNOSTIC mode (correct = false):
+  Populate "studentCanDo", "nextStep", "diagnosticTraining".
+  Leave "advancedChallenge.congratulations" = "" and "advancedChallenge.question" = "".
+
+  - "hintStream": the live, student-facing hint, built as a single flowing
+    string: first the DON'T line, then WHAT to do next (never reveal the
+    exact expression or sentence), then HOW to do it. Append a short concept
+    explanation tuned to the grade band when useful.
+
+  - "studentCanDo.subjectTrack": "STEM" or "HUMANITIES_LANGUAGES".
+  - "studentCanDo.message": ONE sentence starting with "Hi [first name], you ...".
+    For STEM, name the last mathematically correct line/step. For Humanities/
+    Languages, name the strongest correct logic, translation fragment, factual
+    premise, or thesis foundation so far.
+
+  - "nextStep.dont": what NOT to do (the incorrect step), in clear plain language.
+  - "nextStep.what": the correct formula / strategy / grammar / phrase / sentence
+    structure / fact to apply next, WITHOUT revealing the exact expression or
+    sentence.
+  - "nextStep.how": how to perform it next step, if useful. "" if not needed.
+  - "nextStep.explanation.gradeBand": one of "G3_OR_LOWER", "G4_TO_G8", "G9_PLUS".
+  - "nextStep.explanation.text": explain the underlying theorem / reason /
+    theory / structure. G3 or lower = one short sentence. G4–G8 = under 50
+    words. G9+ = a paragraph of appropriate length. "" only if no
+    explanation is needed.
+
+  - "diagnosticTraining.underlyingGap": one training exercise that strengthens
+    the underlying milestone / capability / habit behind today's difficulty.
+    Do NOT name the gap, the deficit, or any past issue to the student.
+  - "diagnosticTraining.todaysDifficulty": one training exercise that targets
+    the specific difficulty the student faced in THIS question.
+
+MASTERY mode (correct = true):
+  Populate "advancedChallenge". Leave "studentCanDo.message" = "",
+  "nextStep.dont/what/how" = "", and "diagnosticTraining.*" = "".
+
+  - "hintStream": a short, warm congratulation sentence (this is what the
+    student sees live).
+  - "advancedChallenge.congratulations": the same congratulation, full form.
+  - "advancedChallenge.question": a brand-new question exactly one level more
+    advanced than the current one (STEM: introduce an optimization
+    constraint or symbolic variation; Humanities: a deeper thematic prompt,
+    a more complex grammatical structure, or a comparative primary-source
+    analysis). When a positive context fits naturally, WEAVE THE SCENARIO
+    DIRECTLY INTO THIS QUESTION TEXT (e.g., "While volunteering at a food
+    bank, calculate ..."). Do NOT leave the question neutral and put the
+    scenario in positiveContext.message — the context belongs in the
+    question itself.
+  - "advancedChallenge.useImage": true ONLY if the current question has an
+    image AND a harder image-based variant is natural. Otherwise false and
+    write a text-only question.
+  - "advancedChallenge.positiveContext.theme": the theme woven into the
+    question — one of "VOLUNTEERING", "MOTHERS_DAY", "CHRISTMAS_CAROLLING",
+    "HELPING_IN_WAR_OR_NEED", "SEASONAL_OR_CURRENT_NEWS", or
+    "LOVE_OR_PEACE_GENERAL". "" if no positive context fits the question
+    naturally — in that case the question stays neutral and message is "".
+  - "advancedChallenge.positiveContext.message": OPTIONAL short closing line
+    appended after the question (one sentence, encouraging). Leave "" if no
+    extra closing line is needed, or if theme is "". Never put the scenario
+    here — the scenario lives inside "question".
+
+Use the student's first name when given. Keep everything child-friendly,
+encouraging, direct, and clear.
 `.trim();
 
-// For the streaming variant: structured schema with propertyOrdering so part2
-// (the field the student sees first) is emitted first by the model. That lets
-// us tail the JSON stream and surface part2 characters as they arrive.
+// Streaming variant uses the schema below directly; STREAM_RESPONSE_RULES is
+// the same as JSON_RESPONSE_RULES with one extra reminder that hintStream
+// MUST come first so the scanner can tail it.
+const STREAM_RESPONSE_RULES = `${JSON_RESPONSE_RULES}
+
+The "hintStream" field MUST appear FIRST in the emitted JSON so the student
+sees the live hint or congratulation immediately as characters arrive.`;
+
+// For the streaming variant: structured schema with propertyOrdering so
+// `hintStream` (the field the student sees first) is emitted first by the
+// model. The HintStreamScanner tails the JSON and surfaces its characters as
+// they arrive.
 const FEEDBACK_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
-    part2: { type: Type.STRING },
-    part1: { type: Type.STRING },
-    part3: { type: Type.STRING },
+    hintStream: { type: Type.STRING },
     correct: { type: Type.BOOLEAN },
-    newQuestion: { type: Type.STRING },
+    studentCanDo: {
+      type: Type.OBJECT,
+      properties: {
+        subjectTrack: { type: Type.STRING, enum: ["STEM", "HUMANITIES_LANGUAGES"] },
+        message: { type: Type.STRING },
+      },
+      required: ["subjectTrack", "message"],
+      propertyOrdering: ["subjectTrack", "message"],
+    },
+    nextStep: {
+      type: Type.OBJECT,
+      properties: {
+        dont: { type: Type.STRING },
+        what: { type: Type.STRING },
+        how: { type: Type.STRING },
+        explanation: {
+          type: Type.OBJECT,
+          properties: {
+            gradeBand: { type: Type.STRING, enum: ["G3_OR_LOWER", "G4_TO_G8", "G9_PLUS"] },
+            text: { type: Type.STRING },
+          },
+          required: ["gradeBand", "text"],
+          propertyOrdering: ["gradeBand", "text"],
+        },
+      },
+      required: ["dont", "what", "how", "explanation"],
+      propertyOrdering: ["dont", "what", "how", "explanation"],
+    },
+    diagnosticTraining: {
+      type: Type.OBJECT,
+      properties: {
+        underlyingGap: { type: Type.STRING },
+        todaysDifficulty: { type: Type.STRING },
+      },
+      required: ["underlyingGap", "todaysDifficulty"],
+      propertyOrdering: ["underlyingGap", "todaysDifficulty"],
+    },
+    advancedChallenge: {
+      type: Type.OBJECT,
+      properties: {
+        congratulations: { type: Type.STRING },
+        question: { type: Type.STRING },
+        useImage: { type: Type.BOOLEAN },
+        positiveContext: {
+          type: Type.OBJECT,
+          properties: {
+            theme: { type: Type.STRING },
+            message: { type: Type.STRING },
+          },
+          required: ["theme", "message"],
+          propertyOrdering: ["theme", "message"],
+        },
+      },
+      required: ["congratulations", "question", "useImage", "positiveContext"],
+      propertyOrdering: ["congratulations", "question", "useImage", "positiveContext"],
+    },
   },
-  required: ["part2", "part1", "part3", "correct", "newQuestion"],
-  propertyOrdering: ["part2", "part1", "part3", "correct", "newQuestion"],
+  required: [
+    "hintStream",
+    "correct",
+    "studentCanDo",
+    "nextStep",
+    "diagnosticTraining",
+    "advancedChallenge",
+  ],
+  propertyOrdering: [
+    "hintStream",
+    "correct",
+    "studentCanDo",
+    "nextStep",
+    "diagnosticTraining",
+    "advancedChallenge",
+  ],
 };
-
-const STREAM_RESPONSE_RULES = `
-You MUST respond with a single JSON object matching the provided schema. The
-"part2" field MUST come first in the JSON output so the student sees the most
-important guidance immediately.
-- "correct": true only if every content/step and answer is complete and correct.
-- "part1": (incorrect case) which step is correct just before the student got stuck; "" if correct.
-- "part2": (incorrect case) guidance for the first stuck step; (correct case) a brief confirmation that the student's answer is correct.
-- "part3": (incorrect case) practice recommendations for after class; "" if correct.
-- "newQuestion": (correct case) the more advanced similar question with a positive message; "" if incorrect.
-Use the student's name when given. Keep each field child-friendly and concise.
-`.trim();
 
 async function buildTeacherSection(teacherId) {
   if (!teacherId) return "";
@@ -296,14 +423,91 @@ async function buildGeminiRequest({
   };
 }
 
+// Default empty shape — matches FEEDBACK_RESPONSE_SCHEMA exactly so the
+// controller and frontend never have to branch on missing nested objects.
+function emptyStudentCanDo() {
+  return { subjectTrack: "STEM", message: "" };
+}
+function emptyNextStep() {
+  return {
+    dont: "",
+    what: "",
+    how: "",
+    explanation: { gradeBand: "G4_TO_G8", text: "" },
+  };
+}
+function emptyDiagnosticTraining() {
+  return { underlyingGap: "", todaysDifficulty: "" };
+}
+function emptyAdvancedChallenge() {
+  return {
+    congratulations: "",
+    question: "",
+    useImage: false,
+    positiveContext: { theme: "", message: "" },
+  };
+}
+
 function buildEmptyFeedback(responseText) {
   return {
     correct: false,
-    part1: "",
-    part2: "Sorry, I couldn't generate feedback this time. Please try again.",
-    part3: "",
-    newQuestion: "",
+    hintStream: "Sorry, I couldn't generate feedback this time. Please try again.",
+    studentCanDo: emptyStudentCanDo(),
+    nextStep: emptyNextStep(),
+    diagnosticTraining: emptyDiagnosticTraining(),
+    advancedChallenge: emptyAdvancedChallenge(),
     raw: responseText,
+  };
+}
+
+function pickString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function shapeStudentCanDo(value) {
+  if (!value || typeof value !== "object") return emptyStudentCanDo();
+  const subjectTrack = value.subjectTrack === "HUMANITIES_LANGUAGES"
+    ? "HUMANITIES_LANGUAGES"
+    : "STEM";
+  return { subjectTrack, message: pickString(value.message) };
+}
+
+function shapeNextStep(value) {
+  if (!value || typeof value !== "object") return emptyNextStep();
+  const explanation = value.explanation && typeof value.explanation === "object"
+    ? value.explanation
+    : {};
+  const allowedBands = new Set(["G3_OR_LOWER", "G4_TO_G8", "G9_PLUS"]);
+  const gradeBand = allowedBands.has(explanation.gradeBand) ? explanation.gradeBand : "G4_TO_G8";
+  return {
+    dont: pickString(value.dont),
+    what: pickString(value.what),
+    how: pickString(value.how),
+    explanation: { gradeBand, text: pickString(explanation.text) },
+  };
+}
+
+function shapeDiagnosticTraining(value) {
+  if (!value || typeof value !== "object") return emptyDiagnosticTraining();
+  return {
+    underlyingGap: pickString(value.underlyingGap),
+    todaysDifficulty: pickString(value.todaysDifficulty),
+  };
+}
+
+function shapeAdvancedChallenge(value) {
+  if (!value || typeof value !== "object") return emptyAdvancedChallenge();
+  const pc = value.positiveContext && typeof value.positiveContext === "object"
+    ? value.positiveContext
+    : {};
+  return {
+    congratulations: pickString(value.congratulations),
+    question: pickString(value.question),
+    useImage: Boolean(value.useImage),
+    positiveContext: {
+      theme: pickString(pc.theme),
+      message: pickString(pc.message),
+    },
   };
 }
 
@@ -311,10 +515,11 @@ function shapeFeedback(parsed, responseText) {
   if (!parsed) return buildEmptyFeedback(responseText);
   return {
     correct: Boolean(parsed.correct),
-    part1: typeof parsed.part1 === "string" ? parsed.part1 : "",
-    part2: typeof parsed.part2 === "string" ? parsed.part2 : "",
-    part3: typeof parsed.part3 === "string" ? parsed.part3 : "",
-    newQuestion: typeof parsed.newQuestion === "string" ? parsed.newQuestion : "",
+    hintStream: pickString(parsed.hintStream),
+    studentCanDo: shapeStudentCanDo(parsed.studentCanDo),
+    nextStep: shapeNextStep(parsed.nextStep),
+    diagnosticTraining: shapeDiagnosticTraining(parsed.diagnosticTraining),
+    advancedChallenge: shapeAdvancedChallenge(parsed.advancedChallenge),
     raw: responseText,
   };
 }
@@ -371,11 +576,11 @@ export async function getClassworkAiFeedback({
   return feedback;
 }
 
-// Scans a streaming JSON response for the "part2" string value and emits its
-// characters as they arrive. Designed to be fed chunks of an in-flight JSON
-// response — handles chunk boundaries, common backslash escapes, and stops
-// when the closing quote of the part2 value is reached.
-class Part2StreamScanner {
+// Scans a streaming JSON response for the "hintStream" string value and emits
+// its characters as they arrive. Designed to be fed chunks of an in-flight
+// JSON response — handles chunk boundaries, common backslash escapes, and
+// stops when the closing quote of the hintStream value is reached.
+class HintStreamScanner {
   constructor() {
     this.buffer = "";
     this.state = "searching"; // searching | inValue | done
@@ -389,7 +594,7 @@ class Part2StreamScanner {
     const out = [];
 
     if (this.state === "searching") {
-      const re = /"part2"\s*:\s*"/;
+      const re = /"hintStream"\s*:\s*"/;
       const match = this.buffer.match(re);
       if (!match) return "";
       this.state = "inValue";
@@ -431,7 +636,7 @@ class Part2StreamScanner {
 }
 
 // Streaming counterpart to getClassworkAiFeedback. Yields incremental events:
-//   { type: 'part2-delta', text }         — characters of part2 as they arrive
+//   { type: 'hint-delta', text }          — characters of hintStream as they arrive
 //   { type: 'done', feedback, cachedTokens, standardPromptHash } — once Gemini finishes
 //   { type: 'error', message }            — terminal failure (after retries)
 //
@@ -473,7 +678,7 @@ export async function* getClassworkAiFeedbackStream(input) {
     return;
   }
 
-  const scanner = new Part2StreamScanner();
+  const scanner = new HintStreamScanner();
   let fullText = "";
   let cachedTokens = 0;
 
@@ -483,7 +688,7 @@ export async function* getClassworkAiFeedbackStream(input) {
       if (piece) {
         fullText += piece;
         const delta = scanner.feed(piece);
-        if (delta) yield { type: "part2-delta", text: delta };
+        if (delta) yield { type: "hint-delta", text: delta };
       }
       const cached = chunk?.usageMetadata?.cachedContentTokenCount;
       if (cached) cachedTokens = cached;

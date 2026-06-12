@@ -1010,8 +1010,8 @@ export const updateAssignmentByAdmin = async (req, res) => {
 // }
 
 // Pull every classwork question for a Session and stitch in the per-question
-// allPart3 history from ClassworkAiReport (broken out by student). Output
-// matches the shape geminiAssignmentQuestions expects.
+// diagnostic-training history from ClassworkAiReport (broken out by student).
+// Output matches the shape geminiAssignmentQuestions expects.
 async function buildSessionReportForAssignment({ session }) {
   if (!session?._id) return { lessonName: "", questions: [] };
 
@@ -1031,7 +1031,7 @@ async function buildSessionReportForAssignment({ session }) {
   ]);
 
   // Index AI reports by `${questionId}::${studentId}` so we can attach
-  // allPart3 history per question without an N+1 inside the loop.
+  // training history per question without an N+1 inside the loop.
   const reportIndex = new Map();
   aiReports.forEach((r) => {
     reportIndex.set(`${r.questionId}::${r.studentId}`, r);
@@ -1044,21 +1044,24 @@ async function buildSessionReportForAssignment({ session }) {
       feedback: s.feedback || "",
     }));
 
-    // Flatten allPart3 across every student who attempted this question.
-    const aiPart3History = [];
+    // Flatten trainingHistory across every student who attempted this
+    // question. Each entry contributes both the underlying-gap training and
+    // today's-difficulty training so the cohort-weakness prompt can see
+    // either signal.
+    const trainingHistory = [];
     (q.submitted || []).forEach((s) => {
       const report = reportIndex.get(`${q.id}::${s.studentId}`);
-      const entries = report?.allPart3 || [];
+      const entries = report?.trainingHistory || [];
       entries.forEach((entry) => {
-        const text =
-          typeof entry === "string" ? entry : String(entry?.text || "");
-        if (text.trim()) {
-          aiPart3History.push({
-            studentId: s.studentId,
-            studentName: s.studentName,
-            text,
-          });
-        }
+        const underlying = String(entry?.underlyingGap || "").trim();
+        const todays = String(entry?.todaysDifficulty || "").trim();
+        if (!underlying && !todays) return;
+        trainingHistory.push({
+          studentId: s.studentId,
+          studentName: s.studentName,
+          underlyingGap: underlying,
+          todaysDifficulty: todays,
+        });
       });
     });
 
@@ -1067,7 +1070,7 @@ async function buildSessionReportForAssignment({ session }) {
       format: q.format,
       correctAnswer: q.correctAnswer,
       submitted,
-      aiPart3History,
+      trainingHistory,
     };
   });
 
