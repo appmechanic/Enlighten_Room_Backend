@@ -8,10 +8,20 @@ const StandardPromptSchema = new mongoose.Schema(
       unique: true,
       index: true,
     },
+    // Legacy joined view of aiHintPromptSections, kept so older callers
+    // (e.g. controllers/geminiHintController.js) keep working unchanged.
+    // The standard-prompt controller rewrites this on every save.
     aiHintPrompt: {
       type: String,
       trim: true,
       default: "",
+    },
+    // Admin-editable AI hint prompt, split into the 10 sections defined in
+    // utils/aiHintSections.js. Used by geminiClassworkFeedback.js to
+    // assemble the per-request rules block.
+    aiHintPromptSections: {
+      type: [String],
+      default: undefined,
     },
     reportPrompt: {
       type: String,

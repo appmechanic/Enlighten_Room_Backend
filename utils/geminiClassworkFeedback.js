@@ -3,6 +3,12 @@ import { GoogleGenAI, Type } from "@google/genai";
 import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
+import {
+  AI_HINT_SECTION_COUNT,
+  assembleAiHintPrompt,
+  defaultAiHintSections,
+  normalizeAiHintSections,
+} from "./aiHintSections.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -73,88 +79,19 @@ async function sourceToInlineData(source) {
   return { base64: Buffer.from(buffer).toString("base64"), mimeType: "image/jpeg" };
 }
 
-// Shared rules text describing the two-mode response shape. Used for both the
-// non-streaming (responseMimeType: application/json) and streaming
-// (responseSchema) paths. `hintStream` MUST be emitted first so the live
-// stream scanner can tail it.
-const JSON_RESPONSE_RULES = `
-You MUST respond with a single JSON object only (no prose, no markdown fences).
-
-Set "correct" to true ONLY if every step and the final answer are complete and correct.
-Choose ONE of two modes based on "correct":
-
-DIAGNOSTIC mode (correct = false):
-  Populate "studentCanDo", "nextStep", "diagnosticTraining".
-  Leave "advancedChallenge.congratulations" = "" and "advancedChallenge.question" = "".
-
-  - "hintStream": the live, student-facing hint, built as a single flowing
-    string: first the DON'T line, then WHAT to do next (never reveal the
-    exact expression or sentence), then HOW to do it. Append a short concept
-    explanation tuned to the grade band when useful.
-
-  - "studentCanDo.subjectTrack": "STEM" or "HUMANITIES_LANGUAGES".
-  - "studentCanDo.message": ONE sentence starting with "Hi [first name], you ...".
-    For STEM, name the last mathematically correct line/step. For Humanities/
-    Languages, name the strongest correct logic, translation fragment, factual
-    premise, or thesis foundation so far.
-
-  - "nextStep.dont": what NOT to do (the incorrect step), in clear plain language.
-  - "nextStep.what": the correct formula / strategy / grammar / phrase / sentence
-    structure / fact to apply next, WITHOUT revealing the exact expression or
-    sentence.
-  - "nextStep.how": how to perform it next step, if useful. "" if not needed.
-  - "nextStep.explanation.gradeBand": one of "G3_OR_LOWER", "G4_TO_G8", "G9_PLUS".
-  - "nextStep.explanation.text": explain the underlying theorem / reason /
-    theory / structure. G3 or lower = one short sentence. G4–G8 = under 50
-    words. G9+ = a paragraph of appropriate length. "" only if no
-    explanation is needed.
-
-  - "diagnosticTraining.underlyingGap": one training exercise that strengthens
-    the underlying milestone / capability / habit behind today's difficulty.
-    Do NOT name the gap, the deficit, or any past issue to the student.
-  - "diagnosticTraining.todaysDifficulty": one training exercise that targets
-    the specific difficulty the student faced in THIS question.
-
-MASTERY mode (correct = true):
-  Populate "advancedChallenge". Leave "studentCanDo.message" = "",
-  "nextStep.dont/what/how" = "", and "diagnosticTraining.*" = "".
-
-  - "hintStream": a short, warm congratulation sentence (this is what the
-    student sees live).
-  - "advancedChallenge.congratulations": the same congratulation, full form.
-  - "advancedChallenge.question": a brand-new question exactly one level more
-    advanced than the current one (STEM: introduce an optimization
-    constraint or symbolic variation; Humanities: a deeper thematic prompt,
-    a more complex grammatical structure, or a comparative primary-source
-    analysis). When a positive context fits naturally, WEAVE THE SCENARIO
-    DIRECTLY INTO THIS QUESTION TEXT (e.g., "While volunteering at a food
-    bank, calculate ..."). Do NOT leave the question neutral and put the
-    scenario in positiveContext.message — the context belongs in the
-    question itself.
-  - "advancedChallenge.useImage": true ONLY if the current question has an
-    image AND a harder image-based variant is natural. Otherwise false and
-    write a text-only question.
-  - "advancedChallenge.positiveContext.theme": the theme woven into the
-    question — one of "VOLUNTEERING", "MOTHERS_DAY", "CHRISTMAS_CAROLLING",
-    "HELPING_IN_WAR_OR_NEED", "SEASONAL_OR_CURRENT_NEWS", or
-    "LOVE_OR_PEACE_GENERAL". "" if no positive context fits the question
-    naturally — in that case the question stays neutral and message is "".
-  - "advancedChallenge.positiveContext.message": OPTIONAL short closing line
-    appended after the question (one sentence, encouraging). Leave "" if no
-    extra closing line is needed, or if theme is "". Never put the scenario
-    here — the scenario lives inside "question".
-
-Use the student's first name when given. Keep everything child-friendly,
-encouraging, direct, and clear.
-`.trim();
-
-// Streaming variant uses the schema below directly; STREAM_RESPONSE_RULES is
-// the same as JSON_RESPONSE_RULES with one extra reminder that hintStream
-// MUST come first so the scanner can tail it.
-const STREAM_RESPONSE_RULES = `${JSON_RESPONSE_RULES}
-
-The "hintStream" field MUST appear FIRST in the emitted JSON so the student
+// Shared rules text describing the two-mode response shape is now assembled
+// at request time from the admin-editable sections in
+// utils/aiHintSections.js. buildRulesSection() joins those 10 strings into
+// the body that used to be the hard-coded JSON_RESPONSE_RULES constant, and
+// optionally appends the streaming reminder.
+const STREAM_HINT_FIRST_REMINDER =
+`The "hintStream" field MUST appear FIRST in the emitted JSON so the student
 sees the live hint or congratulation immediately as characters arrive.`;
+
+function buildRulesSection(sections, { streaming }) {
+  const body = assembleAiHintPrompt(sections).trim();
+  return streaming ? `${body}\n\n${STREAM_HINT_FIRST_REMINDER}` : body;
+}
 
 // For the streaming variant: structured schema with propertyOrdering so
 // `hintStream` (the field the student sees first) is emitted first by the
@@ -264,17 +201,26 @@ function hashStandardPrompt(text) {
   return crypto.createHash("sha1").update(trimmed).digest("hex");
 }
 
-// Returns the trimmed standard-prompt body and its hash. Hash is "" when no
-// prompt is configured so any non-empty stored hash on a report still counts
-// as a mismatch (forces a re-send if the admin later adds a prompt).
+// Returns the 10 admin-editable AI-hint sections (falling back to defaults if
+// the DB row is missing or malformed), the assembled prompt body, and a hash
+// of that body. The hash is used as a per-interaction cache key: when the
+// report's stored hash matches this, we send the short reminder instead of
+// re-shipping the full assembled prompt.
 async function loadStandardPrompt() {
   try {
     const doc = await StandardPrompt.findOne({ key: "global" }).lean();
-    const text = (doc?.aiHintPrompt || "").trim();
-    return { text, hash: hashStandardPrompt(text) };
+    const sections =
+      Array.isArray(doc?.aiHintPromptSections) &&
+      doc.aiHintPromptSections.length === AI_HINT_SECTION_COUNT
+        ? normalizeAiHintSections(doc.aiHintPromptSections)
+        : defaultAiHintSections();
+    const text = assembleAiHintPrompt(sections);
+    return { sections, text, hash: hashStandardPrompt(text) };
   } catch (err) {
     console.error("[ClassworkFeedback] Failed to load StandardPrompt:", err);
-    return { text: "", hash: "" };
+    const sections = defaultAiHintSections();
+    const text = assembleAiHintPrompt(sections);
+    return { sections, text, hash: hashStandardPrompt(text) };
   }
 }
 
@@ -353,11 +299,11 @@ async function buildGeminiRequest({
   format,
   studentName,
   teacherId,
-  rulesSection,
+  streaming,
   lastSentStandardPromptHash,
 }) {
   console.log("[ClassworkFeedback] teacherId:", teacherId || "(missing)");
-  const [{ text: standardText, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
+  const [{ sections, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
     loadStandardPrompt(),
     buildTeacherSection(teacherId),
   ]);
@@ -365,20 +311,19 @@ async function buildGeminiRequest({
   const reuseStandard =
     Boolean(standardPromptHash) && lastSentStandardPromptHash === standardPromptHash;
 
-  const standardSection = standardText
-    ? (reuseStandard ? STANDARD_PROMPT_REMINDER : `Standard prompt: ${standardText}`)
-    : "";
+  const rulesSection = reuseStandard
+    ? STANDARD_PROMPT_REMINDER
+    : buildRulesSection(sections, { streaming: Boolean(streaming) });
 
-  console.log("[ClassworkFeedback] Standard prompt:", standardText
-    ? (reuseStandard ? "reminder (cached)" : "full body (first send or version changed)")
-    : "none configured"
+  console.log("[ClassworkFeedback] Standard prompt:",
+    reuseStandard ? "reminder (cached)" : "full body (first send or version changed)"
   );
   console.log(
     "[ClassworkFeedback] Using teacher prompt:",
     teacherPrompt ? "yes" : "no"
   );
 
-  const systemInstruction = [standardSection, teacherPrompt, rulesSection]
+  const systemInstruction = [teacherPrompt, rulesSection]
     .filter(Boolean)
     .join("\n\n");
 
@@ -542,7 +487,7 @@ export async function getClassworkAiFeedback({
     format,
     studentName,
     teacherId,
-    rulesSection: JSON_RESPONSE_RULES,
+    streaming: false,
     lastSentStandardPromptHash,
   });
 
@@ -648,7 +593,7 @@ class HintStreamScanner {
 export async function* getClassworkAiFeedbackStream(input) {
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
     ...input,
-    rulesSection: STREAM_RESPONSE_RULES,
+    streaming: true,
   });
 
   const config = {
