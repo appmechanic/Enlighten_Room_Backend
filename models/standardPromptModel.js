@@ -8,17 +8,18 @@ const StandardPromptSchema = new mongoose.Schema(
       unique: true,
       index: true,
     },
-    // Legacy joined view of aiHintPromptSections, kept so older callers
-    // (e.g. controllers/geminiHintController.js) keep working unchanged.
-    // The standard-prompt controller rewrites this on every save.
+    // Joined view of aiHintPromptSections, rewritten by the standard-prompt
+    // controller on every save so older callers (e.g. geminiHintController)
+    // that read aiHintPrompt directly keep working unchanged.
     aiHintPrompt: {
       type: String,
       trim: true,
       default: "",
     },
-    // Admin-editable AI hint prompt, split into the 10 sections defined in
-    // utils/aiHintSections.js. Used by geminiClassworkFeedback.js to
-    // assemble the per-request rules block.
+    // Admin's AI hint prompt split into 10 sub-fields, edited individually
+    // in the AdminAiPrompts UI. Position-based; see
+    // Enlighten_Room_React/src/components/Admin/aiHintPromptSections.js for
+    // the section meta (id/title/placeholder).
     aiHintPromptSections: {
       type: [String],
       default: undefined,

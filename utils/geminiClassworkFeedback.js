@@ -3,12 +3,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
-import {
-  AI_HINT_SECTION_COUNT,
-  assembleAiHintPrompt,
-  defaultAiHintSections,
-  normalizeAiHintSections,
-} from "./aiHintSections.js";
+import { buildJsonResponseRules } from "./aiHintSections.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -79,19 +74,21 @@ async function sourceToInlineData(source) {
   return { base64: Buffer.from(buffer).toString("base64"), mimeType: "image/jpeg" };
 }
 
-// Shared rules text describing the two-mode response shape is now assembled
-// at request time from the admin-editable sections in
-// utils/aiHintSections.js. buildRulesSection() joins those 10 strings into
-// the body that used to be the hard-coded JSON_RESPONSE_RULES constant, and
-// optionally appends the streaming reminder.
-const STREAM_HINT_FIRST_REMINDER =
-`The "hintStream" field MUST appear FIRST in the emitted JSON so the student
-sees the live hint or congratulation immediately as characters arrive.`;
+// Shared rules text describing the two-mode response shape. Used for both
+// the non-streaming (responseMimeType: application/json) and streaming
+// (responseSchema) paths. Assembled from the 10 string constants in
+// utils/aiHintSections.js so editing one section there changes the rules in
+// isolation. `hintStream` MUST be emitted first so the live stream scanner
+// can tail it.
+const JSON_RESPONSE_RULES = buildJsonResponseRules();
 
-function buildRulesSection(sections, { streaming }) {
-  const body = assembleAiHintPrompt(sections).trim();
-  return streaming ? `${body}\n\n${STREAM_HINT_FIRST_REMINDER}` : body;
-}
+// Streaming variant uses the schema below directly; STREAM_RESPONSE_RULES is
+// the same as JSON_RESPONSE_RULES with one extra reminder that hintStream
+// MUST come first so the scanner can tail it.
+const STREAM_RESPONSE_RULES = `${JSON_RESPONSE_RULES}
+
+The "hintStream" field MUST appear FIRST in the emitted JSON so the student
+sees the live hint or congratulation immediately as characters arrive.`;
 
 // For the streaming variant: structured schema with propertyOrdering so
 // `hintStream` (the field the student sees first) is emitted first by the
@@ -201,26 +198,17 @@ function hashStandardPrompt(text) {
   return crypto.createHash("sha1").update(trimmed).digest("hex");
 }
 
-// Returns the 10 admin-editable AI-hint sections (falling back to defaults if
-// the DB row is missing or malformed), the assembled prompt body, and a hash
-// of that body. The hash is used as a per-interaction cache key: when the
-// report's stored hash matches this, we send the short reminder instead of
-// re-shipping the full assembled prompt.
+// Returns the trimmed standard-prompt body and its hash. Hash is "" when no
+// prompt is configured so any non-empty stored hash on a report still counts
+// as a mismatch (forces a re-send if the admin later adds a prompt).
 async function loadStandardPrompt() {
   try {
     const doc = await StandardPrompt.findOne({ key: "global" }).lean();
-    const sections =
-      Array.isArray(doc?.aiHintPromptSections) &&
-      doc.aiHintPromptSections.length === AI_HINT_SECTION_COUNT
-        ? normalizeAiHintSections(doc.aiHintPromptSections)
-        : defaultAiHintSections();
-    const text = assembleAiHintPrompt(sections);
-    return { sections, text, hash: hashStandardPrompt(text) };
+    const text = (doc?.aiHintPrompt || "").trim();
+    return { text, hash: hashStandardPrompt(text) };
   } catch (err) {
     console.error("[ClassworkFeedback] Failed to load StandardPrompt:", err);
-    const sections = defaultAiHintSections();
-    const text = assembleAiHintPrompt(sections);
-    return { sections, text, hash: hashStandardPrompt(text) };
+    return { text: "", hash: "" };
   }
 }
 
@@ -299,11 +287,11 @@ async function buildGeminiRequest({
   format,
   studentName,
   teacherId,
-  streaming,
+  rulesSection,
   lastSentStandardPromptHash,
 }) {
   console.log("[ClassworkFeedback] teacherId:", teacherId || "(missing)");
-  const [{ sections, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
+  const [{ text: standardText, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
     loadStandardPrompt(),
     buildTeacherSection(teacherId),
   ]);
@@ -311,19 +299,20 @@ async function buildGeminiRequest({
   const reuseStandard =
     Boolean(standardPromptHash) && lastSentStandardPromptHash === standardPromptHash;
 
-  const rulesSection = reuseStandard
-    ? STANDARD_PROMPT_REMINDER
-    : buildRulesSection(sections, { streaming: Boolean(streaming) });
+  const standardSection = standardText
+    ? (reuseStandard ? STANDARD_PROMPT_REMINDER : `Standard prompt: ${standardText}`)
+    : "";
 
-  console.log("[ClassworkFeedback] Standard prompt:",
-    reuseStandard ? "reminder (cached)" : "full body (first send or version changed)"
+  console.log("[ClassworkFeedback] Standard prompt:", standardText
+    ? (reuseStandard ? "reminder (cached)" : "full body (first send or version changed)")
+    : "none configured"
   );
   console.log(
     "[ClassworkFeedback] Using teacher prompt:",
     teacherPrompt ? "yes" : "no"
   );
 
-  const systemInstruction = [teacherPrompt, rulesSection]
+  const systemInstruction = [standardSection, teacherPrompt, rulesSection]
     .filter(Boolean)
     .join("\n\n");
 
@@ -487,7 +476,7 @@ export async function getClassworkAiFeedback({
     format,
     studentName,
     teacherId,
-    streaming: false,
+    rulesSection: JSON_RESPONSE_RULES,
     lastSentStandardPromptHash,
   });
 
@@ -593,7 +582,7 @@ class HintStreamScanner {
 export async function* getClassworkAiFeedbackStream(input) {
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
     ...input,
-    streaming: true,
+    rulesSection: STREAM_RESPONSE_RULES,
   });
 
   const config = {
