@@ -152,7 +152,15 @@ const getGeminiHint = async (req, res) => {
         roomId ? Classroom.findById(roomId).select("teacherId").lean() : null,
       ]);
 
-      standardPromptText = (standardDoc?.aiHintPrompt || "").trim();
+      const sections = Array.isArray(standardDoc?.aiHintPromptSections)
+        ? standardDoc.aiHintPromptSections
+        : [];
+      const joinedSections = sections
+        .map((s) => (typeof s === "string" ? s.trim() : ""))
+        .filter((s) => s.length > 0)
+        .join("\n\n");
+      standardPromptText =
+        joinedSections || (standardDoc?.aiHintPrompt || "").trim();
 
       if (classroom?.teacherId) {
         const teacherConfig = await TeacherAIConfig.findOne({
