@@ -233,106 +233,12 @@ async function buildGeminiRequest({
   };
 }
 
-// Default empty shape — kept in sync with the JSON structure the admin's
-// standard prompt instructs Gemini to return, so the controller and frontend
-// never have to branch on missing nested objects.
-function emptyStudentCanDo() {
-  return { subjectTrack: "STEM", message: "" };
-}
-function emptyNextStep() {
-  return {
-    dont: "",
-    what: "",
-    how: "",
-    explanation: { gradeBand: "G4_TO_G8", text: "" },
-  };
-}
-function emptyDiagnosticTraining() {
-  return { underlyingGap: "", todaysDifficulty: "" };
-}
-function emptyAdvancedChallenge() {
-  return {
-    congratulations: "",
-    question: "",
-    useImage: false,
-    positiveContext: { theme: "", message: "" },
-  };
-}
-
-function buildEmptyFeedback(responseText) {
-  return {
-    correct: false,
-    hintStream: "Sorry, I couldn't generate feedback this time. Please try again.",
-    studentCanDo: emptyStudentCanDo(),
-    nextStep: emptyNextStep(),
-    diagnosticTraining: emptyDiagnosticTraining(),
-    advancedChallenge: emptyAdvancedChallenge(),
-    raw: responseText,
-  };
-}
-
-function pickString(value) {
-  return typeof value === "string" ? value : "";
-}
-
-function shapeStudentCanDo(value) {
-  if (!value || typeof value !== "object") return emptyStudentCanDo();
-  const subjectTrack = value.subjectTrack === "HUMANITIES_LANGUAGES"
-    ? "HUMANITIES_LANGUAGES"
-    : "STEM";
-  return { subjectTrack, message: pickString(value.message) };
-}
-
-function shapeNextStep(value) {
-  if (!value || typeof value !== "object") return emptyNextStep();
-  const explanation = value.explanation && typeof value.explanation === "object"
-    ? value.explanation
-    : {};
-  const allowedBands = new Set(["G3_OR_LOWER", "G4_TO_G8", "G9_PLUS"]);
-  const gradeBand = allowedBands.has(explanation.gradeBand) ? explanation.gradeBand : "G4_TO_G8";
-  return {
-    dont: pickString(value.dont),
-    what: pickString(value.what),
-    how: pickString(value.how),
-    explanation: { gradeBand, text: pickString(explanation.text) },
-  };
-}
-
-function shapeDiagnosticTraining(value) {
-  if (!value || typeof value !== "object") return emptyDiagnosticTraining();
-  return {
-    underlyingGap: pickString(value.underlyingGap),
-    todaysDifficulty: pickString(value.todaysDifficulty),
-  };
-}
-
-function shapeAdvancedChallenge(value) {
-  if (!value || typeof value !== "object") return emptyAdvancedChallenge();
-  const pc = value.positiveContext && typeof value.positiveContext === "object"
-    ? value.positiveContext
-    : {};
-  return {
-    congratulations: pickString(value.congratulations),
-    question: pickString(value.question),
-    useImage: Boolean(value.useImage),
-    positiveContext: {
-      theme: pickString(pc.theme),
-      message: pickString(pc.message),
-    },
-  };
-}
-
+// Pass-through: whatever Gemini emits as JSON is what the caller gets. The
+// shape (field names, enums, nested keys) is dictated entirely by the admin's
+// standard prompt. Downstream code (controller + Mongo schema) defaults
+// missing fields, so a malformed/empty response degrades safely.
 function shapeFeedback(parsed, responseText) {
-  if (!parsed) return buildEmptyFeedback(responseText);
-  return {
-    correct: Boolean(parsed.correct),
-    hintStream: pickString(parsed.hintStream),
-    studentCanDo: shapeStudentCanDo(parsed.studentCanDo),
-    nextStep: shapeNextStep(parsed.nextStep),
-    diagnosticTraining: shapeDiagnosticTraining(parsed.diagnosticTraining),
-    advancedChallenge: shapeAdvancedChallenge(parsed.advancedChallenge),
-    raw: responseText,
-  };
+  return { ...(parsed || {}), raw: responseText };
 }
 
 export async function getClassworkAiFeedback({
