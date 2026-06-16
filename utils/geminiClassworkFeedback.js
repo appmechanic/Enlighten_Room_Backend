@@ -111,14 +111,6 @@ async function loadStandardPrompt() {
   }
 }
 
-// Short reminder sent on every call AFTER the first one for a given
-// (room, question, student) interaction. Keeps token usage low while
-// re-anchoring the model on the standard prompt it already saw and on the
-// JSON schema the caller expects back.
-const STANDARD_PROMPT_REMINDER =
-  "Standard prompt: continue to follow the standard guidance you received "
-  + "earlier for this student and return feedback in the same JSON schema.";
-
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
@@ -164,20 +156,12 @@ function parseJsonResponse(text) {
 // Builds the Gemini request payload (systemInstruction + contents) from the
 // same inputs both the streaming and non-streaming entry points take.
 //
-// Standard-prompt delivery strategy:
-//   - First AI call for a (room, question, student) interaction sends the
-//     FULL standard prompt body (caller passes lastSentStandardPromptHash="" ).
-//   - Subsequent calls for the same interaction send a SHORT reminder that
-//     re-anchors the model on the previously-seen standard guidance and the
-//     JSON schema, saving tokens.
-//   - The teacher's personal prompt is attached EVERY time (teachers tune it
-//     freely; we never assume Gemini has it cached).
-//   - When the admin edits StandardPrompt, its content changes and so does
-//     its hash; the next call for every interaction will detect the mismatch
-//     and re-send the full body, then store the new hash on the report.
-//
-// The function returns `standardPromptHash` so the caller can persist it on
-// the ClassworkAiReport after the call succeeds.
+// The admin's standard prompt now carries BOTH the JSON schema description
+// and the per-field content rules, so it is sent in full on every call.
+// Gemini's server-side implicit cache (cachedContentTokenCount in the
+// response) handles cost amortisation when the same body is sent repeatedly.
+// The function still returns `standardPromptHash` for callers that persist
+// it on ClassworkAiReport, but the value no longer gates what we send.
 async function buildGeminiRequest({
   questionText,
   answer,
@@ -186,7 +170,6 @@ async function buildGeminiRequest({
   format,
   studentName,
   teacherId,
-  lastSentStandardPromptHash,
 }) {
   console.log("[ClassworkFeedback] teacherId:", teacherId || "(missing)");
   const [{ text: standardText, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
@@ -194,16 +177,11 @@ async function buildGeminiRequest({
     buildTeacherSection(teacherId),
   ]);
 
-  const reuseStandard =
-    Boolean(standardPromptHash) && lastSentStandardPromptHash === standardPromptHash;
+  const standardSection = standardText ? `Standard prompt: ${standardText}` : "";
 
-  const standardSection = standardText
-    ? (reuseStandard ? STANDARD_PROMPT_REMINDER : `Standard prompt: ${standardText}`)
-    : "";
-
-  console.log("[ClassworkFeedback] Standard prompt:", standardText
-    ? (reuseStandard ? "reminder (cached)" : "full body (first send or version changed)")
-    : "none configured"
+  console.log(
+    "[ClassworkFeedback] Standard prompt:",
+    standardText ? "full body" : "none configured"
   );
   console.log(
     "[ClassworkFeedback] Using teacher prompt:",
@@ -365,7 +343,6 @@ export async function getClassworkAiFeedback({
   format,
   studentName,
   teacherId,
-  lastSentStandardPromptHash,
 }) {
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
     questionText,
@@ -375,7 +352,6 @@ export async function getClassworkAiFeedback({
     format,
     studentName,
     teacherId,
-    lastSentStandardPromptHash,
   });
 
   const config = {
