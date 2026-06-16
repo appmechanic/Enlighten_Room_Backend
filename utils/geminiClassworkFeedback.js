@@ -1,9 +1,8 @@
 import crypto from "crypto";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
-import { buildJsonResponseRules } from "./aiHintSections.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -73,106 +72,6 @@ async function sourceToInlineData(source) {
   const buffer = await response.arrayBuffer();
   return { base64: Buffer.from(buffer).toString("base64"), mimeType: "image/jpeg" };
 }
-
-// Shared rules text describing the two-mode response shape. Used for both
-// the non-streaming (responseMimeType: application/json) and streaming
-// (responseSchema) paths. Assembled from the 10 string constants in
-// utils/aiHintSections.js so editing one section there changes the rules in
-// isolation. `hintStream` MUST be emitted first so the live stream scanner
-// can tail it.
-const JSON_RESPONSE_RULES = buildJsonResponseRules();
-
-// Streaming variant uses the schema below directly; STREAM_RESPONSE_RULES is
-// the same as JSON_RESPONSE_RULES with one extra reminder that hintStream
-// MUST come first so the scanner can tail it.
-const STREAM_RESPONSE_RULES = `${JSON_RESPONSE_RULES}
-
-The "hintStream" field MUST appear FIRST in the emitted JSON so the student
-sees the live hint or congratulation immediately as characters arrive.`;
-
-// For the streaming variant: structured schema with propertyOrdering so
-// `hintStream` (the field the student sees first) is emitted first by the
-// model. The HintStreamScanner tails the JSON and surfaces its characters as
-// they arrive.
-const FEEDBACK_RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    hintStream: { type: Type.STRING },
-    correct: { type: Type.BOOLEAN },
-    studentCanDo: {
-      type: Type.OBJECT,
-      properties: {
-        subjectTrack: { type: Type.STRING, enum: ["STEM", "HUMANITIES_LANGUAGES"] },
-        message: { type: Type.STRING },
-      },
-      required: ["subjectTrack", "message"],
-      propertyOrdering: ["subjectTrack", "message"],
-    },
-    nextStep: {
-      type: Type.OBJECT,
-      properties: {
-        dont: { type: Type.STRING },
-        what: { type: Type.STRING },
-        how: { type: Type.STRING },
-        explanation: {
-          type: Type.OBJECT,
-          properties: {
-            gradeBand: { type: Type.STRING, enum: ["G3_OR_LOWER", "G4_TO_G8", "G9_PLUS"] },
-            text: { type: Type.STRING },
-          },
-          required: ["gradeBand", "text"],
-          propertyOrdering: ["gradeBand", "text"],
-        },
-      },
-      required: ["dont", "what", "how", "explanation"],
-      propertyOrdering: ["dont", "what", "how", "explanation"],
-    },
-    diagnosticTraining: {
-      type: Type.OBJECT,
-      properties: {
-        underlyingGap: { type: Type.STRING },
-        todaysDifficulty: { type: Type.STRING },
-      },
-      required: ["underlyingGap", "todaysDifficulty"],
-      propertyOrdering: ["underlyingGap", "todaysDifficulty"],
-    },
-    advancedChallenge: {
-      type: Type.OBJECT,
-      properties: {
-        congratulations: { type: Type.STRING },
-        question: { type: Type.STRING },
-        useImage: { type: Type.BOOLEAN },
-        positiveContext: {
-          type: Type.OBJECT,
-          properties: {
-            theme: { type: Type.STRING },
-            message: { type: Type.STRING },
-          },
-          required: ["theme", "message"],
-          propertyOrdering: ["theme", "message"],
-        },
-      },
-      required: ["congratulations", "question", "useImage", "positiveContext"],
-      propertyOrdering: ["congratulations", "question", "useImage", "positiveContext"],
-    },
-  },
-  required: [
-    "hintStream",
-    "correct",
-    "studentCanDo",
-    "nextStep",
-    "diagnosticTraining",
-    "advancedChallenge",
-  ],
-  propertyOrdering: [
-    "hintStream",
-    "correct",
-    "studentCanDo",
-    "nextStep",
-    "diagnosticTraining",
-    "advancedChallenge",
-  ],
-};
 
 async function buildTeacherSection(teacherId) {
   if (!teacherId) return "";
@@ -287,7 +186,6 @@ async function buildGeminiRequest({
   format,
   studentName,
   teacherId,
-  rulesSection,
   lastSentStandardPromptHash,
 }) {
   console.log("[ClassworkFeedback] teacherId:", teacherId || "(missing)");
@@ -312,7 +210,7 @@ async function buildGeminiRequest({
     teacherPrompt ? "yes" : "no"
   );
 
-  const systemInstruction = [standardSection, teacherPrompt, rulesSection]
+  const systemInstruction = [standardSection, teacherPrompt]
     .filter(Boolean)
     .join("\n\n");
 
@@ -357,8 +255,9 @@ async function buildGeminiRequest({
   };
 }
 
-// Default empty shape — matches FEEDBACK_RESPONSE_SCHEMA exactly so the
-// controller and frontend never have to branch on missing nested objects.
+// Default empty shape — kept in sync with the JSON structure the admin's
+// standard prompt instructs Gemini to return, so the controller and frontend
+// never have to branch on missing nested objects.
 function emptyStudentCanDo() {
   return { subjectTrack: "STEM", message: "" };
 }
@@ -476,7 +375,6 @@ export async function getClassworkAiFeedback({
     format,
     studentName,
     teacherId,
-    rulesSection: JSON_RESPONSE_RULES,
     lastSentStandardPromptHash,
   });
 
@@ -582,13 +480,11 @@ class HintStreamScanner {
 export async function* getClassworkAiFeedbackStream(input) {
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
     ...input,
-    rulesSection: STREAM_RESPONSE_RULES,
   });
 
   const config = {
     systemInstruction,
     responseMimeType: "application/json",
-    responseSchema: FEEDBACK_RESPONSE_SCHEMA,
     thinkingConfig: FEEDBACK_THINKING_CONFIG,
     maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
   };
