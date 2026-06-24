@@ -16,6 +16,24 @@ const MODEL = "gemini-2.5-flash";
 const FEEDBACK_THINKING_CONFIG = { thinkingBudget: 0 };
 const FEEDBACK_MAX_OUTPUT_TOKENS = 500;
 
+// Renders the teacher's per-question correctAnswer for the prompt. An array of
+// strings is treated as a set of acceptable answers (any one of them counts as
+// correct); a single string is used verbatim. We keep this separate from
+// normalizeAnswerText because the student's `answer` array means "one entry
+// per blank", not "any of these is acceptable".
+function formatCorrectAnswerForPrompt(value) {
+  if (Array.isArray(value)) {
+    const items = value
+      .map((entry) => String(entry ?? "").trim())
+      .filter(Boolean);
+    if (items.length === 0) return "";
+    if (items.length === 1) return items[0];
+    return items.map((a, i) => `${i + 1}. ${a}`).join("\n");
+  }
+  if (value == null) return "";
+  return String(value).trim();
+}
+
 function normalizeAnswerText(value) {
   if (Array.isArray(value)) {
     return value
@@ -193,14 +211,21 @@ async function buildGeminiRequest({
     .join("\n\n");
 
   const normalizedAnswerText = normalizeAnswerText(answer);
-  const referenceAnswer = normalizeAnswerText(correctAnswer);
+  const referenceAnswer = formatCorrectAnswerForPrompt(correctAnswer);
+  const referenceCount = Array.isArray(correctAnswer)
+    ? correctAnswer.filter((c) => String(c ?? "").trim()).length
+    : referenceAnswer ? 1 : 0;
   const answerImageSource = getAnswerImageSource(answer);
 
   const promptLines = [
     studentName ? `Student name: ${studentName}` : null,
     `Question: ${questionText}`,
     format ? `Answer Format: ${format}` : null,
-    referenceAnswer ? `Reference / Correct Answer: ${referenceAnswer}` : null,
+    referenceAnswer
+      ? (referenceCount > 1
+          ? `Acceptable correct answers (any one counts as correct):\n${referenceAnswer}`
+          : `Reference / Correct Answer: ${referenceAnswer}`)
+      : null,
     `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
     questionImage ? "A question image is attached." : null,
     answerImageSource ? "A student answer image is attached. Inspect the handwriting/image carefully." : null,

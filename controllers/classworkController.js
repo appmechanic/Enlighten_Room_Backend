@@ -367,7 +367,9 @@ export const downloadAllAnswersCsvReport = async (req, res) => {
           'AI Score': s.aiScore,
           'AI Used': s.aiUsed,
           'Feedback': s.feedback,
-          'Correct Answer': q.correctAnswer ?? '',
+          'Correct Answer': Array.isArray(q.correctAnswer)
+            ? q.correctAnswer.filter((s) => String(s ?? '').trim()).join(' | ')
+            : q.correctAnswer ?? '',
         });
       });
     });
@@ -409,7 +411,9 @@ export const sendClassworkReportToStudentsAndParents = async (req, res) => {
           'AI Score': s.aiScore,
           'AI Used': s.aiUsed,
           'Feedback': s.feedback,
-          'Correct Answer': q.correctAnswer ?? '',
+          'Correct Answer': Array.isArray(q.correctAnswer)
+            ? q.correctAnswer.filter((s) => String(s ?? '').trim()).join(' | ')
+            : q.correctAnswer ?? '',
         });
       });
     });
