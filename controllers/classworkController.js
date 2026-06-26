@@ -661,17 +661,17 @@ async function generateAndStoreClassReport(lessonDoc) {
   }
 
   // Use updateOne with $set rather than doc.save() so the new nested
-  // subdocument array (studentBreakdown) writes through cleanly regardless
-  // of any in-memory path-tracking state on the loaded doc.
+  // subdocument arrays (studentDifficulties etc.) write through cleanly
+  // regardless of any in-memory path-tracking state on the loaded doc.
   await Lesson.updateOne(
     { _id: lessonDoc._id },
     { $set: { classReport } },
   );
   console.log(
     `[ClassReport] stored for lesson=${lessonDoc._id}: ` +
-      `${classReport.studentBreakdown.length} friction points, ` +
-      `${classReport.nextLessonPivot.length} pivots, ` +
-      `focusSkill="${classReport.targetedHomeworkFocus.focusSkill}"`,
+      `${classReport.studentDifficulties.length} difficulties, ` +
+      `${classReport.nextLessonStrategy.length} strategies, ` +
+      `${classReport.targetedHomework.length} homework items`,
   );
   return classReport;
 }
@@ -700,9 +700,9 @@ export const regenerateClassReportForRoom = async (req, res) => {
       const cr = lesson.classReport;
       const alreadyGenerated =
         cr &&
-        ((Array.isArray(cr.studentBreakdown) && cr.studentBreakdown.length > 0) ||
-          (Array.isArray(cr.nextLessonPivot) && cr.nextLessonPivot.length > 0) ||
-          (cr.targetedHomeworkFocus && cr.targetedHomeworkFocus.focusSkill));
+        ((Array.isArray(cr.studentDifficulties) && cr.studentDifficulties.length > 0) ||
+          (Array.isArray(cr.nextLessonStrategy) && cr.nextLessonStrategy.length > 0) ||
+          (Array.isArray(cr.targetedHomework) && cr.targetedHomework.length > 0));
       if (!lessonName && alreadyGenerated) {
         // Already has a report — skip unless explicitly named.
         continue;

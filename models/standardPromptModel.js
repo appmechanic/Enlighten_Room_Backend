@@ -24,10 +24,21 @@ const StandardPromptSchema = new mongoose.Schema(
       type: [String],
       default: undefined,
     },
+    // Joined view of reportPromptSections, rewritten on every save so older
+    // callers (e.g. generateClassReportSummary's fallback path) that read
+    // reportPrompt directly keep working unchanged.
     reportPrompt: {
       type: String,
       trim: true,
       default: "",
+    },
+    // Admin's Class Report standard prompt split into 5 sub-fields, edited
+    // individually in AdminAiPrompts. Position-based; see
+    // Enlighten_Room_React/src/components/Admin/aiHintPromptSections.js
+    // (CLASS_REPORT_PROMPT_SECTIONS) for the section meta.
+    reportPromptSections: {
+      type: [String],
+      default: undefined,
     },
     emailPrompt: {
       type: String,

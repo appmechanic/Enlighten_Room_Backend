@@ -7,21 +7,23 @@ const GLOBAL_KEY = "global";
 // both an array (aiHintPromptSections) and a joined string (aiHintPrompt) so
 // older callers reading the joined string keep working.
 const AI_HINT_SECTION_COUNT = 10;
-const AI_HINT_JOIN_SEPARATOR = "\n\n";
+// Class Report prompt mirrors the same pattern with 5 sub-fields.
+const REPORT_SECTION_COUNT = 5;
+const JOIN_SEPARATOR = "\n\n";
 
-function normalizeSections(input) {
+function normalizeSections(input, count) {
   const arr = Array.isArray(input) ? input : [];
-  return Array.from({ length: AI_HINT_SECTION_COUNT }, (_, i) =>
+  return Array.from({ length: count }, (_, i) =>
     typeof arr[i] === "string" ? arr[i].trim() : ""
   );
 }
 
-function sectionsFromDoc(doc) {
+function aiHintSectionsFromDoc(doc) {
   if (
     Array.isArray(doc?.aiHintPromptSections) &&
     doc.aiHintPromptSections.length === AI_HINT_SECTION_COUNT
   ) {
-    return normalizeSections(doc.aiHintPromptSections);
+    return normalizeSections(doc.aiHintPromptSections, AI_HINT_SECTION_COUNT);
   }
   // No structured array stored yet — drop the legacy single string into the
   // first sub-field so the admin can split it across sections on next save.
@@ -31,20 +33,37 @@ function sectionsFromDoc(doc) {
   return sections;
 }
 
+function reportSectionsFromDoc(doc) {
+  if (
+    Array.isArray(doc?.reportPromptSections) &&
+    doc.reportPromptSections.length === REPORT_SECTION_COUNT
+  ) {
+    return normalizeSections(doc.reportPromptSections, REPORT_SECTION_COUNT);
+  }
+  // Same legacy bridge as aiHint: if only the flat reportPrompt was stored,
+  // surface it in the first sub-field for the admin to split.
+  const legacy = (doc?.reportPrompt || "").trim();
+  const sections = Array.from({ length: REPORT_SECTION_COUNT }, () => "");
+  if (legacy) sections[0] = legacy;
+  return sections;
+}
+
 function joinSections(sections) {
-  return sections.filter((s) => s.length > 0).join(AI_HINT_JOIN_SEPARATOR);
+  return sections.filter((s) => s.length > 0).join(JOIN_SEPARATOR);
 }
 
 export const getStandardPrompts = asyncHandler(async (req, res) => {
   const doc = await StandardPrompt.findOne({ key: GLOBAL_KEY }).lean();
-  const sections = sectionsFromDoc(doc);
+  const aiHintSections = aiHintSectionsFromDoc(doc);
+  const reportSections = reportSectionsFromDoc(doc);
 
   return res.json({
     ok: true,
     data: {
-      aiHintPrompt: doc?.aiHintPrompt || joinSections(sections),
-      aiHintPromptSections: sections,
-      reportPrompt: doc?.reportPrompt || "",
+      aiHintPrompt: doc?.aiHintPrompt || joinSections(aiHintSections),
+      aiHintPromptSections: aiHintSections,
+      reportPrompt: doc?.reportPrompt || joinSections(reportSections),
+      reportPromptSections: reportSections,
       emailPrompt: doc?.emailPrompt || "",
       updatedAt: doc?.updatedAt || null,
     },
@@ -53,15 +72,36 @@ export const getStandardPrompts = asyncHandler(async (req, res) => {
 
 export const upsertStandardPrompts = asyncHandler(async (req, res) => {
   const userId = req.user?._id;
-  const { aiHintPromptSections, reportPrompt, emailPrompt } = req.body || {};
+  const {
+    aiHintPromptSections,
+    reportPromptSections,
+    reportPrompt,
+    emailPrompt,
+  } = req.body || {};
 
-  const sections = normalizeSections(aiHintPromptSections);
-  const joined = joinSections(sections);
+  const aiHintSections = normalizeSections(
+    aiHintPromptSections,
+    AI_HINT_SECTION_COUNT
+  );
+  const aiHintJoined = joinSections(aiHintSections);
+
+  // When the admin posts reportPromptSections, the joined-string mirror is
+  // derived from them — admins editing in the new sectioned UI never touch
+  // the legacy single-field reportPrompt. Fall back to the body's
+  // reportPrompt only if the sectioned array wasn't sent (e.g. older client).
+  const reportSections = normalizeSections(
+    reportPromptSections,
+    REPORT_SECTION_COUNT
+  );
+  const reportJoined = Array.isArray(reportPromptSections)
+    ? joinSections(reportSections)
+    : (reportPrompt || "").trim();
 
   const next = {
-    aiHintPrompt: joined,
-    aiHintPromptSections: sections,
-    reportPrompt: (reportPrompt || "").trim(),
+    aiHintPrompt: aiHintJoined,
+    aiHintPromptSections: aiHintSections,
+    reportPrompt: reportJoined,
+    reportPromptSections: reportSections,
     emailPrompt: (emailPrompt || "").trim(),
     updatedBy: userId || null,
   };
@@ -76,9 +116,10 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     ok: true,
     message: "Standard prompts saved successfully",
     data: {
-      aiHintPrompt: doc?.aiHintPrompt || joined,
-      aiHintPromptSections: sectionsFromDoc(doc),
-      reportPrompt: doc?.reportPrompt || "",
+      aiHintPrompt: doc?.aiHintPrompt || aiHintJoined,
+      aiHintPromptSections: aiHintSectionsFromDoc(doc),
+      reportPrompt: doc?.reportPrompt || reportJoined,
+      reportPromptSections: reportSectionsFromDoc(doc),
       emailPrompt: doc?.emailPrompt || "",
       updatedAt: doc?.updatedAt || null,
     },

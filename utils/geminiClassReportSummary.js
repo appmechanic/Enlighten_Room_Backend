@@ -6,11 +6,10 @@ import StandardPrompt from "../models/standardPromptModel.js";
 // default on the View Report page. Distinct from getClassworkAiFeedback, which
 // runs per student submission and produces individual feedback.
 //
-// Both StandardPrompt.reportPrompt (global) and TeacherAIConfig.reportPrompt
-// (per-teacher) are included in the system instruction — labeled and joined —
-// mirroring the per-student feedback flow. The lesson's classwork questions
-// and the students' submitted answers are passed in as the user content so
-// Gemini has the material to summarize.
+// The system instruction is built from the admin's editable
+// StandardPrompt.reportPromptSections (5 sub-sections) and the per-teacher
+// TeacherAIConfig.reportPrompt. The lesson's classwork questions and the
+// students' submitted answers are passed in as the user content.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -89,73 +88,71 @@ async function buildTeacherSection(teacherId) {
   }
 }
 
+// Pulls the admin's editable 5-section Class Report prompt. Falls back to the
+// joined-string mirror for legacy docs written before the sectioned schema.
 async function buildStandardSection() {
   try {
     const doc = await StandardPrompt.findOne({ key: "global" })
-      .select("reportPrompt")
+      .select("reportPromptSections reportPrompt")
       .lean();
-    const prompt = (doc?.reportPrompt || "").trim();
-    return prompt ? `Standard prompt: ${prompt}` : "";
+    const sections = Array.isArray(doc?.reportPromptSections)
+      ? doc.reportPromptSections
+          .map((s) => (typeof s === "string" ? s.trim() : ""))
+          .filter(Boolean)
+      : [];
+    const joined = sections.length
+      ? sections.join("\n\n")
+      : (doc?.reportPrompt || "").trim();
+    return joined ? `Standard prompt: ${joined}` : "";
   } catch (err) {
     console.error("[ClassReportSummary] Failed to load StandardPrompt:", err);
     return "";
   }
 }
 
-// Always-on guidance describing WHAT each field of the structured response
-// means. responseSchema below enforces the JSON shape; this section anchors
-// the model on the semantics of each field. The admin's standard prompt and
-// the teacher's prompt are layered on top — they express pedagogical tone
-// and preferences but do not need to know about the schema.
-const SCHEMA_GUIDANCE = `
-You are summarizing one classroom lesson for the teacher. Use the submitted
-answers to populate this structured class report:
-- studentBreakdown: each item is one concrete friction point observed in the
-  submissions (e.g. "Finding common denominators") plus the real student
-  names affected by it. Only include students who actually struggled with
-  that point — do not invent or pad.
-- nextLessonPivot: 1-3 tactical recommendations the teacher should apply in
-  the next lesson, grounded in what tripped students up here.
-- targetedHomeworkFocus.focusSkill: the single highest-leverage skill to
-  assign as homework practice (e.g. "Balancing chemical equations").
-- targetedHomeworkFocus.pedagogicalReason: a brief justification for that
-  skill choice, tied to the observed gaps.
-Keep every field concrete and grounded in the actual submissions provided.
-`.trim();
-
 // Gemini structured-output schema mirroring the Mongoose classReport subdoc.
 // Forces the model to return valid JSON in the exact shape we persist.
 const CLASS_REPORT_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
-    studentBreakdown: {
+    studentDifficulties: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
-          frictionPoint: { type: Type.STRING },
+          difficulty: { type: Type.STRING },
           affectedStudents: {
             type: Type.ARRAY,
             items: { type: Type.STRING },
           },
         },
-        required: ["frictionPoint", "affectedStudents"],
+        required: ["difficulty", "affectedStudents"],
       },
     },
-    nextLessonPivot: {
+    nextLessonStrategy: {
       type: Type.ARRAY,
-      items: { type: Type.STRING },
-    },
-    targetedHomeworkFocus: {
-      type: Type.OBJECT,
-      properties: {
-        focusSkill: { type: Type.STRING },
-        pedagogicalReason: { type: Type.STRING },
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          difficulty: { type: Type.STRING },
+          teachingStrategy: { type: Type.STRING },
+        },
+        required: ["difficulty", "teachingStrategy"],
       },
-      required: ["focusSkill", "pedagogicalReason"],
+    },
+    targetedHomework: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          kindsOfTraining: { type: Type.STRING },
+          link: { type: Type.STRING },
+        },
+        required: ["kindsOfTraining"],
+      },
     },
   },
-  required: ["studentBreakdown", "nextLessonPivot", "targetedHomeworkFocus"],
+  required: ["studentDifficulties", "nextLessonStrategy", "targetedHomework"],
 };
 
 // Compact the lesson's classwork + submissions into a textual snapshot the
@@ -218,10 +215,11 @@ export async function generateClassReportSummary({
     teacherSection ? "yes" : "no"
   );
 
-  // SCHEMA_GUIDANCE is always sent so the model knows what to put in each
-  // structured field; admin standard prompt and teacher prompt are appended
-  // as additional pedagogical guidance.
-  const systemInstruction = [SCHEMA_GUIDANCE, standardSection, teacherSection]
+  // Admin's editable Class Report prompt is the single source of truth for
+  // pedagogical tone, language rules, and JSON-shape guidance. The teacher's
+  // per-account override is appended after so it can layer preferences on
+  // top without losing the admin's structure.
+  const systemInstruction = [standardSection, teacherSection]
     .filter(Boolean)
     .join("\n\n");
 
@@ -268,30 +266,37 @@ export async function generateClassReportSummary({
     }
   }
 
-  const studentBreakdown = Array.isArray(parsed?.studentBreakdown)
-    ? parsed.studentBreakdown
+  const studentDifficulties = Array.isArray(parsed?.studentDifficulties)
+    ? parsed.studentDifficulties
         .map((entry) => ({
-          frictionPoint: String(entry?.frictionPoint || "").trim(),
+          difficulty: String(entry?.difficulty || "").trim(),
           affectedStudents: Array.isArray(entry?.affectedStudents)
             ? entry.affectedStudents.map((s) => String(s).trim()).filter(Boolean)
             : [],
         }))
-        .filter((entry) => entry.frictionPoint)
+        .filter((entry) => entry.difficulty)
     : [];
-  const nextLessonPivot = Array.isArray(parsed?.nextLessonPivot)
-    ? parsed.nextLessonPivot.map((s) => String(s).trim()).filter(Boolean)
+  const nextLessonStrategy = Array.isArray(parsed?.nextLessonStrategy)
+    ? parsed.nextLessonStrategy
+        .map((entry) => ({
+          difficulty: String(entry?.difficulty || "").trim(),
+          teachingStrategy: String(entry?.teachingStrategy || "").trim(),
+        }))
+        .filter((entry) => entry.difficulty || entry.teachingStrategy)
     : [];
-  const targetedHomeworkFocus = {
-    focusSkill: String(parsed?.targetedHomeworkFocus?.focusSkill || "").trim(),
-    pedagogicalReason: String(
-      parsed?.targetedHomeworkFocus?.pedagogicalReason || ""
-    ).trim(),
-  };
+  const targetedHomework = Array.isArray(parsed?.targetedHomework)
+    ? parsed.targetedHomework
+        .map((entry) => ({
+          kindsOfTraining: String(entry?.kindsOfTraining || "").trim(),
+          link: String(entry?.link || "").trim(),
+        }))
+        .filter((entry) => entry.kindsOfTraining)
+    : [];
 
   return {
-    studentBreakdown,
-    nextLessonPivot,
-    targetedHomeworkFocus,
+    studentDifficulties,
+    nextLessonStrategy,
+    targetedHomework,
     generatedAt: new Date(),
     model: MODEL,
   };

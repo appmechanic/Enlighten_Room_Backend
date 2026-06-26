@@ -1,22 +1,35 @@
 import mongoose from "mongoose";
 
-// One row of the AI class report's friction-point breakdown.
+// One row of the AI class report's student-difficulties breakdown.
 // _id is disabled via schema options — it can't be done inside the inline
 // object literal because Mongoose treats `_id: false` there as a path
 // declaration of type Boolean, which conflicts with the auto-generated
 // ObjectId and silently breaks saves.
-const StudentBreakdownSchema = new mongoose.Schema(
+const StudentDifficultySchema = new mongoose.Schema(
   {
-    frictionPoint: { type: String, default: "" },
+    difficulty: { type: String, default: "" },
     affectedStudents: { type: [String], default: [] },
   },
   { _id: false }
 );
 
-const TargetedHomeworkFocusSchema = new mongoose.Schema(
+// Per-difficulty teaching strategy for the next lesson — one entry per
+// difficulty observed in studentDifficulties.
+const NextLessonStrategySchema = new mongoose.Schema(
   {
-    focusSkill: { type: String, default: "" },
-    pedagogicalReason: { type: String, default: "" },
+    difficulty: { type: String, default: "" },
+    teachingStrategy: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
+// A homework training item — a verb-led description of the practice
+// (e.g. "practice 8 balancing chemical reactions") plus an optional link
+// to online material.
+const TargetedHomeworkSchema = new mongoose.Schema(
+  {
+    kindsOfTraining: { type: String, default: "" },
+    link: { type: String, default: "" },
   },
   { _id: false }
 );
@@ -51,12 +64,9 @@ const LessonSchema = new mongoose.Schema(
     // Stored separately from per-student ClassworkAiReport docs — this is
     // the "Class Report" the teacher sees by default in the View Report UI.
     classReport: {
-      studentBreakdown: { type: [StudentBreakdownSchema], default: [] },
-      nextLessonPivot: { type: [String], default: [] },
-      targetedHomeworkFocus: {
-        type: TargetedHomeworkFocusSchema,
-        default: () => ({}),
-      },
+      studentDifficulties: { type: [StudentDifficultySchema], default: [] },
+      nextLessonStrategy: { type: [NextLessonStrategySchema], default: [] },
+      targetedHomework: { type: [TargetedHomeworkSchema], default: [] },
       generatedAt: { type: Date, default: null },
       model: { type: String, default: "" },
     },
