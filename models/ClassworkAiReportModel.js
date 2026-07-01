@@ -101,13 +101,10 @@ const ClassworkAiReportSchema = new mongoose.Schema(
     lastHintStream: { type: String, default: '' },
     // Diagnostic-training history paired with the interaction it belongs to.
     trainingHistory: { type: [TrainingHistoryEntrySchema], default: [] },
-    // Hash of the StandardPrompt aiHintPrompt last sent to Gemini for this
-    // (room, question, student) exchange. Subsequent AI calls compare this to
-    // the current hash: match → send a short reminder; mismatch (or empty) →
-    // send the full standard prompt again and update this field. Admin edits
-    // to the standard prompt change its content and therefore its hash, which
-    // automatically forces every report to resend the full prompt on its next
-    // call — no separate invalidation pass needed.
+    // Audit-only: hash of the StandardPrompt aiHintPrompt that was sent to
+    // Gemini on the most recent call for this (room, question, student).
+    // Not read by application code — the full standard prompt is sent on
+    // every call and Gemini's implicit cache handles cost amortisation.
     standardPromptHash: { type: String, default: '' },
   },
   { timestamps: true }

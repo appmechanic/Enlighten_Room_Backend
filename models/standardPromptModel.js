@@ -9,8 +9,8 @@ const StandardPromptSchema = new mongoose.Schema(
       index: true,
     },
     // Joined view of aiHintPromptSections, rewritten by the standard-prompt
-    // controller on every save so older callers (e.g. geminiHintController)
-    // that read aiHintPrompt directly keep working unchanged.
+    // controller on every save. Read by getClassworkAiFeedback as the single
+    // source of truth for both the JSON response shape and content rules.
     aiHintPrompt: {
       type: String,
       trim: true,

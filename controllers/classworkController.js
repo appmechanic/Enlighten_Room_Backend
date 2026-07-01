@@ -1079,20 +1079,6 @@ export const submitAnswer = async (req, res) => {
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
-    // Look up the hash of the standard prompt last sent to Gemini for THIS
-    // (room, question, student) interaction. Empty on the very first call.
-    // If it matches the current standard prompt hash, the helper will send a
-    // short reminder; otherwise it will send the full standard prompt body.
-    let lastSentStandardPromptHash = '';
-    try {
-      const existingReport = await ClassworkAiReport.findOne(
-        { roomId: question.roomId, questionId: question.id, studentId },
-      ).select('standardPromptHash').lean();
-      lastSentStandardPromptHash = existingReport?.standardPromptHash || '';
-    } catch (lookupErr) {
-      console.error('[Classwork] Failed to read prior standardPromptHash:', lookupErr);
-    }
-
     if (!aiExpired) {
       try {
         aiResult = await getClassworkAiFeedback({
@@ -1103,7 +1089,6 @@ export const submitAnswer = async (req, res) => {
           format: question.format,
           studentName,
           teacherId: resolvedTeacherId,
-          lastSentStandardPromptHash,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
@@ -1183,10 +1168,7 @@ export const submitAnswer = async (req, res) => {
         lastAnswer: normalizedAnswer,
         lastHintStream: aiResult.hintStream || '',
       };
-      // Record which standard-prompt version Gemini just saw so the next call
-      // for this interaction can send the short reminder instead of the full
-      // body. Skip if Gemini wasn't actually called (aiExpired) — we have no
-      // new state to record.
+      // Audit-only: record which standard-prompt version Gemini just saw.
       if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
         reportSet.standardPromptHash = aiResult.standardPromptHash;
       }
@@ -1355,19 +1337,6 @@ export const submitAnswerStream = async (req, res) => {
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
-    // Look up the hash of the standard prompt last sent to Gemini for THIS
-    // (room, question, student) interaction. Empty on first call; on a match
-    // the helper sends a short reminder instead of the full standard prompt.
-    let lastSentStandardPromptHash = '';
-    try {
-      const existingReport = await ClassworkAiReport.findOne(
-        { roomId: question.roomId, questionId: question.id, studentId },
-      ).select('standardPromptHash').lean();
-      lastSentStandardPromptHash = existingReport?.standardPromptHash || '';
-    } catch (lookupErr) {
-      console.error('[Classwork] Failed to read prior standardPromptHash:', lookupErr);
-    }
-
     if (aiExpired) {
       // AI gated off for this question — skip the model call but still record
       // the submission below so the answer counts.
@@ -1381,7 +1350,6 @@ export const submitAnswerStream = async (req, res) => {
           format: question.format,
           studentName,
           teacherId: resolvedTeacherId,
-          lastSentStandardPromptHash,
         })) {
           if (event.type === 'hint-delta') {
             writeEvent({ type: 'hint-delta', text: event.text });
@@ -1467,9 +1435,7 @@ export const submitAnswerStream = async (req, res) => {
         lastAnswer: normalizedAnswer,
         lastHintStream: aiResult.hintStream || '',
       };
-      // Persist which standard-prompt version Gemini just saw. Next call for
-      // this interaction will compare against this hash; match → reminder,
-      // mismatch (admin edited the prompt) → full body again.
+      // Audit-only: record which standard-prompt version Gemini just saw.
       if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
         reportSet.standardPromptHash = aiResult.standardPromptHash;
       }

@@ -40,8 +40,6 @@ import GradeSubmissionRoutes from "./routes/gradedSubmissionRoutes.js";
 import PrivacyPolicyRoutes from "./routes/privacyPolicyRoutes.js";
 import ResourcesRoutes from "./routes/resourcesRoutes.js";
 import testimonialRoutes from "./routes/testimonialRoutes.js";
-import geminiHintRoutes from './routes/geminiHintRoutes.js';
-// import transactionRoutes from "./routes/transactionRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
 import partnerRoutes from "./routes/partnerRoutes.js";
 
@@ -101,9 +99,6 @@ app.use("/api/analytics", analyticsRoutes);
 // Classwork routes
 app.use("/api/classwork", classworkRoutes);
 
-// Gemini hint route
-app.use("/api/gemini-hint", geminiHintRoutes);
-
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/admin/promotions", promotionRoutes);
 app.use("/api/system/languages", languageRoutes);
@@ -144,7 +139,6 @@ cron.schedule("0 */8 * * *", async () => {
     console.error("Currency rate cron job failed:", err);
   }
 });
-// app.use("/api/transactions", transactionRoutes);
 
 //subscribers model
 app.use("/api/subscribers", subscriberRoutes);
@@ -205,33 +199,7 @@ app.use((err, req, res, next) => {
   next();
 });
 
-// const validateInitialKey = async () => {
-//   const envKey = process.env.INITIAL_SECRET_KEY;
-
-//   if (!envKey) {
-//     console.error("❌ INITIAL_SECRET_KEY not set in environment");
-//     process.exit(1);
-//   }
-
-//   try {
-//     const keyDoc = await Keys.findOne({ secret_key: envKey });
-
-//     if (!keyDoc) {
-//       console.error(
-//         "❌ INITIAL_SECRET_KEY does not match any record in the database"
-//       );
-//       process.exit(1);
-//     }
-
-//     console.log("✅ Secret key validation passed. Server starting...");
-//   } catch (error) {
-//     console.error("❌ Error validating secret key:", error);
-//     process.exit(1);
-//   }
-// };
-// validateInitialKey().then(() => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-// });

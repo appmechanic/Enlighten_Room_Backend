@@ -1,8 +1,5 @@
-// controllers/ai.controller.js
-// import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
 
-// const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Reusable helper
