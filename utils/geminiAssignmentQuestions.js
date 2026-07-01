@@ -1,6 +1,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import StandardPrompt from "../models/standardPromptModel.js";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
+import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 
 // Generates the question batch for a Create Assignment AI call. Produces a
 // mixed list covering up to all 4 classwork formats (mcq / fill-blanks /
@@ -23,7 +24,6 @@ import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
 
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 10;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30 * 1000;
@@ -39,33 +39,6 @@ b) Also some questions focus on their weaknesses (Please count the frequencies o
 c) Also give them some more advanced questions that are one level, two levels and even three levels (if some students are very smart and the number of questions allows) deeper and challenging for the abled students.
 Please add a message of love, peace or a positive value to the context if possible. But it's not a must when the question doesn't fit a context.
 The following is my teacher's personalized prompt. Please follow his/her advice and the above structure to generate questions if the personalized prompt is good to my learning. But please ignore it if it doesn't fit my needs.`;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function generateContentWithRetry(request) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await ai.models.generateContent(request);
-    } catch (err) {
-      lastErr = err;
-      const status = err?.status ?? err?.error?.code;
-      if (!RETRYABLE_STATUSES.has(status) || attempt === MAX_ATTEMPTS) {
-        throw err;
-      }
-      const exp = BASE_DELAY_MS * 2 ** (attempt - 1);
-      const backoff = Math.min(exp, MAX_DELAY_MS);
-      const jitter = Math.floor(Math.random() * 500);
-      console.warn(
-        `[AssignmentQuestions] Gemini ${status} on attempt ${attempt}/${MAX_ATTEMPTS}; retrying in ${backoff + jitter}ms`,
-      );
-      await sleep(backoff + jitter);
-    }
-  }
-  throw lastErr;
-}
 
 async function loadStandardPrompt() {
   try {
@@ -257,28 +230,28 @@ export async function generateAssignmentQuestions({
     buildSessionReportSnapshot(sessionReport || { questions: [] }),
   ].join("\n");
 
-  const result = await generateContentWithRetry({
-    model: MODEL,
-    contents: [{ role: "user", parts: [{ text: userMessage }] }],
-    config: {
-      systemInstruction,
-      responseMimeType: "application/json",
-      responseSchema: QUESTION_RESPONSE_SCHEMA,
+  const result = await withGeminiRetry(
+    () =>
+      ai.models.generateContent({
+        model: MODEL,
+        contents: [{ role: "user", parts: [{ text: userMessage }] }],
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: QUESTION_RESPONSE_SCHEMA,
+        },
+      }),
+    {
+      maxAttempts: MAX_ATTEMPTS,
+      baseDelayMs: BASE_DELAY_MS,
+      maxDelayMs: MAX_DELAY_MS,
+      tag: "AssignmentQuestions",
     },
-  });
+  );
 
   const raw = (result?.text || "").trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) {
-      console.error("[AssignmentQuestions] No JSON object in response:", raw);
-      throw new Error("AI returned an invalid response.");
-    }
-    parsed = JSON.parse(match[0]);
-  }
+  const parsed = parseFirstJsonObject(raw, { tag: "AssignmentQuestions" });
+  if (!parsed) throw new Error("AI returned an invalid response.");
 
   const list = Array.isArray(parsed?.questions) ? parsed.questions : [];
   const cleaned = list

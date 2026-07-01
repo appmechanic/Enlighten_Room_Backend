@@ -1,6 +1,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
+import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 
 // Generates the lesson-level "Class Report" summary that the teacher sees by
 // default on the View Report page. Distinct from getClassworkAiFeedback, which
@@ -14,7 +15,6 @@ import StandardPrompt from "../models/standardPromptModel.js";
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
 
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 // Generation is now run in the background after the end-lesson HTTP response
 // has been sent, so we can ride out long Gemini demand spikes instead of
 // failing fast. ~20 attempts with exponential backoff capped at 60s gives
@@ -23,33 +23,6 @@ const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 20;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 60 * 1000;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function generateContentWithRetry(request) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await ai.models.generateContent(request);
-    } catch (err) {
-      lastErr = err;
-      const status = err?.status ?? err?.error?.code;
-      if (!RETRYABLE_STATUSES.has(status) || attempt === MAX_ATTEMPTS) {
-        throw err;
-      }
-      const exp = BASE_DELAY_MS * 2 ** (attempt - 1);
-      const backoff = Math.min(exp, MAX_DELAY_MS);
-      const jitter = Math.floor(Math.random() * 500);
-      console.warn(
-        `[ClassReportSummary] Gemini ${status} on attempt ${attempt}/${MAX_ATTEMPTS}; retrying in ${backoff + jitter}ms`
-      );
-      await sleep(backoff + jitter);
-    }
-  }
-  throw lastErr;
-}
 
 function normalizeAnswerText(value) {
   if (value == null) return "";
@@ -225,20 +198,29 @@ export async function generateClassReportSummary({
 
   const snapshot = buildLessonSnapshot({ lessonName, questions });
 
-  const result = await generateContentWithRetry({
-    model: MODEL,
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: snapshot }],
-      },
-    ],
-    config: {
-      systemInstruction,
-      responseMimeType: "application/json",
-      responseSchema: CLASS_REPORT_RESPONSE_SCHEMA,
-    },
-  });
+  const result = await withGeminiRetry(
+    () =>
+      ai.models.generateContent({
+        model: MODEL,
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: snapshot }],
+          },
+        ],
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          responseSchema: CLASS_REPORT_RESPONSE_SCHEMA,
+        },
+      }),
+    {
+      maxAttempts: MAX_ATTEMPTS,
+      baseDelayMs: BASE_DELAY_MS,
+      maxDelayMs: MAX_DELAY_MS,
+      tag: "ClassReportSummary",
+    }
+  );
 
   const text = (result?.text || "").trim();
   if (!text) {
@@ -249,22 +231,8 @@ export async function generateClassReportSummary({
   // responseMimeType=application/json should guarantee raw JSON, but in
   // practice the model occasionally still wraps output in ```json fences
   // or leaks a leading note. Extract the first { ... } block defensively.
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) {
-      console.error("[ClassReportSummary] No JSON object in response:", text);
-      return null;
-    }
-    try {
-      parsed = JSON.parse(match[0]);
-    } catch (err) {
-      console.error("[ClassReportSummary] JSON parse failed:", err, text);
-      return null;
-    }
-  }
+  const parsed = parseFirstJsonObject(text, { tag: "ClassReportSummary" });
+  if (!parsed) return null;
 
   const studentDifficulties = Array.isArray(parsed?.studentDifficulties)
     ? parsed.studentDifficulties

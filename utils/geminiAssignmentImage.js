@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { s3 } from "./s3.js";
+import { withGeminiRetry } from "./geminiCommon.js";
 
 // Generates a question illustration with Gemini 3 Pro Image (Nano Banana Pro)
 // and uploads it to DigitalOcean Spaces, returning the public URL. Used by the
@@ -17,16 +18,11 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // today; if Google promotes it to GA the model id will change.
 const IMAGE_MODEL = "gemini-3-pro-image-preview";
 
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 4;
 const BASE_DELAY_MS = 1500;
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function getSpacesPublicUrl(key) {
   if (!bucketName || !spaceEndpoint) {
@@ -52,28 +48,6 @@ function buildImagePrompt({ questionText, course, topic, format }) {
     questionText,
   ];
   return lines.filter(Boolean).join("\n");
-}
-
-async function generateImageWithRetry(request) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await ai.models.generateContent(request);
-    } catch (err) {
-      lastErr = err;
-      const status = err?.status ?? err?.error?.code;
-      if (!RETRYABLE_STATUSES.has(status) || attempt === MAX_ATTEMPTS) {
-        throw err;
-      }
-      const exp = BASE_DELAY_MS * 2 ** (attempt - 1);
-      const jitter = Math.floor(Math.random() * 500);
-      console.warn(
-        `[AssignmentImage] Gemini ${status} on attempt ${attempt}/${MAX_ATTEMPTS}; retrying in ${exp + jitter}ms`,
-      );
-      await sleep(exp + jitter);
-    }
-  }
-  throw lastErr;
 }
 
 // Pull the first image part out of a generateContent response. Image models
@@ -120,21 +94,29 @@ export async function generateAssignmentQuestionImage({
   if (!questionText) return null;
 
   try {
-    const result = await generateImageWithRetry({
-      model: IMAGE_MODEL,
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: buildImagePrompt({ questionText, course, topic, format }) }],
-        },
-      ],
-      // The image-capable models need IMAGE listed in responseModalities;
-      // including TEXT lets the model still attach a short caption if needed,
-      // which we ignore.
-      config: {
-        responseModalities: ["IMAGE", "TEXT"],
+    const result = await withGeminiRetry(
+      () =>
+        ai.models.generateContent({
+          model: IMAGE_MODEL,
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: buildImagePrompt({ questionText, course, topic, format }) }],
+            },
+          ],
+          // The image-capable models need IMAGE listed in responseModalities;
+          // including TEXT lets the model still attach a short caption if needed,
+          // which we ignore.
+          config: {
+            responseModalities: ["IMAGE", "TEXT"],
+          },
+        }),
+      {
+        maxAttempts: MAX_ATTEMPTS,
+        baseDelayMs: BASE_DELAY_MS,
+        tag: "AssignmentImage",
       },
-    });
+    );
 
     const image = extractFirstImage(result);
     if (!image) {

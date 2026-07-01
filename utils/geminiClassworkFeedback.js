@@ -3,6 +3,7 @@ import { GoogleGenAI } from "@google/genai";
 import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
+import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -129,47 +130,8 @@ async function loadStandardPrompt() {
   }
 }
 
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function generateContentWithRetry(request) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    try {
-      return await ai.models.generateContent(request);
-    } catch (err) {
-      lastErr = err;
-      const status = err?.status ?? err?.error?.code;
-      if (!RETRYABLE_STATUSES.has(status) || attempt === MAX_ATTEMPTS) {
-        throw err;
-      }
-      const backoff = BASE_DELAY_MS * 2 ** (attempt - 1);
-      const jitter = Math.floor(Math.random() * BASE_DELAY_MS);
-      console.warn(
-        `[ClassworkFeedback] Gemini ${status} on attempt ${attempt}/${MAX_ATTEMPTS}; retrying in ${backoff + jitter}ms`
-      );
-      await sleep(backoff + jitter);
-    }
-  }
-  throw lastErr;
-}
-
-function parseJsonResponse(text) {
-  if (!text) return null;
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  try {
-    return JSON.parse(match[0]);
-  } catch (err) {
-    console.error("[ClassworkFeedback] JSON parse failed:", err, text);
-    return null;
-  }
-}
 
 // Builds the Gemini request payload (systemInstruction + contents) from the
 // same inputs both the streaming and non-streaming entry points take.
@@ -298,11 +260,14 @@ export async function getClassworkAiFeedback({
     config,
   });
 
-  const result = await generateContentWithRetry({
-    model: MODEL,
-    contents,
-    config,
-  });
+  const result = await withGeminiRetry(
+    () => ai.models.generateContent({ model: MODEL, contents, config }),
+    {
+      maxAttempts: MAX_ATTEMPTS,
+      baseDelayMs: BASE_DELAY_MS,
+      tag: "ClassworkFeedback",
+    }
+  );
 
   const cachedTokens = result?.usageMetadata?.cachedContentTokenCount;
   if (cachedTokens) {
@@ -310,7 +275,10 @@ export async function getClassworkAiFeedback({
   }
 
   const responseText = result.text || "";
-  const feedback = shapeFeedback(parseJsonResponse(responseText), responseText);
+  const feedback = shapeFeedback(
+    parseFirstJsonObject(responseText, { tag: "ClassworkFeedback" }),
+    responseText
+  );
   feedback.standardPromptHash = standardPromptHash;
   return feedback;
 }
@@ -440,7 +408,10 @@ export async function* getClassworkAiFeedbackStream(input) {
     console.log(`[ClassworkFeedback] Implicit cache hit: ${cachedTokens} tokens reused`);
   }
 
-  const feedback = shapeFeedback(parseJsonResponse(fullText), fullText);
+  const feedback = shapeFeedback(
+    parseFirstJsonObject(fullText, { tag: "ClassworkFeedback" }),
+    fullText
+  );
   feedback.standardPromptHash = standardPromptHash;
   yield { type: "done", feedback, cachedTokens, standardPromptHash };
 }
