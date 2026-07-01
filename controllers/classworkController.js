@@ -54,10 +54,63 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
     if (q) { latestAdvancedQuestion = q; break; }
   }
 
+  // Report renderers want the FULL last WRONG interaction that immediately
+  // preceded the student's most recent correct answer — the wrong answer,
+  // its live hint, all three feedback parts (studentCanDo, nextStep,
+  // diagnosticTraining), and any bonus challenge the AI attached. This is
+  // rendered as a highlighted "your last wrong attempt" callout right above
+  // the correct-answer block so teachers and students can see exactly what
+  // was corrected. Falls back to `null` when the student never got it right,
+  // or when their very first attempt was correct (no wrong to precede).
+  let lastWrongInteraction = null;
+  const lastCorrectIdx = (() => {
+    for (let i = interactions.length - 1; i >= 0; i -= 1) {
+      if (interactions[i]?.correct) return i;
+    }
+    return -1;
+  })();
+  if (lastCorrectIdx > 0) {
+    for (let i = lastCorrectIdx - 1; i >= 0; i -= 1) {
+      const it = interactions[i];
+      if (it && !it.correct) {
+        lastWrongInteraction = {
+          interactionId: it._id || null,
+          questionText: it.questionText || '',
+          ...(includeStudentAnswer ? { studentAnswer: it.studentAnswer } : {}),
+          hintStream: it.hintStream || '',
+          studentCanDo: {
+            subjectTrack: it.studentCanDo?.subjectTrack || 'STEM',
+            message: it.studentCanDo?.message || '',
+          },
+          nextStep: {
+            dont: it.nextStep?.dont || '',
+            what: it.nextStep?.what || '',
+            how: it.nextStep?.how || '',
+            explanation: {
+              gradeBand: it.nextStep?.explanation?.gradeBand || 'G4_TO_G8',
+              text: it.nextStep?.explanation?.text || '',
+            },
+          },
+          diagnosticTraining: {
+            underlyingGap: it.diagnosticTraining?.underlyingGap || '',
+            todaysDifficulty: it.diagnosticTraining?.todaysDifficulty || '',
+          },
+          advancedChallenge: {
+            congratulations: it.advancedChallenge?.congratulations || '',
+            question: it.advancedChallenge?.question || '',
+          },
+          timestamp: it.timestamp || null,
+        };
+        break;
+      }
+    }
+  }
+
   return {
     lastHintStream: report?.lastHintStream || '',
     originalQuestion: report?.originalQuestion || '',
     latestAdvancedQuestion,
+    lastWrongInteraction,
     trainingHistory: (report?.trainingHistory || []).map((entry) => ({
       interactionId: entry.interactionId || null,
       underlyingGap: entry.underlyingGap || '',
@@ -1555,6 +1608,7 @@ export const viewAllAnswers = async (req, res) => {
                 trainingHistory: [],
                 interactions: [],
                 latestAdvancedQuestion: '',
+                lastWrongInteraction: null,
                 originalQuestion: '',
               },
         };
