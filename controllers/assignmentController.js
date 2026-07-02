@@ -1045,22 +1045,22 @@ async function buildSessionReportForAssignment({ session }) {
     }));
 
     // Flatten trainingHistory across every student who attempted this
-    // question. Each entry contributes both the underlying-gap training and
-    // today's-difficulty training so the cohort-weakness prompt can see
-    // either signal.
+    // question so the cohort-weakness prompt sees every part3 advice string
+    // Gemini emitted for this room/question. Each entry's `part3` array is
+    // passed through verbatim.
     const trainingHistory = [];
     (q.submitted || []).forEach((s) => {
       const report = reportIndex.get(`${q.id}::${s.studentId}`);
       const entries = report?.trainingHistory || [];
       entries.forEach((entry) => {
-        const underlying = String(entry?.underlyingGap || "").trim();
-        const todays = String(entry?.todaysDifficulty || "").trim();
-        if (!underlying && !todays) return;
+        const items = Array.isArray(entry?.part3)
+          ? entry.part3.map((x) => String(x ?? "").trim()).filter(Boolean)
+          : [];
+        if (items.length === 0) return;
         trainingHistory.push({
           studentId: s.studentId,
           studentName: s.studentName,
-          underlyingGap: underlying,
-          todaysDifficulty: todays,
+          part3: items,
         });
       });
     });

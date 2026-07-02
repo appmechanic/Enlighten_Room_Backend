@@ -1,86 +1,38 @@
 import mongoose from 'mongoose';
 
-// Sub-shapes mirror the Gemini response schema in
-// `utils/geminiClassworkFeedback.js` so the controller can persist the parsed
-// feedback object directly without flattening.
-const StudentCanDoSchema = new mongoose.Schema(
-  {
-    subjectTrack: { type: String, enum: ['STEM', 'HUMANITIES_LANGUAGES'], default: 'STEM' },
-    message: { type: String, default: '' },
-  },
-  { _id: false }
-);
-
-const NextStepExplanationSchema = new mongoose.Schema(
-  {
-    gradeBand: {
-      type: String,
-      enum: ['G3_OR_LOWER', 'G4_TO_G8', 'G9_PLUS'],
-      default: 'G4_TO_G8',
-    },
-    text: { type: String, default: '' },
-  },
-  { _id: false }
-);
-
-const NextStepSchema = new mongoose.Schema(
-  {
-    dont: { type: String, default: '' },
-    what: { type: String, default: '' },
-    how: { type: String, default: '' },
-    explanation: { type: NextStepExplanationSchema, default: () => ({}) },
-  },
-  { _id: false }
-);
-
-const DiagnosticTrainingSchema = new mongoose.Schema(
-  {
-    underlyingGap: { type: String, default: '' },
-    todaysDifficulty: { type: String, default: '' },
-  },
-  { _id: false }
-);
-
-const PositiveContextSchema = new mongoose.Schema(
-  {
-    theme: { type: String, default: '' },
-    message: { type: String, default: '' },
-  },
-  { _id: false }
-);
-
+// Sub-shape mirrors the Gemini response schema from the admin's
+// StandardPrompt. Keep the field names in lockstep with the prompt so
+// nothing gets silently dropped on save.
 const AdvancedChallengeSchema = new mongoose.Schema(
   {
     congratulations: { type: String, default: '' },
     question: { type: String, default: '' },
-    useImage: { type: Boolean, default: false },
-    positiveContext: { type: PositiveContextSchema, default: () => ({}) },
   },
   { _id: false }
 );
 
-// Each interaction carries its own `_id` (the "interaction_id" referenced by
-// the report spec). The training-history entries pair back to a specific
-// interaction via interactionId.
+// Each interaction carries its own `_id` — the "interaction_id" the
+// trainingHistory entries pair back to. part1/part2/part3 are stored as
+// string arrays exactly as the prompt schema declares them.
 const InteractionSchema = new mongoose.Schema({
   questionText: { type: String, default: '' },
   studentAnswer: { type: mongoose.Schema.Types.Mixed },
   hintStream: { type: String, default: '' },
-  studentCanDo: { type: StudentCanDoSchema, default: () => ({}) },
-  nextStep: { type: NextStepSchema, default: () => ({}) },
-  diagnosticTraining: { type: DiagnosticTrainingSchema, default: () => ({}) },
+  part1: { type: [String], default: [] },
+  part2: { type: [String], default: [] },
+  part3: { type: [String], default: [] },
   advancedChallenge: { type: AdvancedChallengeSchema, default: () => ({}) },
   correct: { type: Boolean, default: false },
   timestamp: { type: Date, default: Date.now },
 });
 
-// Running history of diagnostic-training advice, paired with the interaction
-// it came from, so the report can show both trainings per interaction.
+// Running history of part3 advice strings, paired with the interaction they
+// came from. Kept as a flat array of strings alongside the interactionId so
+// reports can show all diagnostic-training suggestions in one place.
 const TrainingHistoryEntrySchema = new mongoose.Schema(
   {
     interactionId: { type: mongoose.Schema.Types.ObjectId, required: true },
-    underlyingGap: { type: String, default: '' },
-    todaysDifficulty: { type: String, default: '' },
+    part3: { type: [String], default: [] },
     timestamp: { type: Date, default: Date.now },
   },
   { _id: false }

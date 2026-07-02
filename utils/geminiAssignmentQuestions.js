@@ -150,10 +150,11 @@ function buildSessionReportSnapshot({ lessonName, questions }) {
       lines.push(`   Diagnostic-training history for this Q:`);
       training.forEach((entry, i) => {
         const who = entry?.studentName || entry?.studentId || `Student ${i + 1}`;
-        const underlying = String(entry?.underlyingGap || "").trim();
-        const todays = String(entry?.todaysDifficulty || "").trim();
-        if (underlying) lines.push(`     - ${who} (underlying gap): ${underlying}`);
-        if (todays) lines.push(`     - ${who} (today's difficulty): ${todays}`);
+        const items = Array.isArray(entry?.part3) ? entry.part3 : [];
+        items
+          .map((s) => String(s ?? "").trim())
+          .filter(Boolean)
+          .forEach((text) => lines.push(`     - ${who}: ${text}`));
       });
     }
     lines.push("");
@@ -185,7 +186,7 @@ function formatCountsBlock(perFormatCounts) {
 // captures the prompts and model used so the caller can persist a snapshot
 // on the Assignment doc.
 export async function generateAssignmentQuestions({
-  sessionReport, // { lessonName, questions: [{ question, format, correctAnswer, submitted: [{studentName, feedback}], trainingHistory: [{studentName, underlyingGap, todaysDifficulty}] }] }
+  sessionReport, // { lessonName, questions: [{ question, format, correctAnswer, submitted: [{studentName, feedback}], trainingHistory: [{studentName, part3: [string, ...]}] }] }
   perFormatCounts, // { mcq, "fill-blanks", handwriting, textbox } -> int
   maxAiHints,
   course,

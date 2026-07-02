@@ -15,36 +15,35 @@ import nodemailer from "nodemailer";
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
 
-// Default shape returned when the AI is skipped (aiExpired) or fails. Mirrors
-// the structure produced by `getClassworkAiFeedback` / `...Stream` so the
-// downstream persistence and response-shaping code can read every field
-// without branching on undefined nested objects.
+// Coerce whatever the AI (or a caller) provides into a string[] so downstream
+// code can always spread it safely. Strings become one-element arrays; falsy
+// values become []; arrays are copied and their entries stringified.
+function toStringArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v ?? ''));
+  }
+  if (value == null || value === '') return [];
+  return [String(value)];
+}
+
+// Default shape returned when the AI is skipped (aiExpired) or fails. Matches
+// the admin StandardPrompt schema: `{ correct, hintStream, part1[], part2[],
+// part3[], advancedChallenge{ congratulations, question } }`.
 function emptyAiFeedback() {
   return {
     correct: false,
     hintStream: '',
-    studentCanDo: { subjectTrack: 'STEM', message: '' },
-    nextStep: {
-      dont: '',
-      what: '',
-      how: '',
-      explanation: { gradeBand: 'G4_TO_G8', text: '' },
-    },
-    diagnosticTraining: { underlyingGap: '', todaysDifficulty: '' },
-    advancedChallenge: {
-      congratulations: '',
-      question: '',
-      useImage: false,
-      positiveContext: { theme: '', message: '' },
-    },
+    part1: [],
+    part2: [],
+    part3: [],
+    advancedChallenge: { congratulations: '', question: '' },
   };
 }
 
 // Projects a stored ClassworkAiReport document into the wire shape consumed
-// by the teacher/student report renderers. Mirrors the nested feedback shape
-// so the frontend never has to branch on missing sub-objects, and walks
-// `interactions` backwards once to surface the latest advanced-challenge
-// question (the mastery-mode bonus prompt).
+// by the teacher/student report renderers. Walks `interactions` backwards
+// once to surface the latest advanced-challenge question (the mastery-mode
+// bonus prompt).
 function projectAiReport(report, { includeStudentAnswer = false } = {}) {
   const interactions = Array.isArray(report?.interactions) ? report.interactions : [];
 
@@ -56,12 +55,9 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
 
   // Report renderers want the FULL last WRONG interaction that immediately
   // preceded the student's most recent correct answer — the wrong answer,
-  // its live hint, all three feedback parts (studentCanDo, nextStep,
-  // diagnosticTraining), and any bonus challenge the AI attached. This is
-  // rendered as a highlighted "your last wrong attempt" callout right above
-  // the correct-answer block so teachers and students can see exactly what
-  // was corrected. Falls back to `null` when the student never got it right,
-  // or when their very first attempt was correct (no wrong to precede).
+  // its live hint, part1/2/3, and any bonus challenge the AI attached.
+  // Falls back to `null` when the student never got it right, or when their
+  // very first attempt was correct (no wrong to precede).
   let lastWrongInteraction = null;
   const lastCorrectIdx = (() => {
     for (let i = interactions.length - 1; i >= 0; i -= 1) {
@@ -78,23 +74,9 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
           questionText: it.questionText || '',
           ...(includeStudentAnswer ? { studentAnswer: it.studentAnswer } : {}),
           hintStream: it.hintStream || '',
-          studentCanDo: {
-            subjectTrack: it.studentCanDo?.subjectTrack || 'STEM',
-            message: it.studentCanDo?.message || '',
-          },
-          nextStep: {
-            dont: it.nextStep?.dont || '',
-            what: it.nextStep?.what || '',
-            how: it.nextStep?.how || '',
-            explanation: {
-              gradeBand: it.nextStep?.explanation?.gradeBand || 'G4_TO_G8',
-              text: it.nextStep?.explanation?.text || '',
-            },
-          },
-          diagnosticTraining: {
-            underlyingGap: it.diagnosticTraining?.underlyingGap || '',
-            todaysDifficulty: it.diagnosticTraining?.todaysDifficulty || '',
-          },
+          part1: toStringArray(it.part1),
+          part2: toStringArray(it.part2),
+          part3: toStringArray(it.part3),
           advancedChallenge: {
             congratulations: it.advancedChallenge?.congratulations || '',
             question: it.advancedChallenge?.question || '',
@@ -113,8 +95,7 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
     lastWrongInteraction,
     trainingHistory: (report?.trainingHistory || []).map((entry) => ({
       interactionId: entry.interactionId || null,
-      underlyingGap: entry.underlyingGap || '',
-      todaysDifficulty: entry.todaysDifficulty || '',
+      part3: toStringArray(entry.part3),
       timestamp: entry.timestamp || null,
     })),
     interactions: interactions.map((it) => ({
@@ -122,31 +103,12 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
       questionText: it.questionText || '',
       ...(includeStudentAnswer ? { studentAnswer: it.studentAnswer } : {}),
       hintStream: it.hintStream || '',
-      studentCanDo: {
-        subjectTrack: it.studentCanDo?.subjectTrack || 'STEM',
-        message: it.studentCanDo?.message || '',
-      },
-      nextStep: {
-        dont: it.nextStep?.dont || '',
-        what: it.nextStep?.what || '',
-        how: it.nextStep?.how || '',
-        explanation: {
-          gradeBand: it.nextStep?.explanation?.gradeBand || 'G4_TO_G8',
-          text: it.nextStep?.explanation?.text || '',
-        },
-      },
-      diagnosticTraining: {
-        underlyingGap: it.diagnosticTraining?.underlyingGap || '',
-        todaysDifficulty: it.diagnosticTraining?.todaysDifficulty || '',
-      },
+      part1: toStringArray(it.part1),
+      part2: toStringArray(it.part2),
+      part3: toStringArray(it.part3),
       advancedChallenge: {
         congratulations: it.advancedChallenge?.congratulations || '',
         question: it.advancedChallenge?.question || '',
-        useImage: Boolean(it.advancedChallenge?.useImage),
-        positiveContext: {
-          theme: it.advancedChallenge?.positiveContext?.theme || '',
-          message: it.advancedChallenge?.positiveContext?.message || '',
-        },
       },
       correct: Boolean(it.correct),
       timestamp: it.timestamp || null,
@@ -154,34 +116,18 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
   };
 }
 
-// Pulled-down view of the AI feedback that we ship to the student frontend
-// in the `ai` field on /submit and on the SSE `done` event. Keeps Part 3
-// (diagnosticTraining) off the wire — it belongs only on the teacher report.
+// Pulled-down view of the AI feedback we ship to the student frontend in the
+// `ai` field on /submit and on the SSE `done` event. Keeps part3 (diagnostic
+// training) off the wire — it belongs only on the teacher report.
 function projectAiForStudent(aiResult) {
   return {
     correct: Boolean(aiResult?.correct),
     hintStream: aiResult?.hintStream || '',
-    studentCanDo: {
-      subjectTrack: aiResult?.studentCanDo?.subjectTrack || 'STEM',
-      message: aiResult?.studentCanDo?.message || '',
-    },
-    nextStep: {
-      dont: aiResult?.nextStep?.dont || '',
-      what: aiResult?.nextStep?.what || '',
-      how: aiResult?.nextStep?.how || '',
-      explanation: {
-        gradeBand: aiResult?.nextStep?.explanation?.gradeBand || 'G4_TO_G8',
-        text: aiResult?.nextStep?.explanation?.text || '',
-      },
-    },
+    part1: toStringArray(aiResult?.part1),
+    part2: toStringArray(aiResult?.part2),
     advancedChallenge: {
       congratulations: aiResult?.advancedChallenge?.congratulations || '',
       question: aiResult?.advancedChallenge?.question || '',
-      useImage: Boolean(aiResult?.advancedChallenge?.useImage),
-      positiveContext: {
-        theme: aiResult?.advancedChallenge?.positiveContext?.theme || '',
-        message: aiResult?.advancedChallenge?.positiveContext?.message || '',
-      },
     },
   };
 }
@@ -1192,26 +1138,30 @@ export const submitAnswer = async (req, res) => {
     try {
       const interactionId = new mongoose.Types.ObjectId();
       const interactionAt = new Date();
+      const part1 = toStringArray(aiResult.part1);
+      const part2 = toStringArray(aiResult.part2);
+      const part3 = toStringArray(aiResult.part3);
       const interaction = {
         _id: interactionId,
         questionText: questionTextForAi,
         studentAnswer: normalizedAnswer,
         hintStream: aiResult.hintStream || '',
-        studentCanDo: aiResult.studentCanDo,
-        nextStep: aiResult.nextStep,
-        diagnosticTraining: aiResult.diagnosticTraining,
-        advancedChallenge: aiResult.advancedChallenge,
+        part1,
+        part2,
+        part3,
+        advancedChallenge: {
+          congratulations: aiResult.advancedChallenge?.congratulations || '',
+          question: aiResult.advancedChallenge?.question || '',
+        },
         correct: isCorrect,
         timestamp: interactionAt,
       };
 
       const pushOps = { interactions: interaction };
-      const dt = aiResult.diagnosticTraining || {};
-      if (dt.underlyingGap || dt.todaysDifficulty) {
+      if (part3.length > 0) {
         pushOps.trainingHistory = {
           interactionId,
-          underlyingGap: dt.underlyingGap || '',
-          todaysDifficulty: dt.todaysDifficulty || '',
+          part3,
           timestamp: interactionAt,
         };
       }
@@ -1258,12 +1208,12 @@ export const submitAnswer = async (req, res) => {
         format: question.format,
         expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
       },
-      // DIAGNOSTIC: student sees studentCanDo.message + nextStep blocks +
-      //             hintStream. teacher sees student answer + hintStream.
+      // DIAGNOSTIC: student sees hintStream + part1 + part2. Teacher's
+      //             report shows the full part1/part2/part3 per attempt.
       // MASTERY: student sees advancedChallenge (congratulations + question);
       //          teacher sees the final answer marked correct.
-      // diagnosticTraining is intentionally NOT returned — it belongs only in
-      // the report.
+      // part3 is intentionally NOT returned to the student — it belongs only
+      // in the teacher report.
       ai: projectAiForStudent(aiResult),
       feedback,
       correctAnswer: question.correctAnswer,
@@ -1459,26 +1409,30 @@ export const submitAnswerStream = async (req, res) => {
     try {
       const interactionId = new mongoose.Types.ObjectId();
       const interactionAt = new Date();
+      const part1 = toStringArray(aiResult.part1);
+      const part2 = toStringArray(aiResult.part2);
+      const part3 = toStringArray(aiResult.part3);
       const interaction = {
         _id: interactionId,
         questionText: questionTextForAi,
         studentAnswer: normalizedAnswer,
         hintStream: aiResult.hintStream || '',
-        studentCanDo: aiResult.studentCanDo,
-        nextStep: aiResult.nextStep,
-        diagnosticTraining: aiResult.diagnosticTraining,
-        advancedChallenge: aiResult.advancedChallenge,
+        part1,
+        part2,
+        part3,
+        advancedChallenge: {
+          congratulations: aiResult.advancedChallenge?.congratulations || '',
+          question: aiResult.advancedChallenge?.question || '',
+        },
         correct: isCorrect,
         timestamp: interactionAt,
       };
 
       const pushOps = { interactions: interaction };
-      const dt = aiResult.diagnosticTraining || {};
-      if (dt.underlyingGap || dt.todaysDifficulty) {
+      if (part3.length > 0) {
         pushOps.trainingHistory = {
           interactionId,
-          underlyingGap: dt.underlyingGap || '',
-          todaysDifficulty: dt.todaysDifficulty || '',
+          part3,
           timestamp: interactionAt,
         };
       }

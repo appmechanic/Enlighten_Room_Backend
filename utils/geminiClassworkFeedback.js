@@ -133,6 +133,86 @@ async function loadStandardPrompt() {
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
 
+// Short correlation id printed on every log line for a single Gemini call so
+// prompt + response entries line up in the log stream when multiple students
+// submit concurrently.
+function newReqId() {
+  return crypto.randomBytes(3).toString("hex");
+}
+
+// contents[].parts includes base64 image blobs that would otherwise flood the
+// log. Replace their inlineData with a size marker so the shape stays visible
+// but the payload is short.
+function summarizeContentsForLog(contents) {
+  try {
+    return JSON.parse(
+      JSON.stringify(contents, (key, value) => {
+        if (key === "data" && typeof value === "string" && value.length > 120) {
+          return `<base64 ${value.length} chars>`;
+        }
+        return value;
+      }),
+    );
+  } catch {
+    return contents;
+  }
+}
+
+// Fields the Mongo InteractionSchema in ClassworkAiReportModel.js persists.
+// Used only for logging a mismatch warning — the code itself passes Gemini's
+// output through untouched.
+const PERSISTED_INTERACTION_KEYS = new Set([
+  "hintStream",
+  "part1",
+  "part2",
+  "part3",
+  "advancedChallenge",
+  "correct",
+]);
+
+// Prints the parsed response with two extra breadcrumbs:
+//   - which top-level keys Gemini actually emitted
+//   - which of those keys the persistence layer will silently drop (because
+//     they're not in the Mongoose sub-schemas)
+function logGeminiResponse(reqId, rawText, parsed) {
+  console.log(`[ClassworkFeedback][req=${reqId}] === RESPONSE ===`);
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] Raw text (${rawText.length} chars):\n${rawText}`,
+  );
+  if (parsed && typeof parsed === "object") {
+    const keys = Object.keys(parsed);
+    console.log(`[ClassworkFeedback][req=${reqId}] Parsed top-level keys:`, keys);
+    console.log(
+      `[ClassworkFeedback][req=${reqId}] Parsed object:`,
+      JSON.stringify(parsed, null, 2),
+    );
+    const droppedByMongo = keys.filter(
+      (k) => !PERSISTED_INTERACTION_KEYS.has(k),
+    );
+    if (droppedByMongo.length > 0) {
+      console.warn(
+        `[ClassworkFeedback][req=${reqId}] ⚠ Schema mismatch — these keys will be DROPPED on save:`,
+        droppedByMongo,
+        `(persisted keys: ${[...PERSISTED_INTERACTION_KEYS].join(", ")})`,
+      );
+    }
+    const missingPersisted = [...PERSISTED_INTERACTION_KEYS].filter(
+      (k) => !(k in parsed),
+    );
+    if (missingPersisted.length > 0) {
+      console.warn(
+        `[ClassworkFeedback][req=${reqId}] ⚠ Missing keys that the DB schema expects:`,
+        missingPersisted,
+      );
+    }
+  } else {
+    console.warn(
+      `[ClassworkFeedback][req=${reqId}] Parsed response is not an object — Gemini output did not contain a valid JSON object.`,
+    );
+  }
+  console.log(`[ClassworkFeedback][req=${reqId}] === END RESPONSE ===`);
+}
+
 // Builds the Gemini request payload (systemInstruction + contents) from the
 // same inputs both the streaming and non-streaming entry points take.
 //
@@ -143,6 +223,7 @@ const BASE_DELAY_MS = 500;
 // The function still returns `standardPromptHash` for callers that persist
 // it on ClassworkAiReport, but the value no longer gates what we send.
 async function buildGeminiRequest({
+  reqId,
   questionText,
   answer,
   correctAnswer,
@@ -151,7 +232,11 @@ async function buildGeminiRequest({
   studentName,
   teacherId,
 }) {
-  console.log("[ClassworkFeedback] teacherId:", teacherId || "(missing)");
+  console.log(`[ClassworkFeedback][req=${reqId}] === PROMPT ===`);
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] teacherId:`,
+    teacherId || "(missing)",
+  );
   const [{ text: standardText, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
     loadStandardPrompt(),
     buildTeacherSection(teacherId),
@@ -160,12 +245,14 @@ async function buildGeminiRequest({
   const standardSection = standardText ? `Standard prompt: ${standardText}` : "";
 
   console.log(
-    "[ClassworkFeedback] Standard prompt:",
-    standardText ? "full body" : "none configured"
+    `[ClassworkFeedback][req=${reqId}] Standard prompt (${standardText.length} chars):\n${standardText || "(none configured)"}`,
   );
   console.log(
-    "[ClassworkFeedback] Using teacher prompt:",
-    teacherPrompt ? "yes" : "no"
+    `[ClassworkFeedback][req=${reqId}] Teacher prompt:\n${teacherPrompt || "(none)"}`,
+  );
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] standardPromptHash:`,
+    standardPromptHash,
   );
 
   const systemInstruction = [standardSection, teacherPrompt]
@@ -213,6 +300,20 @@ async function buildGeminiRequest({
 
   parts.push({ text: promptLines.join("\n") });
 
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] User prompt (${promptLines.join("\n").length} chars):\n${promptLines.join("\n")}`,
+  );
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] Question image attached:`,
+    Boolean(questionImage),
+    "· Answer image attached:",
+    Boolean(answerImageSource),
+  );
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] Final systemInstruction (${systemInstruction.length} chars):\n${systemInstruction}`,
+  );
+  console.log(`[ClassworkFeedback][req=${reqId}] === END PROMPT ===`);
+
   return {
     systemInstruction,
     contents: [{ role: "user", parts }],
@@ -237,7 +338,9 @@ export async function getClassworkAiFeedback({
   studentName,
   teacherId,
 }) {
+  const reqId = newReqId();
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
+    reqId,
     questionText,
     answer,
     correctAnswer,
@@ -254,10 +357,10 @@ export async function getClassworkAiFeedback({
     maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
   };
 
-  console.log("[ClassworkFeedback] Gemini request:", {
+  console.log(`[ClassworkFeedback][req=${reqId}] Gemini request:`, {
     model: MODEL,
-    contents,
-    config,
+    contents: summarizeContentsForLog(contents),
+    config: { ...config, systemInstruction: `<${systemInstruction.length} chars — see PROMPT block above>` },
   });
 
   const result = await withGeminiRetry(
@@ -265,20 +368,27 @@ export async function getClassworkAiFeedback({
     {
       maxAttempts: MAX_ATTEMPTS,
       baseDelayMs: BASE_DELAY_MS,
-      tag: "ClassworkFeedback",
+      tag: `ClassworkFeedback:${reqId}`,
     }
   );
 
   const cachedTokens = result?.usageMetadata?.cachedContentTokenCount;
   if (cachedTokens) {
-    console.log(`[ClassworkFeedback] Implicit cache hit: ${cachedTokens} tokens reused`);
+    console.log(
+      `[ClassworkFeedback][req=${reqId}] Implicit cache hit: ${cachedTokens} tokens reused`,
+    );
   }
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] Usage metadata:`,
+    result?.usageMetadata || "(none)",
+  );
 
   const responseText = result.text || "";
-  const feedback = shapeFeedback(
-    parseFirstJsonObject(responseText, { tag: "ClassworkFeedback" }),
-    responseText
-  );
+  const parsed = parseFirstJsonObject(responseText, {
+    tag: `ClassworkFeedback:${reqId}`,
+  });
+  logGeminiResponse(reqId, responseText, parsed);
+  const feedback = shapeFeedback(parsed, responseText);
   feedback.standardPromptHash = standardPromptHash;
   return feedback;
 }
@@ -353,7 +463,9 @@ class HintStreamScanner {
 // ClassworkAiReport — that is what makes the next call short-circuit to a
 // reminder instead of resending the full standard prompt.
 export async function* getClassworkAiFeedbackStream(input) {
+  const reqId = newReqId();
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
+    reqId,
     ...input,
   });
 
@@ -364,10 +476,10 @@ export async function* getClassworkAiFeedbackStream(input) {
     maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
   };
 
-  console.log("[ClassworkFeedback] Gemini stream request:", {
+  console.log(`[ClassworkFeedback][req=${reqId}] Gemini stream request:`, {
     model: MODEL,
-    contents,
-    config,
+    contents: summarizeContentsForLog(contents),
+    config: { ...config, systemInstruction: `<${systemInstruction.length} chars — see PROMPT block above>` },
   });
 
   let stream;
@@ -378,7 +490,10 @@ export async function* getClassworkAiFeedbackStream(input) {
       config,
     });
   } catch (err) {
-    console.error("[ClassworkFeedback] generateContentStream failed:", err);
+    console.error(
+      `[ClassworkFeedback][req=${reqId}] generateContentStream failed:`,
+      err,
+    );
     yield { type: "error", message: err?.message || "Stream init failed" };
     return;
   }
@@ -386,11 +501,13 @@ export async function* getClassworkAiFeedbackStream(input) {
   const scanner = new HintStreamScanner();
   let fullText = "";
   let cachedTokens = 0;
+  let chunkCount = 0;
 
   try {
     for await (const chunk of stream) {
       const piece = chunk?.text || "";
       if (piece) {
+        chunkCount += 1;
         fullText += piece;
         const delta = scanner.feed(piece);
         if (delta) yield { type: "hint-delta", text: delta };
@@ -399,19 +516,31 @@ export async function* getClassworkAiFeedbackStream(input) {
       if (cached) cachedTokens = cached;
     }
   } catch (err) {
-    console.error("[ClassworkFeedback] Stream iteration failed:", err);
+    console.error(
+      `[ClassworkFeedback][req=${reqId}] Stream iteration failed after ${chunkCount} chunks (${fullText.length} chars so far):`,
+      err,
+    );
+    console.error(
+      `[ClassworkFeedback][req=${reqId}] Partial raw text:\n${fullText}`,
+    );
     yield { type: "error", message: err?.message || "Stream read failed" };
     return;
   }
 
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] Stream finished — ${chunkCount} chunks, ${fullText.length} chars total`,
+  );
   if (cachedTokens) {
-    console.log(`[ClassworkFeedback] Implicit cache hit: ${cachedTokens} tokens reused`);
+    console.log(
+      `[ClassworkFeedback][req=${reqId}] Implicit cache hit: ${cachedTokens} tokens reused`,
+    );
   }
 
-  const feedback = shapeFeedback(
-    parseFirstJsonObject(fullText, { tag: "ClassworkFeedback" }),
-    fullText
-  );
+  const parsed = parseFirstJsonObject(fullText, {
+    tag: `ClassworkFeedback:${reqId}`,
+  });
+  logGeminiResponse(reqId, fullText, parsed);
+  const feedback = shapeFeedback(parsed, fullText);
   feedback.standardPromptHash = standardPromptHash;
   yield { type: "done", feedback, cachedTokens, standardPromptHash };
 }
