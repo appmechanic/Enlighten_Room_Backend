@@ -15,6 +15,16 @@ const SessionSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    // Subject picked from the Subject list, OR the literal string "Other".
+    // When subject === "Other", subjectCustom holds the free-text entry.
+    subject: {
+      type: String,
+      default: "",
+    },
+    subjectCustom: {
+      type: String,
+      default: "",
+    },
     sessionUrl: {
       type: String,
       required: true,

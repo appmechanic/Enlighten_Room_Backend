@@ -40,7 +40,9 @@ export const createClassroom = async (req, res) => {
     // if (students.length !== studentIds.length) {
     //   return res.status(400).json({ error: "One or more students not found" });
     // }
-    // ✅ Calculate expiryDateTime based on frequency
+    // Legacy: when a frequency was provided, derive an expiry from it.
+    // Now that frequency/duration are optional, fall back to the client's
+    // lastDate (already validated in the form) if frequency is absent.
     const startDate = new Date(dateTime);
     let expiryDateTime = new Date(startDate);
 
@@ -52,9 +54,10 @@ export const createClassroom = async (req, res) => {
       expiryDateTime.setMonth(
         expiryDateTime.getMonth() + Math.ceil(durationInWeeks / 4)
       );
+    } else if (req.body?.lastDate) {
+      expiryDateTime = new Date(req.body.lastDate);
     }
 
-    // ✅ Add expiryDateTime into the request body before saving
     const classroomData = {
       ...req.body,
       expiryDateTime,
@@ -478,6 +481,8 @@ export const addClassSession = async (req, res) => {
     slots,
     repeat,
     untilDate,
+    subject,
+    subjectCustom,
   } = req.body;
 
   if (!classroomId) {
@@ -546,6 +551,8 @@ export const addClassSession = async (req, res) => {
       topic,
       notes,
       sessionUrl,
+      ...(subject !== undefined ? { subject } : {}),
+      ...(subjectCustom !== undefined ? { subjectCustom } : {}),
       ...(duration !== undefined ? { duration } : {}),
       recurrence: {
         type: repeatType,

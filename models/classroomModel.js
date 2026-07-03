@@ -15,10 +15,10 @@ const classroomSchema = new mongoose.Schema(
         required: true,
       },
     ],
+    // Subject moved to Session settings. Kept here for backward compatibility.
     subject: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Subject",
-      required: true,
     },
     sessions: [
       {
@@ -31,14 +31,14 @@ const classroomSchema = new mongoose.Schema(
       type: Date,
       required: true,
     },
+    // Frequency & duration are no longer collected at classroom creation;
+    // sessions carry their own recurrence and duration.
     frequency: {
-      type: String, // e.g., 'daily', 'weekly', etc.
+      type: String,
       enum: ["daily", "weekly", "monthly"],
-      required: true,
     },
     duration: {
       type: Number, // in minutes
-      required: true,
     },
     lastDate: {
       type: Date,
