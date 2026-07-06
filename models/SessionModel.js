@@ -25,6 +25,14 @@ const SessionSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    instructionLanguage: {
+      type: String,
+      default: "English",
+    },
+    maxOutputTokens: {
+      type: Number,
+      default: 800,
+    },
     sessionUrl: {
       type: String,
       required: true,

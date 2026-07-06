@@ -2,6 +2,22 @@ import { GoogleGenAI, Type } from "@google/genai";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
+import { recordAiTokenUsage } from "./aiTokenUsage.js";
+
+// Output-token budget scales with class size so bigger classes have room to
+// cover more per-student difficulties. Capped so we don't blow past a
+// reasonable ceiling regardless of enrolment.
+const REPORT_BASE_MAX_OUTPUT_TOKENS = 1000;
+const REPORT_PER_STUDENT_MAX_OUTPUT_TOKENS = 25;
+const REPORT_MAX_OUTPUT_TOKENS_CAP = 4000;
+
+function reportMaxOutputTokens(studentCount) {
+  const n = Number(studentCount) > 0 ? Number(studentCount) : 0;
+  return Math.min(
+    REPORT_BASE_MAX_OUTPUT_TOKENS + REPORT_PER_STUDENT_MAX_OUTPUT_TOKENS * n,
+    REPORT_MAX_OUTPUT_TOKENS_CAP,
+  );
+}
 
 // Generates the lesson-level "Class Report" summary that the teacher sees by
 // default on the View Report page. Distinct from getClassworkAiFeedback, which
@@ -160,6 +176,7 @@ export async function generateClassReportSummary({
   lessonName,
   questions,
   teacherId,
+  studentCount,
 }) {
   if (!Array.isArray(questions) || questions.length === 0) {
     return null;
@@ -198,6 +215,11 @@ export async function generateClassReportSummary({
 
   const snapshot = buildLessonSnapshot({ lessonName, questions });
 
+  const maxOutputTokens = reportMaxOutputTokens(studentCount);
+  console.log(
+    `[ClassReportSummary] studentCount=${studentCount ?? "?"} → maxOutputTokens=${maxOutputTokens}`,
+  );
+
   const result = await withGeminiRetry(
     () =>
       ai.models.generateContent({
@@ -212,6 +234,8 @@ export async function generateClassReportSummary({
           systemInstruction,
           responseMimeType: "application/json",
           responseSchema: CLASS_REPORT_RESPONSE_SCHEMA,
+          thinkingConfig: { thinkingBudget: -1 },
+          maxOutputTokens,
         },
       }),
     {
@@ -221,6 +245,8 @@ export async function generateClassReportSummary({
       tag: "ClassReportSummary",
     }
   );
+
+  await recordAiTokenUsage(result?.usageMetadata, { tag: "ClassReportSummary" });
 
   const text = (result?.text || "").trim();
   if (!text) {

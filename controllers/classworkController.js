@@ -642,14 +642,21 @@ async function generateAndStoreClassReport(lessonDoc) {
     `[ClassReport] lesson=${lessonDoc._id} name="${lessonDoc.name}" questions=${lessonQuestions.length} submissions=${submissionCount}`,
   );
 
-  const teacherId = lessonDoc.classroomId
-    ? (await Classroom.findById(lessonDoc.classroomId).select('teacherId').lean())?.teacherId
+  const classroomDoc = lessonDoc.classroomId
+    ? await Classroom.findById(lessonDoc.classroomId)
+        .select('teacherId studentIds')
+        .lean()
     : null;
+  const teacherId = classroomDoc?.teacherId || null;
+  const studentCount = Array.isArray(classroomDoc?.studentIds)
+    ? classroomDoc.studentIds.length
+    : 0;
 
   const classReport = await generateClassReportSummary({
     lessonName: lessonDoc.name,
     questions: lessonQuestions,
     teacherId,
+    studentCount,
   });
 
   if (!classReport) {
@@ -1088,6 +1095,7 @@ export const submitAnswer = async (req, res) => {
           format: question.format,
           studentName,
           teacherId: resolvedTeacherId,
+          maxOutputTokens: question.maxOutputTokens,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
@@ -1353,6 +1361,7 @@ export const submitAnswerStream = async (req, res) => {
           format: question.format,
           studentName,
           teacherId: resolvedTeacherId,
+          maxOutputTokens: question.maxOutputTokens,
         })) {
           if (event.type === 'hint-delta') {
             writeEvent({ type: 'hint-delta', text: event.text });
@@ -1628,7 +1637,7 @@ export const updateStagedQuestion = async (req, res) => {
     const editable = [
       'label', 'title', 'question', 'format', 'formatLabel',
       'options', 'blanks', 'maxLength', 'correctAnswer',
-      'expiryTime', 'aiAllowed', 'aiExpiryTime',
+      'expiryTime', 'aiAllowed', 'aiExpiryTime', 'maxOutputTokens',
     ];
     for (const key of editable) {
       if (patch[key] !== undefined) existing[key] = patch[key];

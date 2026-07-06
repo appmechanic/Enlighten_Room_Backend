@@ -30,6 +30,7 @@ const ClassworkSchema = new mongoose.Schema({
   expiryTime: { type: Number, default: 30 },
   aiAllowed: { type: Boolean, default: true },
   aiExpiryTime: { type: Number, default: 30 },
+  maxOutputTokens: { type: Number },
   createdAt: { type: Date, default: Date.now },
   released: { type: Boolean, default: true },
   releasedAt: { type: Date, default: null },

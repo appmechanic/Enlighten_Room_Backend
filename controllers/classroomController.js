@@ -483,6 +483,8 @@ export const addClassSession = async (req, res) => {
     untilDate,
     subject,
     subjectCustom,
+    instructionLanguage,
+    maxOutputTokens,
   } = req.body;
 
   if (!classroomId) {
@@ -553,6 +555,10 @@ export const addClassSession = async (req, res) => {
       sessionUrl,
       ...(subject !== undefined ? { subject } : {}),
       ...(subjectCustom !== undefined ? { subjectCustom } : {}),
+      ...(instructionLanguage !== undefined ? { instructionLanguage } : {}),
+      ...(maxOutputTokens !== undefined
+        ? { maxOutputTokens: Number(maxOutputTokens) }
+        : {}),
       ...(duration !== undefined ? { duration } : {}),
       recurrence: {
         type: repeatType,
@@ -1015,6 +1021,8 @@ export const validateSessionForUser = async (req, res) => {
         sessionDate: session.sessionDate,
         sessionUrl: session.sessionUrl,
         notes: session.notes,
+        instructionLanguage: session.instructionLanguage,
+        maxOutputTokens: session.maxOutputTokens,
         classroom: {
           id: classroom._id,
           teacherId: classroom.teacherId._id,

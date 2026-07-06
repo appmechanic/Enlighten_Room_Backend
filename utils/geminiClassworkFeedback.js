@@ -4,18 +4,17 @@ import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
+import { recordAiTokenUsage } from "./aiTokenUsage.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
 // Latency knobs applied to every classwork-feedback call.
-//   - thinkingConfig.thinkingBudget = 0 disables 2.5-flash's internal
-//     reasoning pass, which otherwise adds ~2–4s before the first token.
-//     Hint-quality is good enough without it for short classroom Q&A.
-//   - maxOutputTokens caps total response length so the model can't ramble;
-//     full latency scales with output token count, so this directly
-//     shortens both time-to-last-token and overall student wait.
-const FEEDBACK_THINKING_CONFIG = { thinkingBudget: 0 };
-const FEEDBACK_MAX_OUTPUT_TOKENS = 500;
+//   - thinkingConfig.thinkingBudget = -1 lets 2.5-flash decide how much
+//     internal reasoning to spend per prompt (dynamic thinking).
+//   - maxOutputTokens is passed per-call by the teacher (defaults to the
+//     grade/language-based value stored on the session).
+const FEEDBACK_THINKING_CONFIG = { thinkingBudget: -1 };
+const DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS = 800;
 
 // Renders the teacher's per-question correctAnswer for the prompt. An array of
 // strings is treated as a set of acceptable answers (any one of them counts as
@@ -337,6 +336,7 @@ export async function getClassworkAiFeedback({
   format,
   studentName,
   teacherId,
+  maxOutputTokens,
 }) {
   const reqId = newReqId();
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
@@ -350,11 +350,16 @@ export async function getClassworkAiFeedback({
     teacherId,
   });
 
+  const resolvedMaxOutputTokens =
+    Number(maxOutputTokens) > 0
+      ? Number(maxOutputTokens)
+      : DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS;
+
   const config = {
     systemInstruction,
     responseMimeType: "application/json",
     thinkingConfig: FEEDBACK_THINKING_CONFIG,
-    maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
+    maxOutputTokens: resolvedMaxOutputTokens,
   };
 
   console.log(`[ClassworkFeedback][req=${reqId}] Gemini request:`, {
@@ -382,6 +387,9 @@ export async function getClassworkAiFeedback({
     `[ClassworkFeedback][req=${reqId}] Usage metadata:`,
     result?.usageMetadata || "(none)",
   );
+  await recordAiTokenUsage(result?.usageMetadata, {
+    tag: `ClassworkFeedback:${reqId}`,
+  });
 
   const responseText = result.text || "";
   const parsed = parseFirstJsonObject(responseText, {
@@ -469,11 +477,16 @@ export async function* getClassworkAiFeedbackStream(input) {
     ...input,
   });
 
+  const resolvedMaxOutputTokens =
+    Number(input?.maxOutputTokens) > 0
+      ? Number(input.maxOutputTokens)
+      : DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS;
+
   const config = {
     systemInstruction,
     responseMimeType: "application/json",
     thinkingConfig: FEEDBACK_THINKING_CONFIG,
-    maxOutputTokens: FEEDBACK_MAX_OUTPUT_TOKENS,
+    maxOutputTokens: resolvedMaxOutputTokens,
   };
 
   console.log(`[ClassworkFeedback][req=${reqId}] Gemini stream request:`, {
@@ -502,6 +515,9 @@ export async function* getClassworkAiFeedbackStream(input) {
   let fullText = "";
   let cachedTokens = 0;
   let chunkCount = 0;
+  // Gemini emits usageMetadata on the final chunk. Keep the latest non-null
+  // one so we can aggregate the monthly totals once the stream closes.
+  let finalUsageMetadata = null;
 
   try {
     for await (const chunk of stream) {
@@ -511,6 +527,9 @@ export async function* getClassworkAiFeedbackStream(input) {
         fullText += piece;
         const delta = scanner.feed(piece);
         if (delta) yield { type: "hint-delta", text: delta };
+      }
+      if (chunk?.usageMetadata) {
+        finalUsageMetadata = chunk.usageMetadata;
       }
       const cached = chunk?.usageMetadata?.cachedContentTokenCount;
       if (cached) cachedTokens = cached;
@@ -535,6 +554,9 @@ export async function* getClassworkAiFeedbackStream(input) {
       `[ClassworkFeedback][req=${reqId}] Implicit cache hit: ${cachedTokens} tokens reused`,
     );
   }
+  await recordAiTokenUsage(finalUsageMetadata, {
+    tag: `ClassworkFeedback:${reqId}`,
+  });
 
   const parsed = parseFirstJsonObject(fullText, {
     tag: `ClassworkFeedback:${reqId}`,
