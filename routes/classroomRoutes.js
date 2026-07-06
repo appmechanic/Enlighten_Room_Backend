@@ -18,6 +18,7 @@ import {
   getAllTeacherSessions,
   getClassroomStudents,
 } from "../controllers/classroomController.js";
+import { getClassroomAiUsage } from "../controllers/aiTokenUsageController.js";
 import auth_admin from "../middleware/auth_admin.js";
 import auth_key_header from "../middleware/auth_key_header.js";
 import auth_token from "../middleware/auth_token.js";
@@ -66,6 +67,16 @@ router.get(
   auth_token,
   allowTeacherOrAdmin,
   getClassroomStudents
+);
+
+// @route   GET /api/classrooms/:classroomId/ai-usage
+// @desc    Per-session monthly AI token usage for this classroom
+router.get(
+  "/:classroomId/ai-usage",
+  auth_key_header,
+  auth_token,
+  allowTeacherOrAdmin,
+  getClassroomAiUsage
 );
 
 // @route   GET /api/classrooms/:id

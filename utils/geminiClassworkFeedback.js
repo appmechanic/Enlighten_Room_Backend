@@ -337,6 +337,7 @@ export async function getClassworkAiFeedback({
   studentName,
   teacherId,
   maxOutputTokens,
+  sessionId,
 }) {
   const reqId = newReqId();
   const { systemInstruction, contents, standardPromptHash } = await buildGeminiRequest({
@@ -388,6 +389,7 @@ export async function getClassworkAiFeedback({
     result?.usageMetadata || "(none)",
   );
   await recordAiTokenUsage(result?.usageMetadata, {
+    sessionId,
     tag: `ClassworkFeedback:${reqId}`,
   });
 
@@ -555,6 +557,7 @@ export async function* getClassworkAiFeedbackStream(input) {
     );
   }
   await recordAiTokenUsage(finalUsageMetadata, {
+    sessionId: input?.sessionId,
     tag: `ClassworkFeedback:${reqId}`,
   });
 

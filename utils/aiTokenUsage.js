@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import AiTokenUsage from "../models/AiTokenUsageModel.js";
 
 function currentMonthKey(date = new Date()) {
@@ -6,11 +7,24 @@ function currentMonthKey(date = new Date()) {
   return `${yyyy}-${mm}`;
 }
 
-// Sums Gemini's per-call usageMetadata into the current month's row. Uses an
-// upsert + $inc so concurrent classwork submissions don't clobber each other.
-// Reads both camelCase (SDK field) and snake_case (raw REST field) for the
-// thoughts count so we survive a future SDK rename.
-export async function recordAiTokenUsage(usageMetadata, { tag = "AI" } = {}) {
+function toObjectId(value) {
+  if (!value) return null;
+  if (value instanceof mongoose.Types.ObjectId) return value;
+  try {
+    return new mongoose.Types.ObjectId(String(value));
+  } catch {
+    return null;
+  }
+}
+
+// Sums Gemini's per-call usageMetadata into the (month, session) row. Uses
+// an upsert + $inc so concurrent classwork submissions don't clobber each
+// other. Reads both camelCase (SDK field) and snake_case (raw REST field)
+// for the thoughts count so we survive a future SDK rename.
+export async function recordAiTokenUsage(
+  usageMetadata,
+  { sessionId = null, tag = "AI" } = {},
+) {
   if (!usageMetadata) return;
   const promptTokenCount = Number(usageMetadata.promptTokenCount) || 0;
   const candidatesTokenCount = Number(usageMetadata.candidatesTokenCount) || 0;
@@ -34,9 +48,10 @@ export async function recordAiTokenUsage(usageMetadata, { tag = "AI" } = {}) {
   }
 
   const monthKey = currentMonthKey();
+  const sessionObjectId = toObjectId(sessionId);
   try {
     await AiTokenUsage.updateOne(
-      { monthKey },
+      { monthKey, sessionId: sessionObjectId },
       {
         $inc: {
           promptTokenCount,
@@ -44,13 +59,13 @@ export async function recordAiTokenUsage(usageMetadata, { tag = "AI" } = {}) {
           cachedContentTokenCount,
           totalThoughtTokens,
         },
-        $setOnInsert: { monthKey },
+        $setOnInsert: { monthKey, sessionId: sessionObjectId },
       },
       { upsert: true },
     );
   } catch (err) {
     console.error(
-      `[${tag}] Failed to persist AI token usage for ${monthKey}:`,
+      `[${tag}] Failed to persist AI token usage for ${monthKey} session=${sessionObjectId || "none"}:`,
       err,
     );
   }

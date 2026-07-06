@@ -464,6 +464,28 @@ async function resolveSessionContext(roomId) {
   }
 }
 
+// Cheap sessionId lookup used only for AI-usage bucketing on the classwork
+// submit path. Prefers the Lesson row (indexed on roomId) because the same
+// room may back multiple sessions historically. Falls back to the sessionUrl
+// scan (resolveSessionContext) when no Lesson exists yet — that covers
+// legacy submits that predate the Lesson model.
+async function resolveSessionIdForRoom(roomId, lessonName) {
+  if (!roomId) return null;
+  try {
+    const query = { roomId };
+    if (lessonName) query.name = lessonName;
+    const lesson = await Lesson.findOne(query)
+      .sort({ startedAt: -1 })
+      .select('sessionId')
+      .lean();
+    if (lesson?.sessionId) return lesson.sessionId;
+  } catch (err) {
+    console.warn('[AiUsage] resolveSessionIdForRoom lesson lookup failed:', err.message);
+  }
+  const ctx = await resolveSessionContext(roomId);
+  return ctx.sessionId;
+}
+
 // Start a lesson for a room: adopt any pre-staged classwork (lessonName === "")
 // into the new lesson, and remove classwork belonging to any prior lesson so
 // the new lesson starts clean while preserving pre-created questions. Also
@@ -657,6 +679,7 @@ async function generateAndStoreClassReport(lessonDoc) {
     questions: lessonQuestions,
     teacherId,
     studentCount,
+    sessionId: lessonDoc.sessionId,
   });
 
   if (!classReport) {
@@ -1085,6 +1108,15 @@ export const submitAnswer = async (req, res) => {
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
+    // Resolve the session that owns this room so the AI usage row lands in
+    // the right (month, session) bucket. If no active lesson is found (e.g.
+    // legacy room without a Lesson row yet), sessionId stays null and the
+    // usage falls into the sessionless monthly bucket.
+    const sessionIdForUsage = await resolveSessionIdForRoom(
+      question.roomId || roomId,
+      question.lessonName,
+    );
+
     if (!aiExpired) {
       try {
         aiResult = await getClassworkAiFeedback({
@@ -1096,6 +1128,7 @@ export const submitAnswer = async (req, res) => {
           studentName,
           teacherId: resolvedTeacherId,
           maxOutputTokens: question.maxOutputTokens,
+          sessionId: sessionIdForUsage,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
@@ -1348,6 +1381,14 @@ export const submitAnswerStream = async (req, res) => {
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
+    // Resolve the session that owns this room so the AI usage row lands in
+    // the right (month, session) bucket. See non-streaming submit for the
+    // fallback semantics when no active lesson is found.
+    const sessionIdForUsage = await resolveSessionIdForRoom(
+      question.roomId || roomId,
+      question.lessonName,
+    );
+
     if (aiExpired) {
       // AI gated off for this question — skip the model call but still record
       // the submission below so the answer counts.
@@ -1362,6 +1403,7 @@ export const submitAnswerStream = async (req, res) => {
           studentName,
           teacherId: resolvedTeacherId,
           maxOutputTokens: question.maxOutputTokens,
+          sessionId: sessionIdForUsage,
         })) {
           if (event.type === 'hint-delta') {
             writeEvent({ type: 'hint-delta', text: event.text });

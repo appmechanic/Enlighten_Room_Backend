@@ -177,6 +177,7 @@ export async function generateClassReportSummary({
   questions,
   teacherId,
   studentCount,
+  sessionId,
 }) {
   if (!Array.isArray(questions) || questions.length === 0) {
     return null;
@@ -246,7 +247,10 @@ export async function generateClassReportSummary({
     }
   );
 
-  await recordAiTokenUsage(result?.usageMetadata, { tag: "ClassReportSummary" });
+  await recordAiTokenUsage(result?.usageMetadata, {
+    sessionId,
+    tag: "ClassReportSummary",
+  });
 
   const text = (result?.text || "").trim();
   if (!text) {
