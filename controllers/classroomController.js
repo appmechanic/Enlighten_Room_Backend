@@ -362,6 +362,11 @@ export const updateClassroomSettings = async (req, res) => {
       ...filteredSettings,
     };
 
+    // scope (Grade/Year) is a top-level classroom field, not part of settings
+    if (settings.hasOwnProperty("scope")) {
+      classroom.scope = settings.scope;
+    }
+
     const updated = await classroom.save();
     res.status(200).json({
       message: "Settings updated successfully",
@@ -379,10 +384,9 @@ export const updateClassSchedule = async (req, res) => {
   try {
     const classroomId = req.params.id;
     const { dateTime, frequency, duration, lastDate } = req.body;
-    if (!dateTime || !frequency || !duration || !lastDate) {
+    if (!dateTime || !lastDate) {
       return res.status(400).json({
-        error:
-          "All scheduled fields (dateTime, frequency, duration, lastDate) are required",
+        error: "dateTime and lastDate are required",
       });
     }
     const classroom = await Classroom.findById(classroomId);
@@ -390,8 +394,8 @@ export const updateClassSchedule = async (req, res) => {
       return res.status(404).json({ error: "Classroom not found" });
     }
     classroom.dateTime = new Date(dateTime);
-    classroom.frequency = frequency;
-    classroom.duration = duration;
+    if (frequency !== undefined) classroom.frequency = frequency;
+    if (duration !== undefined) classroom.duration = duration;
     classroom.lastDate = new Date(lastDate);
 
     const updated = await classroom.save();
