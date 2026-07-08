@@ -16,6 +16,7 @@ import {
   getFullClassroomData,
   getStudentAssignmentsByClassroom,
   getSubAssignmentById,
+  listLessonsForSession,
   updateAssignmentByAdmin,
 } from "../controllers/assignmentController.js";
 import auth_key_header from "../middleware/auth_key_header.js";
@@ -35,6 +36,14 @@ router.post("/create", auth_key_header, auth_token, createAssignment);
 router.post("/new", auth_key_header, auth_token, createnewAssignment);
 // AI-generated assignment from a previous session (Create Assignment panel).
 router.post("/with-ai", auth_key_header, auth_token, createAssignmentWithAI);
+// Lesson picker for the Create Assignment panel — one session can have
+// multiple lessons (reruns), and the teacher chooses which lessons feed the AI.
+router.get(
+  "/lessons-by-session/:sessionId",
+  auth_key_header,
+  auth_token,
+  listLessonsForSession,
+);
 // GET /api/assignments/assigned
 router.get("/assigned", getAllAssignedAssignments);
 router.get("/get-All", getAllAssignments);

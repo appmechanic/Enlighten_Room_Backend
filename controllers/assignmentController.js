@@ -1012,22 +1012,33 @@ export const updateAssignmentByAdmin = async (req, res) => {
 // Pull every classwork question for a Session and stitch in the per-question
 // diagnostic-training history from ClassworkAiReport (broken out by student).
 // Output matches the shape geminiAssignmentQuestions expects.
-async function buildSessionReportForAssignment({ session }) {
+async function buildSessionReportForAssignment({ session, lessonIds }) {
   if (!session?._id) return { lessonName: "", questions: [] };
 
-  const lessons = await Lesson.find({ sessionId: session._id })
+  const allLessons = await Lesson.find({ sessionId: session._id })
     .sort({ startedAt: -1 })
-    .select("name roomId")
+    .select("_id name roomId")
     .lean();
-  const latest = lessons[0];
-  if (!latest) return { lessonName: "", questions: [] };
+  if (!allLessons.length) return { lessonName: "", questions: [] };
+
+  // When the teacher picked specific lessons, honor that filter; otherwise
+  // fall back to the single most-recent lesson (preserves prior behaviour
+  // for callers that pre-date the picker).
+  const filterIds = Array.isArray(lessonIds)
+    ? lessonIds.map((id) => String(id)).filter(Boolean)
+    : [];
+  const picked = filterIds.length
+    ? allLessons.filter((l) => filterIds.includes(String(l._id)))
+    : [allLessons[0]];
+  if (!picked.length) return { lessonName: "", questions: [] };
 
   const [classwork, aiReports] = await Promise.all([
     ClassworkModel.find({
-      roomId: latest.roomId,
-      lessonName: latest.name,
+      $or: picked.map((l) => ({ roomId: l.roomId, lessonName: l.name })),
     }).lean(),
-    ClassworkAiReport.find({ roomId: latest.roomId }).lean(),
+    ClassworkAiReport.find({
+      roomId: { $in: picked.map((l) => l.roomId) },
+    }).lean(),
   ]);
 
   // Index AI reports by `${questionId}::${studentId}` so we can attach
@@ -1074,7 +1085,11 @@ async function buildSessionReportForAssignment({ session }) {
     };
   });
 
-  return { lessonName: latest.name, questions };
+  const label =
+    picked.length === 1
+      ? picked[0].name
+      : `${picked.length} lessons: ${picked.map((l) => l.name).join(", ")}`;
+  return { lessonName: label, questions };
 }
 
 // Global-scope companion to buildSessionReportForAssignment. Walks every past
@@ -1235,6 +1250,7 @@ export const createAssignmentWithAI = async (req, res) => {
     resources = [],
     course,
     topic,
+    lessonIds = [],
   } = req.body || {};
 
   // Basic guards. Most validation is shape-checking — heavier checks (Mongo
@@ -1272,7 +1288,7 @@ export const createAssignmentWithAI = async (req, res) => {
 
     const sessionReport = isGlobalScope
       ? await buildAggregatedReportForClassroom({ classroomId })
-      : await buildSessionReportForAssignment({ session });
+      : await buildSessionReportForAssignment({ session, lessonIds });
     const classroomPrompt = classroom.classroom_prompt || "";
 
     // Resolve teacher prompt: explicit body value wins so the panel can let
@@ -1411,6 +1427,29 @@ export const createAssignmentWithAI = async (req, res) => {
     });
   } catch (err) {
     console.error("createAssignmentWithAI error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/assignment/lessons-by-session/:sessionId
+// Powers the Create Assignment panel's second-level picker: after choosing a
+// session, the teacher gets a checkbox list of the lessons (occurrences) that
+// happened under it. Returns the raw fields needed to render (name, roomId,
+// startedAt, endedAt) — heavier per-lesson data (classwork, AI report) is
+// only fetched at generation time.
+export const listLessonsForSession = async (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId is required." });
+  }
+  try {
+    const lessons = await Lesson.find({ sessionId })
+      .sort({ startedAt: -1 })
+      .select("_id name roomId startedAt endedAt status")
+      .lean();
+    return res.json({ ok: true, lessons });
+  } catch (err) {
+    console.error("listLessonsForSession error:", err);
     return res.status(500).json({ error: err.message });
   }
 };
