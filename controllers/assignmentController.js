@@ -1077,6 +1077,90 @@ async function buildSessionReportForAssignment({ session }) {
   return { lessonName: latest.name, questions };
 }
 
+// Global-scope companion to buildSessionReportForAssignment. Walks every past
+// session of the classroom and unions their classwork questions + per-question
+// diagnostic-training history into one flat snapshot, so the AI can generate a
+// homework set that covers the whole term rather than a single lesson.
+async function buildAggregatedReportForClassroom({ classroomId }) {
+  if (!classroomId) return { lessonName: "", questions: [] };
+
+  const sessions = await Session.find({ classroomId })
+    .select("_id topic")
+    .lean();
+  if (!sessions.length) return { lessonName: "", questions: [] };
+
+  // For each session, look up its most recent lesson (matches
+  // buildSessionReportForAssignment's "latest lesson wins" rule) so the room
+  // + lessonName pair we key ClassworkModel on is unambiguous.
+  const perSessionReports = await Promise.all(
+    sessions.map(async (s) => {
+      const lesson = await Lesson.findOne({ sessionId: s._id })
+        .sort({ startedAt: -1 })
+        .select("name roomId")
+        .lean();
+      if (!lesson) return null;
+      return { session: s, lesson };
+    }),
+  );
+  const withLesson = perSessionReports.filter(Boolean);
+  if (!withLesson.length) return { lessonName: "", questions: [] };
+
+  const [classwork, aiReports] = await Promise.all([
+    ClassworkModel.find({
+      $or: withLesson.map(({ lesson }) => ({
+        roomId: lesson.roomId,
+        lessonName: lesson.name,
+      })),
+    }).lean(),
+    ClassworkAiReport.find({
+      roomId: { $in: withLesson.map(({ lesson }) => lesson.roomId) },
+    }).lean(),
+  ]);
+
+  const reportIndex = new Map();
+  aiReports.forEach((r) => {
+    reportIndex.set(`${r.questionId}::${r.studentId}`, r);
+  });
+
+  const questions = classwork.map((q) => {
+    const submitted = (q.submitted || []).map((s) => ({
+      studentId: s.studentId,
+      studentName: s.studentName,
+      feedback: s.feedback || "",
+    }));
+
+    const trainingHistory = [];
+    (q.submitted || []).forEach((s) => {
+      const report = reportIndex.get(`${q.id}::${s.studentId}`);
+      const entries = report?.trainingHistory || [];
+      entries.forEach((entry) => {
+        const items = Array.isArray(entry?.part3)
+          ? entry.part3.map((x) => String(x ?? "").trim()).filter(Boolean)
+          : [];
+        if (items.length === 0) return;
+        trainingHistory.push({
+          studentId: s.studentId,
+          studentName: s.studentName,
+          part3: items,
+        });
+      });
+    });
+
+    return {
+      question: q.question,
+      format: q.format,
+      correctAnswer: q.correctAnswer,
+      submitted,
+      trainingHistory,
+    };
+  });
+
+  return {
+    lessonName: `All lessons (${withLesson.length} session${withLesson.length === 1 ? "" : "s"})`,
+    questions,
+  };
+}
+
 // Map a generated question (gemini shape) onto a Question doc.
 function buildQuestionDoc({
   generated,
@@ -1155,9 +1239,12 @@ export const createAssignmentWithAI = async (req, res) => {
 
   // Basic guards. Most validation is shape-checking — heavier checks (Mongo
   // ID validity, classroom membership) happen during the Mongoose lookups.
-  if (!classroomId || !sessionId || !teacherId) {
+  // sessionId is optional: when omitted the assignment runs in "all lessons"
+  // (classroom-wide) scope and aggregates classwork across every past session.
+  const isGlobalScope = !sessionId;
+  if (!classroomId || !teacherId) {
     return res.status(400).json({
-      error: "classroomId, sessionId, and teacherId are required.",
+      error: "classroomId and teacherId are required.",
     });
   }
   if (!title || !dueDate) {
@@ -1176,12 +1263,16 @@ export const createAssignmentWithAI = async (req, res) => {
   try {
     const [classroom, session] = await Promise.all([
       Classroom.findById(classroomId).lean(),
-      Session.findById(sessionId).lean(),
+      isGlobalScope ? Promise.resolve(null) : Session.findById(sessionId).lean(),
     ]);
     if (!classroom) return res.status(400).json({ error: "Invalid classroomId" });
-    if (!session) return res.status(400).json({ error: "Invalid sessionId" });
+    if (!isGlobalScope && !session) {
+      return res.status(400).json({ error: "Invalid sessionId" });
+    }
 
-    const sessionReport = await buildSessionReportForAssignment({ session });
+    const sessionReport = isGlobalScope
+      ? await buildAggregatedReportForClassroom({ classroomId })
+      : await buildSessionReportForAssignment({ session });
     const classroomPrompt = classroom.classroom_prompt || "";
 
     // Resolve teacher prompt: explicit body value wins so the panel can let
@@ -1190,12 +1281,13 @@ export const createAssignmentWithAI = async (req, res) => {
     const useExplicitTeacherPrompt =
       typeof teacherPromptOverride === "string" && teacherPromptOverride.trim() !== "";
 
+    const resolvedTopic = topic || session?.topic || sessionReport.lessonName || "";
     const { questions: generatedQuestions, generation } = await generateAssignmentQuestions({
       sessionReport,
       perFormatCounts,
       maxAiHints,
       course: course || classroom.subject?.name,
-      topic: topic || session.topic,
+      topic: resolvedTopic,
       classroomPrompt,
       // If we have an explicit override, slip it into TeacherAIConfig path
       // by passing null teacherId and prepending to the prompt manually. The
@@ -1219,10 +1311,10 @@ export const createAssignmentWithAI = async (req, res) => {
       buildQuestionDoc({
         generated: q,
         classroomId,
-        sessionId,
+        sessionId: sessionId || undefined,
         teacherId,
         course: course || classroom.subject?.name,
-        topic: topic || session.topic,
+        topic: resolvedTopic,
         maxAiHints,
       }),
     );
@@ -1244,7 +1336,7 @@ export const createAssignmentWithAI = async (req, res) => {
           const img = await generateAssignmentQuestionImage({
             questionText: generated.imagePromptHint || generated.questionText,
             course: course || classroom.subject?.name,
-            topic: topic || session.topic,
+            topic: resolvedTopic,
             format: generated.format,
             questionId: doc._id,
           });
@@ -1279,7 +1371,7 @@ export const createAssignmentWithAI = async (req, res) => {
 
     const assignmentDoc = await Assignment.create({
       classroomId,
-      sessionId,
+      ...(sessionId ? { sessionId } : {}),
       teacherId,
       assignments: [task],
     });

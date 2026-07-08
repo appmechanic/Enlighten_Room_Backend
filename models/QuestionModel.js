@@ -10,7 +10,6 @@ const questionSchema = new mongoose.Schema(
     sessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true,
     },
     teacherId: {
       type: mongoose.Schema.Types.ObjectId,

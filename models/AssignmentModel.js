@@ -139,7 +139,6 @@ const AssignmentSchema = new mongoose.Schema(
     sessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Session",
-      required: true,
     },
     teacherId: {
       type: mongoose.Schema.Types.ObjectId,

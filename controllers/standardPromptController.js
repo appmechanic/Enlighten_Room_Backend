@@ -65,6 +65,7 @@ export const getStandardPrompts = asyncHandler(async (req, res) => {
       reportPrompt: doc?.reportPrompt || joinSections(reportSections),
       reportPromptSections: reportSections,
       emailPrompt: doc?.emailPrompt || "",
+      creatingAssignmentPrompt: doc?.creatingAssignmentPrompt || "",
       updatedAt: doc?.updatedAt || null,
     },
   });
@@ -77,6 +78,7 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     reportPromptSections,
     reportPrompt,
     emailPrompt,
+    creatingAssignmentPrompt,
   } = req.body || {};
 
   const aiHintSections = normalizeSections(
@@ -103,6 +105,7 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     reportPrompt: reportJoined,
     reportPromptSections: reportSections,
     emailPrompt: (emailPrompt || "").trim(),
+    creatingAssignmentPrompt: (creatingAssignmentPrompt || "").trim(),
     updatedBy: userId || null,
   };
 
@@ -121,6 +124,7 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
       reportPrompt: doc?.reportPrompt || reportJoined,
       reportPromptSections: reportSectionsFromDoc(doc),
       emailPrompt: doc?.emailPrompt || "",
+      creatingAssignmentPrompt: doc?.creatingAssignmentPrompt || "",
       updatedAt: doc?.updatedAt || null,
     },
   });
