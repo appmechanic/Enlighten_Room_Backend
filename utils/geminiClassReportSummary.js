@@ -7,7 +7,7 @@ import { recordAiTokenUsage } from "./aiTokenUsage.js";
 // Output-token budget scales with class size so bigger classes have room to
 // cover more per-student difficulties. Capped so we don't blow past a
 // reasonable ceiling regardless of enrolment.
-const REPORT_BASE_MAX_OUTPUT_TOKENS = 1000;
+const REPORT_BASE_MAX_OUTPUT_TOKENS = 2000;
 const REPORT_PER_STUDENT_MAX_OUTPUT_TOKENS = 25;
 const REPORT_MAX_OUTPUT_TOKENS_CAP = 4000;
 
