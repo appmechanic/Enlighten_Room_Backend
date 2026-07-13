@@ -13,6 +13,34 @@ const SubmittedSchema = new mongoose.Schema({
   submittedAt: { type: Date, default: Date.now },
 });
 
+const CachedCommonMistakeSchema = new mongoose.Schema(
+  {
+    title: { type: String, default: "" },
+    studentId: { type: String, default: "" },
+    studentName: { type: String, default: "" },
+    studentAnswer: { type: String, default: "" },
+    feedback: { type: String, default: "" },
+    answerLatex: { type: String, default: "" },
+    interactionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
+const AiFeedbackCacheSchema = new mongoose.Schema(
+  {
+    enabled: { type: Boolean, default: false },
+    threshold: { type: Number, default: 0 },
+    cachedAt: { type: Date, default: null },
+    promptSnapshot: { type: String, default: "" },
+    questionSnapshot: { type: String, default: "" },
+    teacherPromptSnapshot: { type: String, default: "" },
+    standardSolution: { type: String, default: "" },
+    commonMistakes: { type: [CachedCommonMistakeSchema], default: [] },
+  },
+  { _id: false }
+);
+
 const ClassworkSchema = new mongoose.Schema({
   id: { type: String, required: true },
   roomId: { type: String, required: true },
@@ -35,6 +63,10 @@ const ClassworkSchema = new mongoose.Schema({
   released: { type: Boolean, default: true },
   releasedAt: { type: Date, default: null },
   submitted: { type: [SubmittedSchema], default: [] },
+  standardSolution: { type: String, default: "" },
+  solutionCapturedAt: { type: Date, default: null },
+  commonMistakeBank: { type: [CachedCommonMistakeSchema], default: [] },
+  aiFeedbackCache: { type: AiFeedbackCacheSchema, default: () => ({}) },
 });
 
 export default mongoose.model('Classwork', ClassworkSchema);

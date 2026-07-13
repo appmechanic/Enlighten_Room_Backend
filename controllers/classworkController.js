@@ -6,25 +6,14 @@ import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
 import Classroom from '../models/classroomModel.js';
 import Session from '../models/SessionModel.js';
 import Lesson from '../models/LessonModel.js';
-import { getClassworkAiFeedback, getClassworkAiFeedbackStream } from '../utils/geminiClassworkFeedback.js';
+import { getClassworkAiFeedback, toStringArray } from '../utils/geminiClassworkFeedback.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
-import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
+import { getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
-
-// Coerce whatever the AI (or a caller) provides into a string[] so downstream
-// code can always spread it safely. Strings become one-element arrays; falsy
-// values become []; arrays are copied and their entries stringified.
-function toStringArray(value) {
-  if (Array.isArray(value)) {
-    return value.map((v) => String(v ?? ''));
-  }
-  if (value == null || value === '') return [];
-  return [String(value)];
-}
 
 // Default shape returned when the AI is skipped (aiExpired) or fails. Matches
 // the admin StandardPrompt schema: `{ correct, hintStream, part1[], part2[],
@@ -37,6 +26,8 @@ function emptyAiFeedback() {
     part2: [],
     part3: [],
     advancedChallenge: { congratulations: '', question: '' },
+    standardSolution: '',
+    commonMistake: { title: '', isCommon: false, answerLatex: '' },
   };
 }
 
@@ -71,12 +62,19 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
       if (it && !it.correct) {
         lastWrongInteraction = {
           interactionId: it._id || null,
+          previousInteractionId: it.previousInteractionId || null,
           questionText: it.questionText || '',
           ...(includeStudentAnswer ? { studentAnswer: it.studentAnswer } : {}),
           hintStream: it.hintStream || '',
           part1: toStringArray(it.part1),
           part2: toStringArray(it.part2),
           part3: toStringArray(it.part3),
+          standardSolution: it.standardSolution || '',
+          commonMistake: {
+            title: it.commonMistake?.title || '',
+            isCommon: Boolean(it.commonMistake?.isCommon),
+            answerLatex: it.commonMistake?.answerLatex || '',
+          },
           advancedChallenge: {
             congratulations: it.advancedChallenge?.congratulations || '',
             question: it.advancedChallenge?.question || '',
@@ -100,12 +98,19 @@ function projectAiReport(report, { includeStudentAnswer = false } = {}) {
     })),
     interactions: interactions.map((it) => ({
       interactionId: it._id || null,
+      previousInteractionId: it.previousInteractionId || null,
       questionText: it.questionText || '',
       ...(includeStudentAnswer ? { studentAnswer: it.studentAnswer } : {}),
       hintStream: it.hintStream || '',
       part1: toStringArray(it.part1),
       part2: toStringArray(it.part2),
       part3: toStringArray(it.part3),
+      standardSolution: it.standardSolution || '',
+      commonMistake: {
+        title: it.commonMistake?.title || '',
+        isCommon: Boolean(it.commonMistake?.isCommon),
+        answerLatex: it.commonMistake?.answerLatex || '',
+      },
       advancedChallenge: {
         congratulations: it.advancedChallenge?.congratulations || '',
         question: it.advancedChallenge?.question || '',
@@ -130,6 +135,44 @@ function projectAiForStudent(aiResult) {
       question: aiResult?.advancedChallenge?.question || '',
     },
   };
+}
+
+function normalizeGradeLevel(input) {
+  const n = Number(input);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n);
+}
+
+function resolveCommonMistakeThreshold({ classSize, gradeLevel }) {
+  const size = Number(classSize) > 0 ? Number(classSize) : 0;
+  if (size <= 7) return 0;
+  if (size > 15) return 2;
+  if (gradeLevel != null && gradeLevel >= 10) return 1;
+  return 2;
+}
+
+function buildCachedContext(question) {
+  const mistakes = Array.isArray(question?.commonMistakeBank)
+    ? question.commonMistakeBank.map((m) => ({
+        title: String(m?.title || '').trim(),
+        studentAnswer: String(m?.studentAnswer || '').trim(),
+        feedback: String(m?.feedback || '').trim(),
+        answerLatex: String(m?.answerLatex || '').trim(),
+      }))
+        .filter((m) => m.title)
+    : [];
+
+  return {
+    standardSolution: String(question?.standardSolution || '').trim(),
+    commonMistakes: mistakes,
+  };
+}
+
+function normalizeMistakeTitle(input) {
+  return String(input || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
 }
 
 const transporter = nodemailer.createTransport({
@@ -673,6 +716,10 @@ async function generateAndStoreClassReport(lessonDoc) {
   const studentCount = Array.isArray(classroomDoc?.studentIds)
     ? classroomDoc.studentIds.length
     : 0;
+  const previousInteractionId = lessonDoc?.classReport?.interactionId
+    ? String(lessonDoc.classReport.interactionId)
+    : '';
+  const interactionId = new mongoose.Types.ObjectId().toString();
 
   const classReport = await generateClassReportSummary({
     lessonName: lessonDoc.name,
@@ -680,6 +727,8 @@ async function generateAndStoreClassReport(lessonDoc) {
     teacherId,
     studentCount,
     sessionId: lessonDoc.sessionId,
+    interactionId,
+    previousInteractionId,
   });
 
   if (!classReport) {
@@ -1039,9 +1088,13 @@ export const submitAnswer = async (req, res) => {
       aiUsed,
       teacherId,
       overrideQuestionText,
+      gradeLevel,
     } = req.body;
 
+    const requestedGradeLevel = normalizeGradeLevel(gradeLevel);
+
     let resolvedTeacherId = teacherId;
+    let resolvedClassSize = null;
     if (!resolvedTeacherId && roomId) {
       try {
         const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1051,12 +1104,33 @@ export const submitAnswer = async (req, res) => {
         });
         if (session?.classroomId) {
           const classroom = await Classroom.findById(session.classroomId)
-            .select("teacherId")
+            .select("teacherId studentIds")
             .lean();
           resolvedTeacherId = classroom?.teacherId || null;
+          resolvedClassSize = Array.isArray(classroom?.studentIds)
+            ? classroom.studentIds.length
+            : null;
         }
       } catch (err) {
         console.error("[Classwork] Failed to resolve teacherId from roomId:", err);
+      }
+    }
+    if (resolvedClassSize == null && roomId) {
+      try {
+        const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const session = await Session.findOne({
+          sessionUrl: { $regex: escapedRoomId, $options: "i" },
+        }).select('classroomId');
+        if (session?.classroomId) {
+          const classroom = await Classroom.findById(session.classroomId)
+            .select('studentIds')
+            .lean();
+          resolvedClassSize = Array.isArray(classroom?.studentIds)
+            ? classroom.studentIds.length
+            : null;
+        }
+      } catch (err) {
+        console.error('[Classwork] Failed to resolve class size from roomId:', err);
       }
     }
 
@@ -1073,7 +1147,7 @@ export const submitAnswer = async (req, res) => {
     if (!question.released) {
       return res.status(403).json({ message: 'This question has not been released yet.' });
     }
-    const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
+    // const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
     // if (answerExpiryState.isExpired) {
     //   return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
     // }
@@ -1105,6 +1179,19 @@ export const submitAnswer = async (req, res) => {
       : question.question;
     const isFollowUp = questionTextForAi !== question.question;
 
+    const existingReport = await ClassworkAiReport.findOne({
+      roomId: question.roomId,
+      questionId: question.id,
+      studentId,
+    })
+      .select('interactions._id')
+      .lean();
+    const previousInteractionId = Array.isArray(existingReport?.interactions) && existingReport.interactions.length > 0
+      ? existingReport.interactions[existingReport.interactions.length - 1]._id
+      : null;
+    const interactionId = new mongoose.Types.ObjectId();
+    const cachedContext = buildCachedContext(question);
+
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
@@ -1129,6 +1216,9 @@ export const submitAnswer = async (req, res) => {
           teacherId: resolvedTeacherId,
           maxOutputTokens: question.maxOutputTokens,
           sessionId: sessionIdForUsage,
+          interactionId: String(interactionId),
+          previousInteractionId: previousInteractionId ? String(previousInteractionId) : '',
+          cachedContext,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
@@ -1150,6 +1240,79 @@ export const submitAnswer = async (req, res) => {
     const isCorrect = Boolean(aiResult.correct);
     const feedback = aiResult.hintStream || '';
 
+    if (!question.standardSolution && aiResult.standardSolution) {
+      question.standardSolution = String(aiResult.standardSolution).trim();
+      question.solutionCapturedAt = new Date();
+    }
+
+    const effectiveClassSize = Number(resolvedClassSize) > 0
+      ? Number(resolvedClassSize)
+      : Number(question?.submitted?.length || 0);
+    const commonMistakeThreshold = resolveCommonMistakeThreshold({
+      classSize: effectiveClassSize,
+      gradeLevel: requestedGradeLevel,
+    });
+
+    const aiCache = question.aiFeedbackCache || {};
+    aiCache.threshold = commonMistakeThreshold;
+    if (commonMistakeThreshold <= 0) {
+      aiCache.enabled = false;
+    }
+
+    const currentMistakeBank = Array.isArray(question.commonMistakeBank)
+      ? [...question.commonMistakeBank]
+      : [];
+    const rawMistakeTitle = aiResult?.commonMistake?.title || '';
+    const normalizedTitle = normalizeMistakeTitle(rawMistakeTitle);
+    const isCommonMistake = Boolean(aiResult?.commonMistake?.isCommon);
+    if (
+      commonMistakeThreshold > 0 &&
+      !isCorrect &&
+      isCommonMistake &&
+      normalizedTitle
+    ) {
+      const hasTitleAlready = currentMistakeBank.some(
+        (m) => normalizeMistakeTitle(m?.title) === normalizedTitle,
+      );
+      if (!hasTitleAlready) {
+        const answerLatex = String(aiResult?.commonMistake?.answerLatex || '').trim();
+        currentMistakeBank.push({
+          title: String(rawMistakeTitle).trim(),
+          studentId,
+          studentName,
+          studentAnswer: answerLatex || formatSubmittedAnswerText(normalizedAnswer),
+          feedback,
+          answerLatex,
+          interactionId,
+          createdAt: new Date(),
+        });
+      }
+    }
+    question.commonMistakeBank = currentMistakeBank;
+
+    const distinctTitles = new Set(
+      currentMistakeBank
+        .map((m) => normalizeMistakeTitle(m?.title))
+        .filter(Boolean),
+    ).size;
+
+    if (
+      commonMistakeThreshold > 0 &&
+      !aiCache.enabled &&
+      distinctTitles >= commonMistakeThreshold
+    ) {
+      aiCache.enabled = true;
+      aiCache.cachedAt = new Date();
+      aiCache.promptSnapshot = String(aiResult?.standardPromptText || '').trim();
+      aiCache.teacherPromptSnapshot = String(aiResult?.teacherPromptText || '').trim();
+      aiCache.questionSnapshot = question.question || '';
+      aiCache.standardSolution = String(
+        question.standardSolution || aiResult.standardSolution || ''
+      ).trim();
+      aiCache.commonMistakes = currentMistakeBank;
+    }
+    question.aiFeedbackCache = aiCache;
+
     const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
     if (existingSubmissionIndex !== -1) {
       const submission = question.submitted[existingSubmissionIndex];
@@ -1170,26 +1333,30 @@ export const submitAnswer = async (req, res) => {
         submittedAt: new Date(),
       });
     }
-    await question.save();
-
     // Persist case-c report data: questions, latest answer, latest hint
     // string, full diagnostic-training history. Each interaction is assigned
     // its own ObjectId so the matching `trainingHistory` entry can reference
     // it via `interactionId`.
     try {
-      const interactionId = new mongoose.Types.ObjectId();
       const interactionAt = new Date();
       const part1 = toStringArray(aiResult.part1);
       const part2 = toStringArray(aiResult.part2);
       const part3 = toStringArray(aiResult.part3);
       const interaction = {
         _id: interactionId,
+        previousInteractionId,
         questionText: questionTextForAi,
         studentAnswer: normalizedAnswer,
         hintStream: aiResult.hintStream || '',
         part1,
         part2,
         part3,
+        standardSolution: aiResult.standardSolution || '',
+        commonMistake: {
+          title: aiResult?.commonMistake?.title || '',
+          isCommon: Boolean(aiResult?.commonMistake?.isCommon),
+          answerLatex: aiResult?.commonMistake?.answerLatex || '',
+        },
         advancedChallenge: {
           congratulations: aiResult.advancedChallenge?.congratulations || '',
           question: aiResult.advancedChallenge?.question || '',
@@ -1234,6 +1401,8 @@ export const submitAnswer = async (req, res) => {
     } catch (reportErr) {
       console.error('[Classwork] Failed to upsert AI report:', reportErr);
     }
+
+    await question.save();
 
     res.status(200).json({
       message: 'Answer submitted',
@@ -1248,6 +1417,11 @@ export const submitAnswer = async (req, res) => {
         studentAnswer: normalizedAnswer,
         format: question.format,
         expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
+        interactionId: String(interactionId),
+        previousInteractionId: previousInteractionId ? String(previousInteractionId) : null,
+        commonMistakeThreshold,
+        cachedCommonMistakeCount: distinctTitles,
+        hasCachedSolution: Boolean(question.standardSolution),
       },
       // DIAGNOSTIC: student sees hintStream + part1 + part2. Teacher's
       //             report shows the full part1/part2/part3 per attempt.
@@ -1262,286 +1436,6 @@ export const submitAnswer = async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
-  }
-};
-
-// Streaming counterpart to submitAnswer. Same validation + persistence, but
-// the AI feedback is streamed back as Server-Sent Events so the student sees
-// the live hint character-by-character. Events:
-//   data: { type: 'hint-delta', text }
-//   data: { type: 'done', isCorrect, ai: {...}, debug, aiAllowed, aiExpired }
-//   data: { type: 'error', message, aiFailed? }
-//
-// Validation errors are returned as plain JSON 4xx/5xx before the SSE stream
-// opens, so the client error path stays identical to /submit. Once the stream
-// is open the response is always 200; downstream failures are surfaced via
-// the 'error' event.
-// SSE comment line (prefixed with ":") that browsers ignore but PaaS routers
-// (DigitalOcean App Platform, Heroku, etc.) treat as response bytes. Sending
-// a ~2KB padding comment immediately after headers forces the proxy buffer
-// past its flush threshold, so subsequent small SSE events are forwarded to
-// the client as they arrive instead of being held until the upstream closes.
-const SSE_BUFFER_PRIMER = `:${" ".repeat(2048)}\n\n`;
-
-export const submitAnswerStream = async (req, res) => {
-  const sseOpen = { value: false };
-  const writeEvent = (payload) => {
-    if (!sseOpen.value) return;
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    // Disable Nagle's algorithm so each small write goes out immediately
-    // rather than waiting for more data to coalesce into a larger TCP packet.
-    res.socket?.setNoDelay?.(true);
-  };
-
-  try {
-    const {
-      id,
-      questionId,
-      studentId,
-      studentName,
-      answer,
-      roomId,
-      aiUsed,
-      teacherId,
-      overrideQuestionText,
-    } = req.body;
-
-    let resolvedTeacherId = teacherId;
-    if (!resolvedTeacherId && roomId) {
-      try {
-        const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const session = await Session.findOne({
-          sessionUrl: { $regex: escapedRoomId, $options: 'i' },
-        });
-        if (session?.classroomId) {
-          const classroom = await Classroom.findById(session.classroomId)
-            .select('teacherId')
-            .lean();
-          resolvedTeacherId = classroom?.teacherId || null;
-        }
-      } catch (err) {
-        console.error('[Classwork] Failed to resolve teacherId from roomId:', err);
-      }
-    }
-
-    const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
-    const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
-
-    if (!question) {
-      return res.status(404).json({
-        message: roomId ? 'Question not found for this room' : 'Question not found',
-      });
-    }
-    if (!question.roomId && roomId) question.roomId = roomId;
-
-    if (!question.released) {
-      return res.status(403).json({ message: 'This question has not been released yet.' });
-    }
-
-    if (question.format === 'textbox') {
-      const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
-      const answerText = typeof answer === 'string' ? answer : '';
-      if (answerText.length > textboxLimit) {
-        return res.status(400).json({ message: `Answer exceeds ${textboxLimit} character limit.` });
-      }
-    }
-
-    const aiAllowed = question.aiAllowed !== false;
-    const aiExpired = !aiAllowed;
-
-    const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
-      roomId: question.roomId || roomId,
-      questionId: question.id || questionId,
-      studentId,
-    });
-
-    const questionTextForAi = (typeof overrideQuestionText === 'string' && overrideQuestionText.trim())
-      ? overrideQuestionText.trim()
-      : question.question;
-    const isFollowUp = questionTextForAi !== question.question;
-
-    // Open SSE stream now — all validation has passed. From here on, errors
-    // are surfaced as SSE 'error' events, not HTTP status codes.
-    res.status(200).set({
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no', // disable nginx response buffering if present
-    });
-    res.flushHeaders?.();
-    res.socket?.setNoDelay?.(true);
-    res.socket?.setKeepAlive?.(true);
-    // Prime the proxy buffer so small SSE events aren't held back. App
-    // Platform's router only forwards bytes once its buffer crosses a
-    // threshold; this 2KB comment crosses it immediately. The leading ":"
-    // marks it as a comment, so the browser ignores it.
-    res.write(SSE_BUFFER_PRIMER);
-    sseOpen.value = true;
-
-    let aiResult = emptyAiFeedback();
-    let aiFailed = false;
-
-    // Resolve the session that owns this room so the AI usage row lands in
-    // the right (month, session) bucket. See non-streaming submit for the
-    // fallback semantics when no active lesson is found.
-    const sessionIdForUsage = await resolveSessionIdForRoom(
-      question.roomId || roomId,
-      question.lessonName,
-    );
-
-    if (aiExpired) {
-      // AI gated off for this question — skip the model call but still record
-      // the submission below so the answer counts.
-    } else {
-      try {
-        for await (const event of getClassworkAiFeedbackStream({
-          questionText: questionTextForAi,
-          answer: normalizedAnswer,
-          correctAnswer: isFollowUp ? '' : question.correctAnswer,
-          questionImage: isFollowUp ? null : question.image,
-          format: question.format,
-          studentName,
-          teacherId: resolvedTeacherId,
-          maxOutputTokens: question.maxOutputTokens,
-          sessionId: sessionIdForUsage,
-        })) {
-          if (event.type === 'hint-delta') {
-            writeEvent({ type: 'hint-delta', text: event.text });
-          } else if (event.type === 'done') {
-            aiResult = event.feedback;
-          } else if (event.type === 'error') {
-            aiFailed = true;
-            console.error('[Classwork] AI stream error:', event.message);
-          }
-        }
-      } catch (aiErr) {
-        console.error('[Classwork] AI feedback failed:', aiErr);
-        aiFailed = true;
-      }
-    }
-
-    if (aiFailed) {
-      writeEvent({
-        type: 'error',
-        aiFailed: true,
-        aiAllowed,
-        aiExpired,
-        message: 'AI feedback is temporarily unavailable. Please try again shortly.',
-      });
-      res.end();
-      return;
-    }
-
-    const isCorrect = Boolean(aiResult.correct);
-    const feedback = aiResult.hintStream || '';
-
-    const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
-    if (existingSubmissionIndex !== -1) {
-      const submission = question.submitted[existingSubmissionIndex];
-      submission.answer = normalizedAnswer;
-      submission.isCorrect = isCorrect;
-      submission.aiUsed = aiUsed;
-      submission.studentName = studentName;
-      submission.feedback = feedback;
-      submission.submittedAt = new Date();
-    } else {
-      question.submitted.push({
-        studentId,
-        studentName,
-        answer: normalizedAnswer,
-        isCorrect,
-        aiUsed,
-        feedback,
-        submittedAt: new Date(),
-      });
-    }
-    await question.save();
-
-    try {
-      const interactionId = new mongoose.Types.ObjectId();
-      const interactionAt = new Date();
-      const part1 = toStringArray(aiResult.part1);
-      const part2 = toStringArray(aiResult.part2);
-      const part3 = toStringArray(aiResult.part3);
-      const interaction = {
-        _id: interactionId,
-        questionText: questionTextForAi,
-        studentAnswer: normalizedAnswer,
-        hintStream: aiResult.hintStream || '',
-        part1,
-        part2,
-        part3,
-        advancedChallenge: {
-          congratulations: aiResult.advancedChallenge?.congratulations || '',
-          question: aiResult.advancedChallenge?.question || '',
-        },
-        correct: isCorrect,
-        timestamp: interactionAt,
-      };
-
-      const pushOps = { interactions: interaction };
-      if (part3.length > 0) {
-        pushOps.trainingHistory = {
-          interactionId,
-          part3,
-          timestamp: interactionAt,
-        };
-      }
-
-      const reportSet = {
-        studentName: studentName || 'Unknown',
-        lastAnswer: normalizedAnswer,
-        lastHintStream: aiResult.hintStream || '',
-      };
-      // Audit-only: record which standard-prompt version Gemini just saw.
-      if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
-        reportSet.standardPromptHash = aiResult.standardPromptHash;
-      }
-
-      await ClassworkAiReport.findOneAndUpdate(
-        { roomId: question.roomId, questionId: question.id, studentId },
-        {
-          $setOnInsert: {
-            roomId: question.roomId,
-            questionId: question.id,
-            studentId,
-            originalQuestion: question.question,
-          },
-          $set: reportSet,
-          $push: pushOps,
-        },
-        { upsert: true, new: true }
-      );
-    } catch (reportErr) {
-      console.error('[Classwork] Failed to upsert AI report:', reportErr);
-    }
-
-    writeEvent({
-      type: 'done',
-      isCorrect,
-      aiAllowed,
-      aiExpired,
-      debug: {
-        originalQuestion: question.question,
-        questionTextForAi,
-        isFollowUp,
-        studentAnswer: normalizedAnswer,
-        format: question.format,
-        expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
-      },
-      ai: projectAiForStudent(aiResult),
-      feedback,
-      correctAnswer: question.correctAnswer,
-    });
-    res.end();
-  } catch (err) {
-    console.error('[Classwork] submitAnswerStream failed:', err);
-    if (sseOpen.value) {
-      writeEvent({ type: 'error', message: err.message || 'Error submitting answer' });
-      res.end();
-    } else {
-      res.status(500).json({ message: 'Error submitting answer', error: err.message });
-    }
   }
 };
 

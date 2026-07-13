@@ -70,7 +70,7 @@ async function buildTeacherSection(teacherId) {
       .select("reportPrompt")
       .lean();
     const prompt = (cfg?.reportPrompt || "").trim();
-    return prompt ? `Teacher prompt: ${prompt}` : "";
+    return prompt;
   } catch (err) {
     console.error("[ClassReportSummary] Failed to load TeacherAIConfig:", err);
     return "";
@@ -92,7 +92,7 @@ async function buildStandardSection() {
     const joined = sections.length
       ? sections.join("\n\n")
       : (doc?.reportPrompt || "").trim();
-    return joined ? `Standard prompt: ${joined}` : "";
+    return joined;
   } catch (err) {
     console.error("[ClassReportSummary] Failed to load StandardPrompt:", err);
     return "";
@@ -147,8 +147,10 @@ const CLASS_REPORT_RESPONSE_SCHEMA = {
 // Compact the lesson's classwork + submissions into a textual snapshot the
 // model can summarize. Per-student answers are listed under each question so
 // the model can see the spread of responses.
-function buildLessonSnapshot({ lessonName, questions }) {
+function buildLessonSnapshot({ lessonName, questions, interactionId, previousInteractionId }) {
   const lines = [];
+  if (interactionId) lines.push(`interaction_id: ${interactionId}`);
+  lines.push(`previous_interaction_id: ${previousInteractionId || "null"}`);
   if (lessonName) lines.push(`Lesson: ${lessonName}`);
   lines.push(`Total questions: ${questions.length}`);
   lines.push("");
@@ -178,6 +180,8 @@ export async function generateClassReportSummary({
   teacherId,
   studentCount,
   sessionId,
+  interactionId,
+  previousInteractionId,
 }) {
   if (!Array.isArray(questions) || questions.length === 0) {
     return null;
@@ -214,7 +218,12 @@ export async function generateClassReportSummary({
     .filter(Boolean)
     .join("\n\n");
 
-  const snapshot = buildLessonSnapshot({ lessonName, questions });
+  const snapshot = buildLessonSnapshot({
+    lessonName,
+    questions,
+    interactionId,
+    previousInteractionId,
+  });
 
   const maxOutputTokens = reportMaxOutputTokens(studentCount);
   console.log(
@@ -295,6 +304,8 @@ export async function generateClassReportSummary({
     studentDifficulties,
     nextLessonStrategy,
     targetedHomework,
+    interactionId: interactionId || "",
+    previousInteractionId: previousInteractionId || "",
     generatedAt: new Date(),
     model: MODEL,
   };

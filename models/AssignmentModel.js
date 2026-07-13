@@ -94,6 +94,15 @@ const AssignmentTaskSchema = new mongoose.Schema({
     min: 0,
     max: 10,
   },
+  // Cooldown (in seconds) enforced on the student side between successive AI
+  // hint requests on the same question. 0 = no cooldown, i.e. back-to-back
+  // requests are allowed until maxAiHints is exhausted.
+  aiHintCooldownSeconds: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 3600,
+  },
   // Snapshot of the prompts used at generation time — keeps the audit trail
   // intact even if the teacher edits their assignmentPrompt later.
   generation: {

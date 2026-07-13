@@ -50,6 +50,10 @@ const questionSchema = new mongoose.Schema(
     // Cap on AI hints copied from the parent assignment task. Enforced by the
     // student answer endpoint, surfaced in the student UI.
     maxAiHints: { type: Number, default: 0, min: 0, max: 10 },
+    // Cooldown (in seconds) between successive AI hint requests on this
+    // question. Copied from the parent task; drives the student-side
+    // countdown that re-enables the "Get hints" button when it hits zero.
+    aiHintCooldownSeconds: { type: Number, default: 0, min: 0, max: 3600 },
     hints: [{ type: String }],
     answer: [{ type: String }],
     metadata: {

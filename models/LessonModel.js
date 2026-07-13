@@ -67,6 +67,8 @@ const LessonSchema = new mongoose.Schema(
       studentDifficulties: { type: [StudentDifficultySchema], default: [] },
       nextLessonStrategy: { type: [NextLessonStrategySchema], default: [] },
       targetedHomework: { type: [TargetedHomeworkSchema], default: [] },
+      interactionId: { type: String, default: "" },
+      previousInteractionId: { type: String, default: "" },
       generatedAt: { type: Date, default: null },
       model: { type: String, default: "" },
     },

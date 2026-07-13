@@ -283,13 +283,9 @@ export const getAssignedAssignments = async (req, res) => {
       .populate("teacherId", "firstName lastName email")
       .populate("assignments.questions");
 
-    if (!assignments || assignments.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "No assignments found for this student" });
-    }
-
-    // Flatten relevant data
+    // Flatten relevant data. Return an empty array on no matches (via the
+    // response below) rather than 404 so RTK Query's cache reconciles when a
+    // teacher publishes a new assignment.
     const studentAssignments = [];
 
     assignments.forEach((assignmentDoc) => {
@@ -486,12 +482,11 @@ export const getAssignmentsByClassroom = async (req, res) => {
       .populate("sessionId", "notes topic sessionDate sessionUrl")
       .populate("teacherId", "firstName lastName email");
 
-    if (!assignments || assignments.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "No assignments found for this classroom" });
-    }
-    res.status(200).json(assignments);
+    // Return an empty array (200) instead of 404 so RTK Query treats it as a
+    // successful cached response. A 404 error state doesn't get reconciled by
+    // subsequent invalidations from createAssignmentWithAi, which meant the
+    // Assignments tab stayed empty even after a new assignment was published.
+    res.status(200).json(assignments || []);
   } catch (error) {
     console.error("Error fetching assignments by classroom:", error);
     res.status(500).json({ error: "Server error", message: error.message });
@@ -1009,27 +1004,19 @@ export const updateAssignmentByAdmin = async (req, res) => {
 //   resources: [string]
 // }
 
-// Pull every classwork question for a Session and stitch in the per-question
-// diagnostic-training history from ClassworkAiReport (broken out by student).
-// Output matches the shape geminiAssignmentQuestions expects.
-async function buildSessionReportForAssignment({ session, lessonIds }) {
-  if (!session?._id) return { lessonName: "", questions: [] };
-
-  const allLessons = await Lesson.find({ sessionId: session._id })
-    .sort({ startedAt: -1 })
-    .select("_id name roomId")
-    .lean();
-  if (!allLessons.length) return { lessonName: "", questions: [] };
-
-  // When the teacher picked specific lessons, honor that filter; otherwise
-  // fall back to the single most-recent lesson (preserves prior behaviour
-  // for callers that pre-date the picker).
+// Pull every classwork question for the picked lessons and stitch in the
+// per-question diagnostic-training history from ClassworkAiReport (broken out
+// by student). Output matches the shape geminiAssignmentQuestions expects.
+async function buildLessonsReport({ lessonIds }) {
   const filterIds = Array.isArray(lessonIds)
     ? lessonIds.map((id) => String(id)).filter(Boolean)
     : [];
-  const picked = filterIds.length
-    ? allLessons.filter((l) => filterIds.includes(String(l._id)))
-    : [allLessons[0]];
+  if (!filterIds.length) return { lessonName: "", questions: [] };
+
+  const picked = await Lesson.find({ _id: { $in: filterIds } })
+    .sort({ startedAt: -1 })
+    .select("_id name roomId sessionId")
+    .lean();
   if (!picked.length) return { lessonName: "", questions: [] };
 
   const [classwork, aiReports] = await Promise.all([
@@ -1092,8 +1079,8 @@ async function buildSessionReportForAssignment({ session, lessonIds }) {
   return { lessonName: label, questions };
 }
 
-// Global-scope companion to buildSessionReportForAssignment. Walks every past
-// session of the classroom and unions their classwork questions + per-question
+// Global-scope companion to buildLessonsReport. Walks every past session of
+// the classroom and unions their classwork questions + per-question
 // diagnostic-training history into one flat snapshot, so the AI can generate a
 // homework set that covers the whole term rather than a single lesson.
 async function buildAggregatedReportForClassroom({ classroomId }) {
@@ -1104,9 +1091,8 @@ async function buildAggregatedReportForClassroom({ classroomId }) {
     .lean();
   if (!sessions.length) return { lessonName: "", questions: [] };
 
-  // For each session, look up its most recent lesson (matches
-  // buildSessionReportForAssignment's "latest lesson wins" rule) so the room
-  // + lessonName pair we key ClassworkModel on is unambiguous.
+  // For each session, look up its most recent lesson so the room + lessonName
+  // pair we key ClassworkModel on is unambiguous.
   const perSessionReports = await Promise.all(
     sessions.map(async (s) => {
       const lesson = await Lesson.findOne({ sessionId: s._id })
@@ -1185,6 +1171,7 @@ function buildQuestionDoc({
   course,
   topic,
   maxAiHints,
+  aiHintCooldownSeconds,
 }) {
   return {
     classroomId,
@@ -1200,6 +1187,7 @@ function buildQuestionDoc({
     hints: generated.hints || [],
     answer: [],
     maxAiHints,
+    aiHintCooldownSeconds,
     image: "",
     metadata: {
       difficulty: generated.difficulty || "medium",
@@ -1235,7 +1223,6 @@ async function runWithConcurrency(items, limit, worker) {
 export const createAssignmentWithAI = async (req, res) => {
   const {
     classroomId,
-    sessionId,
     teacherId,
     title,
     description = "",
@@ -1244,8 +1231,8 @@ export const createAssignmentWithAI = async (req, res) => {
     perFormatCounts = {},
     perFormatImages = {},
     maxAiHints = 0,
+    aiHintCooldownSeconds = 0,
     maxMarks = 10,
-    studentIds = [],
     teacherPrompt: teacherPromptOverride,
     resources = [],
     course,
@@ -1255,9 +1242,8 @@ export const createAssignmentWithAI = async (req, res) => {
 
   // Basic guards. Most validation is shape-checking — heavier checks (Mongo
   // ID validity, classroom membership) happen during the Mongoose lookups.
-  // sessionId is optional: when omitted the assignment runs in "all lessons"
-  // (classroom-wide) scope and aggregates classwork across every past session.
-  const isGlobalScope = !sessionId;
+  // lessonIds drive scope: a single-lesson pick is the panel's primary flow;
+  // an empty array falls back to the classroom-wide aggregate.
   if (!classroomId || !teacherId) {
     return res.status(400).json({
       error: "classroomId and teacherId are required.",
@@ -1276,19 +1262,33 @@ export const createAssignmentWithAI = async (req, res) => {
     });
   }
 
+  const normalizedLessonIds = Array.isArray(lessonIds)
+    ? lessonIds.map((id) => String(id)).filter(Boolean)
+    : [];
+  const isGlobalScope = normalizedLessonIds.length === 0;
+
   try {
-    const [classroom, session] = await Promise.all([
-      Classroom.findById(classroomId).lean(),
-      isGlobalScope ? Promise.resolve(null) : Session.findById(sessionId).lean(),
-    ]);
+    const classroom = await Classroom.findById(classroomId).lean();
     if (!classroom) return res.status(400).json({ error: "Invalid classroomId" });
-    if (!isGlobalScope && !session) {
-      return res.status(400).json({ error: "Invalid sessionId" });
+
+    // Derive the session from the picked lesson so Question docs still get
+    // stamped with sessionId (used by session/report lookups downstream).
+    let derivedSession = null;
+    if (!isGlobalScope) {
+      const firstLesson = await Lesson.findById(normalizedLessonIds[0])
+        .select("sessionId")
+        .lean();
+      if (firstLesson?.sessionId) {
+        derivedSession = await Session.findById(firstLesson.sessionId).lean();
+      }
     }
+    const derivedSessionId = derivedSession?._id
+      ? String(derivedSession._id)
+      : undefined;
 
     const sessionReport = isGlobalScope
       ? await buildAggregatedReportForClassroom({ classroomId })
-      : await buildSessionReportForAssignment({ session, lessonIds });
+      : await buildLessonsReport({ lessonIds: normalizedLessonIds });
     const classroomPrompt = classroom.classroom_prompt || "";
 
     // Resolve teacher prompt: explicit body value wins so the panel can let
@@ -1297,7 +1297,8 @@ export const createAssignmentWithAI = async (req, res) => {
     const useExplicitTeacherPrompt =
       typeof teacherPromptOverride === "string" && teacherPromptOverride.trim() !== "";
 
-    const resolvedTopic = topic || session?.topic || sessionReport.lessonName || "";
+    const resolvedTopic =
+      topic || derivedSession?.topic || sessionReport.lessonName || "";
     const { questions: generatedQuestions, generation } = await generateAssignmentQuestions({
       sessionReport,
       perFormatCounts,
@@ -1327,11 +1328,12 @@ export const createAssignmentWithAI = async (req, res) => {
       buildQuestionDoc({
         generated: q,
         classroomId,
-        sessionId: sessionId || undefined,
+        sessionId: derivedSessionId,
         teacherId,
         course: course || classroom.subject?.name,
         topic: resolvedTopic,
         maxAiHints,
+        aiHintCooldownSeconds,
       }),
     );
     const savedQuestions = await Question.insertMany(baseDocs);
@@ -1370,24 +1372,33 @@ export const createAssignmentWithAI = async (req, res) => {
       if (okCount > 0) generation.imageModel = ASSIGNMENT_IMAGE_MODEL;
     }
 
+    // AI-generated assignments are class-wide: seed the task with every
+    // student in the classroom so it shows up on their side. Without this,
+    // `getAssignedAssignments` (which filters on `assignments.studentIds`)
+    // returns nothing for any student.
+    const classroomStudentIds = (classroom.studentIds || []).map((id) =>
+      String(id),
+    );
+
     const task = {
       title,
       description,
       startDate: startDate ? new Date(startDate) : new Date(),
       dueDate: new Date(dueDate),
       maxMarks,
-      studentIds,
+      studentIds: classroomStudentIds,
       resources,
       perFormatCounts,
       perFormatImages,
       maxAiHints,
+      aiHintCooldownSeconds,
       questions: savedQuestions.map((q) => q._id),
       generation,
     };
 
     const assignmentDoc = await Assignment.create({
       classroomId,
-      ...(sessionId ? { sessionId } : {}),
+      ...(derivedSessionId ? { sessionId: derivedSessionId } : {}),
       teacherId,
       assignments: [task],
     });
@@ -1409,7 +1420,7 @@ export const createAssignmentWithAI = async (req, res) => {
         tasks: assignmentDoc.assignments,
         actorId: teacherId,
         classroomId,
-        sessionId,
+        sessionId: derivedSessionId,
         io: req.app?.get("io"),
       });
     } catch (notifyErr) {
@@ -1453,3 +1464,4 @@ export const listLessonsForSession = async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 };
+

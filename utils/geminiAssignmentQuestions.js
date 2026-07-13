@@ -209,12 +209,9 @@ export async function generateAssignmentQuestions({
 
   const systemInstruction = [
     SCHEMA_GUIDANCE,
-    "Standard prompt:",
     standardPrompt,
-    teacherPrompt ? `Teacher's personalized prompt:\n${teacherPrompt}` : "",
-    classroomPrompt
-      ? `Classroom context (tone/level):\n${classroomPrompt}`
-      : "",
+    teacherPrompt,
+    classroomPrompt,
   ]
     .filter(Boolean)
     .join("\n\n");

@@ -19,6 +19,11 @@ import {
   listLessonsForSession,
   updateAssignmentByAdmin,
 } from "../controllers/assignmentController.js";
+import {
+  getAssignmentAiHint,
+  getAssignmentAiReport,
+  getAssignmentAiReportByParent,
+} from "../controllers/assignmentAiController.js";
 import auth_key_header from "../middleware/auth_key_header.js";
 import auth_token from "../middleware/auth_token.js";
 
@@ -47,6 +52,24 @@ router.get(
 // GET /api/assignments/assigned
 router.get("/assigned", getAllAssignedAssignments);
 router.get("/get-All", getAllAssignments);
+
+// AI hints on a student's assignment attempt. Mirrors the classwork
+// aiHintPrompt path — same Gemini util, same schema — but reads the ideal
+// answer from Question.correctAnswer and gates per-student inactivation
+// on maxAiHints + AI-marked correctness.
+router.post("/ai-hint", auth_key_header, auth_token, getAssignmentAiHint);
+router.get(
+  "/ai-report/:subAssignmentId/:studentId",
+  auth_key_header,
+  auth_token,
+  getAssignmentAiReport
+);
+router.get(
+  "/ai-report-by-parent/:assignmentId/:studentId",
+  auth_key_header,
+  auth_token,
+  getAssignmentAiReportByParent
+);
 
 //update the assignment
 

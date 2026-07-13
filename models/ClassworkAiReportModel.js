@@ -1,42 +1,33 @@
 import mongoose from 'mongoose';
-
-// Sub-shape mirrors the Gemini response schema from the admin's
-// StandardPrompt. Keep the field names in lockstep with the prompt so
-// nothing gets silently dropped on save.
-const AdvancedChallengeSchema = new mongoose.Schema(
-  {
-    congratulations: { type: String, default: '' },
-    question: { type: String, default: '' },
-  },
-  { _id: false }
-);
+import {
+  AdvancedChallengeSchema,
+  TrainingHistoryEntrySchema,
+} from './aiReportSchemas.js';
 
 // Each interaction carries its own `_id` — the "interaction_id" the
 // trainingHistory entries pair back to. part1/part2/part3 are stored as
 // string arrays exactly as the prompt schema declares them.
 const InteractionSchema = new mongoose.Schema({
+  previousInteractionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    default: null,
+  },
   questionText: { type: String, default: '' },
   studentAnswer: { type: mongoose.Schema.Types.Mixed },
   hintStream: { type: String, default: '' },
   part1: { type: [String], default: [] },
   part2: { type: [String], default: [] },
   part3: { type: [String], default: [] },
+  standardSolution: { type: String, default: '' },
+  commonMistake: {
+    title: { type: String, default: '' },
+    isCommon: { type: Boolean, default: false },
+    answerLatex: { type: String, default: '' },
+  },
   advancedChallenge: { type: AdvancedChallengeSchema, default: () => ({}) },
   correct: { type: Boolean, default: false },
   timestamp: { type: Date, default: Date.now },
 });
-
-// Running history of part3 advice strings, paired with the interaction they
-// came from. Kept as a flat array of strings alongside the interactionId so
-// reports can show all diagnostic-training suggestions in one place.
-const TrainingHistoryEntrySchema = new mongoose.Schema(
-  {
-    interactionId: { type: mongoose.Schema.Types.ObjectId, required: true },
-    part3: { type: [String], default: [] },
-    timestamp: { type: Date, default: Date.now },
-  },
-  { _id: false }
-);
 
 const ClassworkAiReportSchema = new mongoose.Schema(
   {
