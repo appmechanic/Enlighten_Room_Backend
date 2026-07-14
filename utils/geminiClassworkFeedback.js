@@ -4,7 +4,11 @@ import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
-import { recordAiTokenUsage } from "./aiTokenUsage.js";
+import {
+  recordAiTokenUsage,
+  logAiUsage,
+  recordAiCallLog,
+} from "./aiTokenUsage.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
@@ -12,6 +16,28 @@ const FEEDBACK_THINKING_CONFIG = { thinkingBudget: -1 };
 const DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS = 800;
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
+
+// Attached to the user prompt on the first classwork submission for a
+// question so Gemini computes the canonical solution once; every later
+// call in the class (and every assignment call) gets the "skip" line
+// instead to save output tokens.
+const STANDARD_SOLUTION_COMPUTE_INSTRUCTION =
+  'standardSolution: please return a string of the step-by-step solution of this question. Please use "\\n" to separate multiple lines. Please use Latex form for all math expressions and formulas. Please create a sample writing and rubrics for an essay writing question instead of step-by-step solution.';
+const STANDARD_SOLUTION_SKIP_INSTRUCTION = "standardSolution: Leave it empty";
+
+// Attached until the per-question aiFeedbackCache is finalized (classwork)
+// or omitted entirely (assignment). Once the cache is finalized we tell
+// Gemini to skip mistake analysis on every subsequent call.
+const COMMON_MISTAKE_COMPUTE_INSTRUCTION = [
+  "commonMistake: {",
+  "  properties: {",
+  "    isCommon: Type.BOOLEAN — return true if you predict the first mistake of this solution is very common (more than half of this grade's students would make it).",
+  "    title: Type.STRING — a short title for the mistake.",
+  "    answerLatex: Type.STRING — if the student's answer is a handwriting image, return the LaTeX transcription of the handwriting. Use LaTeX for all math expressions.",
+  "  }",
+  "}",
+].join("\n");
+const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
 
 const CLASSWORK_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
@@ -259,6 +285,8 @@ async function buildGeminiRequest({
   interactionId,
   previousInteractionId,
   cachedContext,
+  computeStandardSolution,
+  computeCommonMistake,
 }) {
   console.log(`[ClassworkFeedback][req=${reqId}] === PROMPT ===`);
   console.log(`[ClassworkFeedback][req=${reqId}] teacherId:`, teacherId || "(missing)");
@@ -297,6 +325,12 @@ async function buildGeminiRequest({
     answerImageSource
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
+    computeStandardSolution
+      ? STANDARD_SOLUTION_COMPUTE_INSTRUCTION
+      : STANDARD_SOLUTION_SKIP_INSTRUCTION,
+    computeCommonMistake
+      ? COMMON_MISTAKE_COMPUTE_INSTRUCTION
+      : COMMON_MISTAKE_SKIP_INSTRUCTION,
   ].filter(Boolean);
 
   const cachedSolution =
@@ -426,12 +460,16 @@ export async function getClassworkAiFeedback({
   questionImage,
   format,
   studentName,
+  studentId,
+  classroomId,
   teacherId,
   maxOutputTokens,
   sessionId,
   interactionId,
   previousInteractionId,
   cachedContext,
+  computeStandardSolution = false,
+  computeCommonMistake = false,
 }) {
   const reqId = newReqId();
   const {
@@ -453,6 +491,8 @@ export async function getClassworkAiFeedback({
     interactionId,
     previousInteractionId,
     cachedContext,
+    computeStandardSolution,
+    computeCommonMistake,
   });
 
   const resolvedMaxOutputTokens =
@@ -486,16 +526,7 @@ export async function getClassworkAiFeedback({
     },
   );
 
-  const cachedTokens = result?.usageMetadata?.cachedContentTokenCount;
-  if (cachedTokens) {
-    console.log(
-      `[ClassworkFeedback][req=${reqId}] Implicit cache hit: ${cachedTokens} tokens reused`,
-    );
-  }
-  console.log(
-    `[ClassworkFeedback][req=${reqId}] Usage metadata:`,
-    result?.usageMetadata || "(none)",
-  );
+  logAiUsage(reqId, result?.usageMetadata, "ClassworkFeedback");
   await recordAiTokenUsage(result?.usageMetadata, {
     sessionId,
     tag: `ClassworkFeedback:${reqId}`,
@@ -511,5 +542,26 @@ export async function getClassworkAiFeedback({
   feedback.standardPromptHash = standardPromptHash;
   feedback.standardPromptText = standardPromptText;
   feedback.teacherPromptText = teacherPromptText;
+
+  // Per-call audit log for the admin panel. Best-effort — errors are
+  // swallowed inside recordAiCallLog so a log write can't break feedback.
+  await recordAiCallLog({
+    reqId,
+    tag: "ClassworkFeedback",
+    model: MODEL,
+    sessionId,
+    classroomId,
+    teacherId,
+    studentId,
+    studentName,
+    questionText,
+    studentAnswer: normalizeAnswerText(answer),
+    aiResponseSummary: responseText,
+    standardPromptSnippet: standardPromptText,
+    standardPromptHash,
+    teacherPromptSnippet: teacherPromptText,
+    usageMetadata: result?.usageMetadata,
+  });
+
   return feedback;
 }

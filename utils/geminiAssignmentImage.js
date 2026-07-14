@@ -2,6 +2,11 @@ import { GoogleGenAI } from "@google/genai";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { s3 } from "./s3.js";
 import { withGeminiRetry } from "./geminiCommon.js";
+import {
+  recordAiTokenUsage,
+  logAiUsage,
+  recordAiCallLog,
+} from "./aiTokenUsage.js";
 
 // Generates a question illustration with Gemini 3 Pro Image (Nano Banana Pro)
 // and uploads it to DigitalOcean Spaces, returning the public URL. Used by the
@@ -117,6 +122,20 @@ export async function generateAssignmentQuestionImage({
         tag: "AssignmentImage",
       },
     );
+
+    logAiUsage(null, result?.usageMetadata, "AssignmentImage");
+    await recordAiTokenUsage(result?.usageMetadata, {
+      sessionId: null,
+      tag: "AssignmentImage",
+    });
+    await recordAiCallLog({
+      tag: "AssignmentImage",
+      model: IMAGE_MODEL,
+      questionText: questionText || "",
+      studentAnswer: `Image generation for course=${course || ""} topic=${topic || ""} format=${format || ""} assignment=${assignmentId || ""} question=${questionId || ""}`,
+      aiResponseSummary: "(image bytes returned)",
+      usageMetadata: result?.usageMetadata,
+    });
 
     const image = extractFirstImage(result);
     if (!image) {

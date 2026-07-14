@@ -9,6 +9,10 @@ import {
   getStandardPrompts,
   upsertStandardPrompts,
 } from "../controllers/standardPromptController.js";
+import {
+  getAiTokenUsage,
+  getAiCallLogs,
+} from "../controllers/aiTokenUsageController.js";
 import auth_admin from "../middleware/auth_admin.js";
 import auth_key_header from "../middleware/auth_key_header.js";
 
@@ -39,6 +43,24 @@ router.put(
   auth_admin,
   auth_key_header,
   upsertStandardPrompts
+);
+
+// Dev-stage token tracking. Returns per-(month, session) totals joined with
+// teacher info for the AI Token Usage admin page.
+router.get(
+  "/ai-token-usage",
+  auth_admin,
+  auth_key_header,
+  getAiTokenUsage
+);
+
+// Per-call audit log for the admin AI Call Logs page. Recent-first with
+// tag/teacher/student/session filters.
+router.get(
+  "/ai-call-logs",
+  auth_admin,
+  auth_key_header,
+  getAiCallLogs
 );
 
 export default router;

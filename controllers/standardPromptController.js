@@ -3,10 +3,12 @@ import StandardPrompt from "../models/standardPromptModel.js";
 
 const GLOBAL_KEY = "global";
 
-// Admin's AI hint prompt is edited as 10 sub-fields in the UI but stored as
+// Admin's AI hint prompt is edited as 11 sub-fields in the UI but stored as
 // both an array (aiHintPromptSections) and a joined string (aiHintPrompt) so
-// older callers reading the joined string keep working.
-const AI_HINT_SECTION_COUNT = 10;
+// older callers reading the joined string keep working. Section 11
+// (commonMistake) was added after the original 10; older docs stored 10
+// sections and are padded automatically by normalizeSections below.
+const AI_HINT_SECTION_COUNT = 11;
 // Class Report prompt mirrors the same pattern with 5 sub-fields.
 const REPORT_SECTION_COUNT = 5;
 const JOIN_SEPARATOR = "\n\n";
@@ -21,8 +23,10 @@ function normalizeSections(input, count) {
 function aiHintSectionsFromDoc(doc) {
   if (
     Array.isArray(doc?.aiHintPromptSections) &&
-    doc.aiHintPromptSections.length === AI_HINT_SECTION_COUNT
+    doc.aiHintPromptSections.length > 0
   ) {
+    // Pad/truncate to current count so a docs with 10 stored sections still
+    // load cleanly after the 11th section was added.
     return normalizeSections(doc.aiHintPromptSections, AI_HINT_SECTION_COUNT);
   }
   // No structured array stored yet — drop the legacy single string into the

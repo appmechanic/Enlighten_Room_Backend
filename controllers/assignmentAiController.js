@@ -151,9 +151,15 @@ export const getAssignmentAiHint = async (req, res) => {
         questionImage: question.image,
         format: question.type,
         studentName,
+        studentId,
+        classroomId: parent.classroomId || null,
         teacherId: parent.teacherId,
         // Question has no maxOutputTokens; util applies its own default.
         sessionId: parent.sessionId,
+        // Assignment path never captures a canonical solution or finalizes
+        // a mistake cache — always tell Gemini to skip both.
+        computeStandardSolution: false,
+        computeCommonMistake: false,
       });
     } catch (aiErr) {
       console.error("[AssignmentAi] Gemini call failed:", aiErr);

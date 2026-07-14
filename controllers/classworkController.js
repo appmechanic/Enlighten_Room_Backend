@@ -6,14 +6,25 @@ import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
 import Classroom from '../models/classroomModel.js';
 import Session from '../models/SessionModel.js';
 import Lesson from '../models/LessonModel.js';
-import { getClassworkAiFeedback, toStringArray } from '../utils/geminiClassworkFeedback.js';
+import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
-import { getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
+import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
+
+// Coerce whatever the AI (or a caller) provides into a string[] so downstream
+// code can always spread it safely. Strings become one-element arrays; falsy
+// values become []; arrays are copied and their entries stringified.
+function toStringArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v ?? ''));
+  }
+  if (value == null || value === '') return [];
+  return [String(value)];
+}
 
 // Default shape returned when the AI is skipped (aiExpired) or fails. Matches
 // the admin StandardPrompt schema: `{ correct, hintStream, part1[], part2[],
@@ -716,10 +727,6 @@ async function generateAndStoreClassReport(lessonDoc) {
   const studentCount = Array.isArray(classroomDoc?.studentIds)
     ? classroomDoc.studentIds.length
     : 0;
-  const previousInteractionId = lessonDoc?.classReport?.interactionId
-    ? String(lessonDoc.classReport.interactionId)
-    : '';
-  const interactionId = new mongoose.Types.ObjectId().toString();
 
   const classReport = await generateClassReportSummary({
     lessonName: lessonDoc.name,
@@ -727,8 +734,6 @@ async function generateAndStoreClassReport(lessonDoc) {
     teacherId,
     studentCount,
     sessionId: lessonDoc.sessionId,
-    interactionId,
-    previousInteractionId,
   });
 
   if (!classReport) {
@@ -1147,7 +1152,7 @@ export const submitAnswer = async (req, res) => {
     if (!question.released) {
       return res.status(403).json({ message: 'This question has not been released yet.' });
     }
-    // const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
+    const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
     // if (answerExpiryState.isExpired) {
     //   return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
     // }
@@ -1226,20 +1231,6 @@ export const submitAnswer = async (req, res) => {
       }
     }
 
-    // If AI failed entirely, don't penalize the student: skip saving the submission
-    // and let the frontend roll back the hint count / cooldown.
-    if (aiFailed) {
-      return res.status(503).json({
-        message: 'AI feedback is temporarily unavailable. Please try again shortly.',
-        aiFailed: true,
-        aiAllowed,
-        aiExpired,
-      });
-    }
-
-    const isCorrect = Boolean(aiResult.correct);
-    const feedback = aiResult.hintStream || '';
-
     if (!question.standardSolution && aiResult.standardSolution) {
       question.standardSolution = String(aiResult.standardSolution).trim();
       question.solutionCapturedAt = new Date();
@@ -1313,6 +1304,20 @@ export const submitAnswer = async (req, res) => {
     }
     question.aiFeedbackCache = aiCache;
 
+    // If AI failed entirely, don't penalize the student: skip saving the submission
+    // and let the frontend roll back the hint count / cooldown.
+    if (aiFailed) {
+      return res.status(503).json({
+        message: 'AI feedback is temporarily unavailable. Please try again shortly.',
+        aiFailed: true,
+        aiAllowed,
+        aiExpired,
+      });
+    }
+
+    const isCorrect = Boolean(aiResult.correct);
+    const feedback = aiResult.hintStream || '';
+
     const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
     if (existingSubmissionIndex !== -1) {
       const submission = question.submitted[existingSubmissionIndex];
@@ -1333,6 +1338,8 @@ export const submitAnswer = async (req, res) => {
         submittedAt: new Date(),
       });
     }
+    await question.save();
+
     // Persist case-c report data: questions, latest answer, latest hint
     // string, full diagnostic-training history. Each interaction is assigned
     // its own ObjectId so the matching `trainingHistory` entry can reference

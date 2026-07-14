@@ -2,7 +2,11 @@ import { GoogleGenAI, Type } from "@google/genai";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
-import { recordAiTokenUsage } from "./aiTokenUsage.js";
+import {
+  recordAiTokenUsage,
+  logAiUsage,
+  recordAiCallLog,
+} from "./aiTokenUsage.js";
 
 // Output-token budget scales with class size so bigger classes have room to
 // cover more per-student difficulties. Capped so we don't blow past a
@@ -256,12 +260,29 @@ export async function generateClassReportSummary({
     }
   );
 
+  logAiUsage(null, result?.usageMetadata, "ClassReportSummary");
   await recordAiTokenUsage(result?.usageMetadata, {
     sessionId,
     tag: "ClassReportSummary",
   });
 
   const text = (result?.text || "").trim();
+
+  // Per-call audit log. No student answer here — it's a class-wide summary —
+  // but the snapshot input and AI text still go into the log for the admin
+  // panel to inspect.
+  await recordAiCallLog({
+    tag: "ClassReportSummary",
+    model: MODEL,
+    sessionId,
+    teacherId,
+    questionText: `Lesson: ${lessonName || ""} (${questions.length} questions, ${totalSubmissions} submissions)`,
+    studentAnswer: snapshot,
+    aiResponseSummary: text,
+    standardPromptSnippet: standardSection,
+    teacherPromptSnippet: teacherSection,
+    usageMetadata: result?.usageMetadata,
+  });
   if (!text) {
     console.warn("[ClassReportSummary] Gemini returned empty text.");
     return null;

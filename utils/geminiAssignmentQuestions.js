@@ -2,6 +2,11 @@ import { GoogleGenAI, Type } from "@google/genai";
 import StandardPrompt from "../models/standardPromptModel.js";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
+import {
+  recordAiTokenUsage,
+  logAiUsage,
+  recordAiCallLog,
+} from "./aiTokenUsage.js";
 
 // Generates the question batch for a Create Assignment AI call. Produces a
 // mixed list covering up to all 4 classwork formats (mcq / fill-blanks /
@@ -247,7 +252,26 @@ export async function generateAssignmentQuestions({
     },
   );
 
+  logAiUsage(null, result?.usageMetadata, "AssignmentQuestions");
+  await recordAiTokenUsage(result?.usageMetadata, {
+    sessionId: null,
+    tag: "AssignmentQuestions",
+  });
+
   const raw = (result?.text || "").trim();
+
+  await recordAiCallLog({
+    tag: "AssignmentQuestions",
+    model: MODEL,
+    teacherId,
+    questionText: `Generate assignment: course=${course || ""} topic=${topic || ""} totalRequested=${totalRequested}`,
+    studentAnswer: userMessage,
+    aiResponseSummary: raw,
+    standardPromptSnippet: standardPrompt,
+    teacherPromptSnippet: teacherPrompt,
+    usageMetadata: result?.usageMetadata,
+  });
+
   const parsed = parseFirstJsonObject(raw, { tag: "AssignmentQuestions" });
   if (!parsed) throw new Error("AI returned an invalid response.");
 
