@@ -205,6 +205,7 @@ export const getAiCallLogs = asyncHandler(async (req, res) => {
     questionText: r.questionText || "",
     studentAnswer: r.studentAnswer || "",
     aiResponseSummary: r.aiResponseSummary || "",
+    userPromptText: r.userPromptText || "",
     standardPromptSnippet: r.standardPromptSnippet || "",
     teacherPromptSnippet: r.teacherPromptSnippet || "",
     standardPromptHash: r.standardPromptHash || "",

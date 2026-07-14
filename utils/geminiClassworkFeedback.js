@@ -383,6 +383,15 @@ async function buildGeminiRequest({
 
   parts.push({ text: promptLines.join("\n") });
 
+  // Full text of the user-side prompt so the admin call log can persist
+  // exactly what was sent (question + cached context + runtime directives).
+  const userPromptText = [
+    cacheLines.length > 0 ? cacheLines.join("\n") : null,
+    promptLines.join("\n"),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
   console.log(
     `[ClassworkFeedback][req=${reqId}] Standard prompt (${standardText.length} chars):\n${standardText || "(none configured)"}`,
   );
@@ -412,6 +421,7 @@ async function buildGeminiRequest({
     standardPromptHash,
     standardPromptText: standardText,
     teacherPromptText: teacherPrompt,
+    userPromptText,
     hasCachedSolution: Boolean(cachedSolution),
   };
 }
@@ -478,6 +488,7 @@ export async function getClassworkAiFeedback({
     standardPromptHash,
     standardPromptText,
     teacherPromptText,
+    userPromptText,
     hasCachedSolution,
   } = await buildGeminiRequest({
     reqId,
@@ -557,6 +568,7 @@ export async function getClassworkAiFeedback({
     questionText,
     studentAnswer: normalizeAnswerText(answer),
     aiResponseSummary: responseText,
+    userPromptText,
     standardPromptSnippet: standardPromptText,
     standardPromptHash,
     teacherPromptSnippet: teacherPromptText,

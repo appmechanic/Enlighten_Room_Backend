@@ -43,13 +43,19 @@ const AiCallLogSchema = new mongoose.Schema(
     },
     studentName: { type: String, default: "" },
 
-    // Question / answer content (truncated).
+    // Question / answer content (truncated in recordAiCallLog).
     questionText: { type: String, default: "" },
     studentAnswer: { type: String, default: "" },
     aiResponseSummary: { type: String, default: "" },
 
-    // First N chars of each prompt for a quick eyeball; the full text is
-    // still in the console logs by reqId.
+    // Full user prompt actually sent to Gemini (question, cached context,
+    // runtime compute/skip directives). Captured so the admin panel can
+    // see the exact bytes on the wire.
+    userPromptText: { type: String, default: "" },
+
+    // Full standard + teacher prompt content sent as systemInstruction.
+    // Field name kept as "Snippet" for schema compatibility with earlier
+    // rows; documents may now hold up to CALL_LOG_PROMPT_MAX chars.
     standardPromptSnippet: { type: String, default: "" },
     teacherPromptSnippet: { type: String, default: "" },
     standardPromptHash: { type: String, default: "" },

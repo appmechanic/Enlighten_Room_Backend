@@ -2,7 +2,13 @@ import mongoose from "mongoose";
 import AiTokenUsage from "../models/AiTokenUsageModel.js";
 import AiCallLog from "../models/AiCallLogModel.js";
 
-const CALL_LOG_MAX_STRING = 4000;
+// Per-field truncation caps for AiCallLog. Prompt-side fields are large
+// (full admin prompt can be ~40k chars) so we give them more room; ordinary
+// content fields stay smaller to keep documents compact.
+const CALL_LOG_MAX_STRING = 8000;
+const CALL_LOG_PROMPT_MAX = 60000;
+const CALL_LOG_RESPONSE_MAX = 20000;
+const CALL_LOG_USER_PROMPT_MAX = 20000;
 
 function truncate(value, max = CALL_LOG_MAX_STRING) {
   if (value == null) return "";
@@ -78,6 +84,7 @@ export async function recordAiCallLog({
   questionText,
   studentAnswer,
   aiResponseSummary,
+  userPromptText,
   standardPromptSnippet,
   standardPromptHash,
   teacherPromptSnippet,
@@ -112,10 +119,11 @@ export async function recordAiCallLog({
       studentName: (studentName || "").slice(0, 200),
       questionText: truncate(questionText),
       studentAnswer: truncate(studentAnswer),
-      aiResponseSummary: truncate(aiResponseSummary),
-      standardPromptSnippet: truncate(standardPromptSnippet, 800),
+      aiResponseSummary: truncate(aiResponseSummary, CALL_LOG_RESPONSE_MAX),
+      userPromptText: truncate(userPromptText, CALL_LOG_USER_PROMPT_MAX),
+      standardPromptSnippet: truncate(standardPromptSnippet, CALL_LOG_PROMPT_MAX),
       standardPromptHash: (standardPromptHash || "").slice(0, 80),
-      teacherPromptSnippet: truncate(teacherPromptSnippet, 800),
+      teacherPromptSnippet: truncate(teacherPromptSnippet, CALL_LOG_PROMPT_MAX),
       promptTokenCount,
       candidatesTokenCount,
       cachedContentTokenCount,

@@ -134,6 +134,7 @@ export async function generateAssignmentQuestionImage({
       questionText: questionText || "",
       studentAnswer: `Image generation for course=${course || ""} topic=${topic || ""} format=${format || ""} assignment=${assignmentId || ""} question=${questionId || ""}`,
       aiResponseSummary: "(image bytes returned)",
+      userPromptText: buildImagePrompt({ questionText, course, topic, format }),
       usageMetadata: result?.usageMetadata,
     });
 

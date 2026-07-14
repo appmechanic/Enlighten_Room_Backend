@@ -279,6 +279,7 @@ export async function generateClassReportSummary({
     questionText: `Lesson: ${lessonName || ""} (${questions.length} questions, ${totalSubmissions} submissions)`,
     studentAnswer: snapshot,
     aiResponseSummary: text,
+    userPromptText: snapshot,
     standardPromptSnippet: standardSection,
     teacherPromptSnippet: teacherSection,
     usageMetadata: result?.usageMetadata,

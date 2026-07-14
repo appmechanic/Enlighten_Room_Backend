@@ -267,6 +267,7 @@ export async function generateAssignmentQuestions({
     questionText: `Generate assignment: course=${course || ""} topic=${topic || ""} totalRequested=${totalRequested}`,
     studentAnswer: userMessage,
     aiResponseSummary: raw,
+    userPromptText: userMessage,
     standardPromptSnippet: standardPrompt,
     teacherPromptSnippet: teacherPrompt,
     usageMetadata: result?.usageMetadata,
