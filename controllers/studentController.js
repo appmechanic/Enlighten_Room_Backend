@@ -141,8 +141,6 @@ export const createStudent = async (req, res) => {
     `;
 
     try {
-      await addSendEmail(email, "Your Enlighten Room Account", html);
-      // ✅ Populate parentId and teacherId
       await user.save();
       const populatedUser = await User.findOne({ _id: user._id })
         .populate("parentId", "firstName lastName email")
@@ -150,9 +148,15 @@ export const createStudent = async (req, res) => {
         .populate("referedBy", "firstName lastName email");
       res.status(201).json({ populatedUser });
 
-      // await student.save();
+      // Fire-and-forget welcome email; failures logged but don't block the response
+      addSendEmail(email, "Your Enlighten Room Account", html).catch((err) =>
+        console.error("Error sending welcome email:", err)
+      );
     } catch (error) {
-      console.error("Error sending email:", error);
+      console.error("createStudent save error:", error);
+      res
+        .status(500)
+        .json({ error: error.message || "Failed to create student" });
     }
   } catch (error) {
     console.log(error);
