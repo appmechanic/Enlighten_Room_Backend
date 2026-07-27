@@ -19,11 +19,15 @@ const MODEL = "gemini-2.5-flash";
 // share. Applies only on the no-precompute path — when the canonical
 // solution already rides in systemInstruction we set thinking to 0.
 const THINKING_BUDGET_RATIO = 0.2;
-// Formats whose answer is open-ended enough that the model still needs to
-// think even when the canonical solution is cached: handwriting images must
-// be transcribed/studied, textbox answers are free-form. For these we keep
-// half the no-cache budget instead of dropping thinking to 0.
-const STUDY_HEAVY_FORMATS = new Set(["handwriting", "textbox"]);
+// When the canonical solution is already cached, the model has the answer and
+// needs (almost) no thinking to write a hint — so thinking drops to 0 to
+// minimize the pre-stream delay before the live hint starts typing. The ONE
+// exception is handwriting: the student's answer is an IMAGE the model must
+// still read/transcribe before it can give feedback, so it keeps a small
+// (capped) budget. Textbox used to be here too, but a cached solution makes
+// even a free-form textbox answer cheap to evaluate, and the extra thinking
+// was the main source of dead air — so it now gets 0 like every other format.
+const IMAGE_STUDY_FORMATS = new Set(["handwriting"]);
 const DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS = 800;
 // Absolute ceiling on the thinking budget. Thinking tokens are produced
 // BEFORE the first visible `hintStream` character, so they are pure
@@ -37,22 +41,18 @@ const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
 
 // Derive the Gemini thinking budget from the resolved output-token budget.
-// No cached solution -> full share. Cached solution -> the model has the
-// canonical answer, so 0 for most formats; but handwriting/textbox answers
-// still need room to study the image/open-ended text, so keep half the share.
-// The result is capped by MAX_THINKING_BUDGET so a huge output budget can't
-// translate into a long pre-stream thinking delay before the hint appears.
+// No cached solution -> full share (the model must derive the answer).
+// Cached solution -> 0 for everything except handwriting, which keeps a small
+// capped budget to read the answer image. The result is capped by
+// MAX_THINKING_BUDGET so a huge output budget can't translate into a long
+// pre-stream thinking delay before the hint appears.
 function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format) {
   const share = Math.round(resolvedMaxOutputTokens * THINKING_BUDGET_RATIO);
-  let budget;
-  if (!hasCachedSolution) {
-    budget = share;
-  } else if (STUDY_HEAVY_FORMATS.has(format)) {
-    budget = Math.round(share / 2);
-  } else {
-    return 0;
+  if (!hasCachedSolution) return Math.min(share, MAX_THINKING_BUDGET);
+  if (IMAGE_STUDY_FORMATS.has(format)) {
+    return Math.min(Math.round(share / 2), MAX_THINKING_BUDGET);
   }
-  return Math.min(budget, MAX_THINKING_BUDGET);
+  return 0;
 }
 
 // Attached to the user prompt on the first classwork submission for a
@@ -77,6 +77,14 @@ const COMMON_MISTAKE_COMPUTE_INSTRUCTION = [
 ].join("\n");
 const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
 
+// `hintStream` is the ONLY field streamed to the student live, yet the
+// standard prompt never defined it — so the model was filling it with just
+// a greeting (≈ part1[0]) and the actually-useful guidance ended up in
+// part2, which the student only sees after the stream finishes. This
+// directive is always attached so the live hint stands on its own.
+const HINT_STREAM_INSTRUCTION =
+  "hintStream: This is the ONLY text the student watches stream live, so it must stand alone as a genuinely useful hint. Write 2-4 complete sentences in the language of the original question that (1) greet the student by first name, (2) briefly acknowledge what they did right, and (3) give the single most important next-step nudge toward the correct method — WITHOUT revealing the final answer. Do NOT put only a greeting here, and do NOT just repeat part1.";
+
 // Property order matters: Gemini emits structured-JSON fields in the
 // order they appear in the schema, so the student-facing text
 // (`hintStream`, `part1`, `part2`) is placed first to unlock incremental
@@ -84,13 +92,42 @@ const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
 // metadata (`commonMistake`, `standardSolution`) has finished.
 function buildClassworkResponseSchema({ includeStandardSolution }) {
   const properties = {
-    hintStream: { type: Type.STRING },
-    part1: { type: Type.ARRAY, items: { type: Type.STRING } },
-    part2: { type: Type.ARRAY, items: { type: Type.STRING } },
-    correct: { type: Type.BOOLEAN },
-    part3: { type: Type.ARRAY, items: { type: Type.STRING } },
+    // Field descriptions are honored by Gemini structured output and are the
+    // strongest signal for what goes where. Without them the model conflated
+    // hintStream with part1 (both became a bare greeting). Keep these in sync
+    // with the standard prompt's section descriptions.
+    hintStream: {
+      type: Type.STRING,
+      description:
+        "The concise live hint the student sees typing in real time. 2-4 complete sentences in the question's language: greet by first name, acknowledge what they did right, and give the single most important next-step nudge toward the correct method WITHOUT revealing the final answer. Must stand alone as a useful hint; never just a greeting and never a copy of part1.",
+    },
+    part1: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description:
+        "Acknowledgment section. The first string greets the student by first name and names the last correct step/milestone they reached before the error.",
+    },
+    part2: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description:
+        "Immediate Next Step Guidance. One string per subtitle in order: '🛑: ' (what NOT to do), '✅: ' (the correct formula/strategy), '🔨: ' (how to apply it), and optionally '🔍: ' (short explanation of the underlying theorem/reason).",
+    },
+    correct: {
+      type: Type.BOOLEAN,
+      description:
+        "true only when the student's answer is complete and correct; otherwise false.",
+    },
+    part3: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description:
+        "Diagnostic training suggestions that strengthen the underlying skill the student is missing, phrased encouragingly.",
+    },
     advancedChallenge: {
       type: Type.OBJECT,
+      description:
+        "Only filled when correct is true: a warm congratulation plus a brand-new question one level more advanced. Leave both fields empty strings when the answer is not yet correct.",
       properties: {
         congratulations: { type: Type.STRING },
         question: { type: Type.STRING },
@@ -376,6 +413,7 @@ async function buildGeminiRequest({
     answerImageSource
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
+    HINT_STREAM_INSTRUCTION,
     computeStandardSolution
       ? STANDARD_SOLUTION_COMPUTE_INSTRUCTION
       : STANDARD_SOLUTION_SKIP_INSTRUCTION,
@@ -383,6 +421,7 @@ async function buildGeminiRequest({
       ? COMMON_MISTAKE_COMPUTE_INSTRUCTION
       : COMMON_MISTAKE_SKIP_INSTRUCTION,
   ].filter(Boolean);
+
 
   // Common mistakes rendered as their own attachment part AFTER the main
   // prompt. Kept out of both systemInstruction and the shared user prompt
