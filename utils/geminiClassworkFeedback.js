@@ -25,6 +25,14 @@ const THINKING_BUDGET_RATIO = 0.2;
 // half the no-cache budget instead of dropping thinking to 0.
 const STUDY_HEAVY_FORMATS = new Set(["handwriting", "textbox"]);
 const DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS = 800;
+// Absolute ceiling on the thinking budget. Thinking tokens are produced
+// BEFORE the first visible `hintStream` character, so they are pure
+// time-to-first-token latency on the streaming path. A teacher can set a
+// large maxOutputTokens (e.g. 70k for long handwriting answers); without
+// this cap the 0.2 share alone would be ~14k thinking tokens => many
+// seconds of dead air before the hint starts typing. 2048 keeps enough
+// room to reason about a single submission while bounding that delay.
+const MAX_THINKING_BUDGET = 2048;
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
 
@@ -32,13 +40,19 @@ const BASE_DELAY_MS = 500;
 // No cached solution -> full share. Cached solution -> the model has the
 // canonical answer, so 0 for most formats; but handwriting/textbox answers
 // still need room to study the image/open-ended text, so keep half the share.
+// The result is capped by MAX_THINKING_BUDGET so a huge output budget can't
+// translate into a long pre-stream thinking delay before the hint appears.
 function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format) {
-  const fullBudget = Math.round(resolvedMaxOutputTokens * THINKING_BUDGET_RATIO);
-  if (!hasCachedSolution) return fullBudget;
-  if (STUDY_HEAVY_FORMATS.has(format)) {
-    return Math.round((resolvedMaxOutputTokens * THINKING_BUDGET_RATIO) / 2);
+  const share = Math.round(resolvedMaxOutputTokens * THINKING_BUDGET_RATIO);
+  let budget;
+  if (!hasCachedSolution) {
+    budget = share;
+  } else if (STUDY_HEAVY_FORMATS.has(format)) {
+    budget = Math.round(share / 2);
+  } else {
+    return 0;
   }
-  return 0;
+  return Math.min(budget, MAX_THINKING_BUDGET);
 }
 
 // Attached to the user prompt on the first classwork submission for a
