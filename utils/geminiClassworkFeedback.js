@@ -85,6 +85,25 @@ const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
 const HINT_STREAM_INSTRUCTION =
   "hintStream: This is the ONLY text the student watches stream live, so it must stand alone as a genuinely useful hint. Write 2-4 complete sentences in the language of the original question that (1) greet the student by first name, (2) briefly acknowledge what they did right, and (3) give the single most important next-step nudge toward the correct method — WITHOUT revealing the final answer. Do NOT put only a greeting here, and do NOT just repeat part1.";
 
+// Ask/Tell pedagogy. The backend passes the 1-based attempt number for this
+// (student, question); odd attempts coach the student to RECALL the method
+// themselves (no formula given), even attempts EXPLAIN it. This alternation
+// is what a plain prompt cannot do on its own — it needs the runtime count.
+const ASK_MODE_INSTRUCTION = [
+  "PEDAGOGY MODE = ASK (this is an odd-numbered attempt).",
+  "Do NOT state the correct formula, operation, rule, or final answer. Instead, guide the student to recall it themselves:",
+  "- hintStream: acknowledge what they did right, then ask 1-2 leading questions that point at the method (e.g. \"Which operation undoes multiplication?\", \"What could you do to BOTH sides to isolate the variable?\"). Encourage them to try again.",
+  "- part2: keep the 🛑/✅/🔨 structure, but phrase ✅ and 🔨 as QUESTIONS or nudges that make the student think — do not name the formula outright.",
+  "Stay warm and encouraging so they feel safe trying again.",
+].join("\n");
+const TELL_MODE_INSTRUCTION = [
+  "PEDAGOGY MODE = TELL (this is an even-numbered attempt).",
+  "The student already had a turn to think, so now teach directly:",
+  "- part2: in ✅ state the correct formula/operation/rule plainly, and in 🔨 show step-by-step HOW to apply it to this problem. Be clear and instructive.",
+  "- hintStream: give the key explanation in plain language so it reads well live.",
+  "You may fully explain the method; still let the student carry out the final calculation themselves rather than only printing the final number.",
+].join("\n");
+
 // Property order matters: Gemini emits structured-JSON fields in the
 // order they appear in the schema, so the student-facing text
 // (`hintStream`, `part1`, `part2`) is placed first to unlock incremental
@@ -344,6 +363,7 @@ async function buildGeminiRequest({
   teacherId,
   interactionId,
   previousInteractionId,
+  submissionNumber,
   cachedContext,
   computeStandardSolution,
   computeCommonMistake,
@@ -395,6 +415,21 @@ async function buildGeminiRequest({
     questionImage && !(questionImageText && questionImageText.trim()),
   );
 
+  // Ask/Tell pedagogy directive, derived from the runtime attempt number.
+  // Odd -> ASK (coach recall), even -> TELL (explain). Skipped entirely when
+  // no valid number was supplied so older callers behave as before. The
+  // "if correct" caveat keeps a correct answer on the normal congratulate +
+  // advancedChallenge path regardless of which mode this attempt is.
+  const attemptNo = Number(submissionNumber);
+  const askTellInstruction =
+    Number.isInteger(attemptNo) && attemptNo > 0
+      ? [
+          `Submission attempt #${attemptNo} for this student on this question.`,
+          attemptNo % 2 === 1 ? ASK_MODE_INSTRUCTION : TELL_MODE_INSTRUCTION,
+          "If the student's answer is fully correct, IGNORE the pedagogy mode above — congratulate them and fill advancedChallenge as usual.",
+        ].join("\n")
+      : null;
+
   const promptLines = [
     interactionId ? `interaction_id: ${interactionId}` : null,
     previousInteractionId
@@ -413,6 +448,7 @@ async function buildGeminiRequest({
     answerImageSource
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
+    askTellInstruction,
     HINT_STREAM_INSTRUCTION,
     computeStandardSolution
       ? STANDARD_SOLUTION_COMPUTE_INSTRUCTION
@@ -564,6 +600,7 @@ export async function getClassworkAiFeedback({
   sessionId,
   interactionId,
   previousInteractionId,
+  submissionNumber,
   cachedContext,
   computeStandardSolution = false,
   computeCommonMistake = false,
@@ -589,6 +626,7 @@ export async function getClassworkAiFeedback({
     teacherId,
     interactionId,
     previousInteractionId,
+    submissionNumber,
     cachedContext,
     computeStandardSolution,
     computeCommonMistake,
@@ -838,6 +876,7 @@ export async function getClassworkAiFeedbackStream({
   sessionId,
   interactionId,
   previousInteractionId,
+  submissionNumber,
   cachedContext,
   computeStandardSolution = false,
   computeCommonMistake = false,
@@ -864,6 +903,7 @@ export async function getClassworkAiFeedbackStream({
     teacherId,
     interactionId,
     previousInteractionId,
+    submissionNumber,
     cachedContext,
     computeStandardSolution,
     computeCommonMistake,

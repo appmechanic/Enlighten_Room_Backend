@@ -1319,9 +1319,17 @@ async function prepareClassworkSubmission(req) {
   })
     .select('interactions._id')
     .lean();
-  const previousInteractionId = Array.isArray(existingReport?.interactions) && existingReport.interactions.length > 0
-    ? existingReport.interactions[existingReport.interactions.length - 1]._id
+  const priorInteractionCount = Array.isArray(existingReport?.interactions)
+    ? existingReport.interactions.length
+    : 0;
+  const previousInteractionId = priorInteractionCount > 0
+    ? existingReport.interactions[priorInteractionCount - 1]._id
     : null;
+  // 1-based attempt number for THIS submission on this (student, question).
+  // Drives the Ask/Tell pedagogy: odd attempts (1,3,5…) ask the student to
+  // recall the method themselves; even attempts (2,4,6…) explain it. Resets
+  // naturally per question because the report is keyed per (room,question,student).
+  const submissionNumber = priorInteractionCount + 1;
   const interactionId = new mongoose.Types.ObjectId();
   const cachedContext = buildCachedContext(question);
 
@@ -1348,6 +1356,7 @@ async function prepareClassworkSubmission(req) {
     isFollowUp,
     previousInteractionId,
     interactionId,
+    submissionNumber,
     cachedContext,
     sessionIdForUsage,
     roomId,
@@ -1625,6 +1634,7 @@ export const submitAnswer = async (req, res) => {
           sessionId: ctx.sessionIdForUsage,
           interactionId: String(ctx.interactionId),
           previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
+          submissionNumber: ctx.submissionNumber,
           cachedContext: ctx.cachedContext,
           computeStandardSolution: !hasPrecomputedSolution,
         });
@@ -1728,6 +1738,7 @@ export const submitAnswerStream = async (req, res) => {
           sessionId: ctx.sessionIdForUsage,
           interactionId: String(ctx.interactionId),
           previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
+          submissionNumber: ctx.submissionNumber,
           cachedContext: ctx.cachedContext,
           computeStandardSolution: !hasPrecomputedSolution,
           onHintDelta: (chunk) => {
