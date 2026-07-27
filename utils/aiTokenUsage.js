@@ -171,21 +171,36 @@ export async function recordAiTokenUsage(
 
   const monthKey = currentMonthKey();
   const sessionObjectId = toObjectId(sessionId);
+  const update = {
+    $inc: {
+      promptTokenCount,
+      candidatesTokenCount,
+      cachedContentTokenCount,
+      totalThoughtTokens,
+    },
+    $setOnInsert: { monthKey, sessionId: sessionObjectId },
+  };
+  const filter = { monthKey, sessionId: sessionObjectId };
   try {
-    await AiTokenUsage.updateOne(
-      { monthKey, sessionId: sessionObjectId },
-      {
-        $inc: {
-          promptTokenCount,
-          candidatesTokenCount,
-          cachedContentTokenCount,
-          totalThoughtTokens,
-        },
-        $setOnInsert: { monthKey, sessionId: sessionObjectId },
-      },
-      { upsert: true },
-    );
+    await AiTokenUsage.updateOne(filter, update, { upsert: true });
   } catch (err) {
+    // Two concurrent submissions for the same (month, session) can both find
+    // no row and both try to insert; one wins, the other gets E11000. The
+    // row now exists, so a second pass is a pure $inc that always succeeds.
+    // (This also self-heals a run that hit the collision before the stale
+    // unique monthKey_1 index was dropped — see scripts/fixAiTokenUsageIndex.js.)
+    if (err && err.code === 11000) {
+      try {
+        await AiTokenUsage.updateOne(filter, update, { upsert: true });
+        return;
+      } catch (retryErr) {
+        console.error(
+          `[${tag}] AI token usage retry failed for ${monthKey} session=${sessionObjectId || "none"}:`,
+          retryErr,
+        );
+        return;
+      }
+    }
     console.error(
       `[${tag}] Failed to persist AI token usage for ${monthKey} session=${sessionObjectId || "none"}:`,
       err,
