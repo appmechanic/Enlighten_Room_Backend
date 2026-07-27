@@ -6,7 +6,14 @@ import ClassworkAiReport from '../models/ClassworkAiReportModel.js';
 import Classroom from '../models/classroomModel.js';
 import Session from '../models/SessionModel.js';
 import Lesson from '../models/LessonModel.js';
-import { getClassworkAiFeedback } from '../utils/geminiClassworkFeedback.js';
+import {
+  getClassworkAiFeedback,
+  getClassworkAiFeedbackStream,
+} from '../utils/geminiClassworkFeedback.js';
+import {
+  precomputeQuestionImageText,
+  precomputeStandardSolution,
+} from '../utils/geminiClassworkPrecompute.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
@@ -518,6 +525,89 @@ async function resolveSessionContext(roomId) {
   }
 }
 
+// Resolve the teacherId for a room by scanning Session.sessionUrl for the
+// room slug and following the classroom pointer. Used by the precompute
+// hook in addQuestion (which needs teacher context to load the teacher's
+// prompt) — separate from the submit-path resolver so it can run without
+// waiting for a Lesson row to exist for staged questions.
+async function resolveTeacherIdForRoom(roomId) {
+  if (!roomId) return null;
+  try {
+    const escapedRoomId = String(roomId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const session = await Session.findOne({
+      sessionUrl: { $regex: escapedRoomId, $options: "i" },
+    })
+      .select("classroomId")
+      .lean();
+    if (!session?.classroomId) return null;
+    const classroom = await Classroom.findById(session.classroomId)
+      .select("teacherId")
+      .lean();
+    return classroom?.teacherId || null;
+  } catch (err) {
+    console.warn("[Classwork] resolveTeacherIdForRoom failed:", err?.message || err);
+    return null;
+  }
+}
+
+// Fires the OCR + standard-solution precomputes in the background so the
+// question-create HTTP response returns immediately. Persists both results
+// on the ClassworkModel doc when they succeed; silent no-op on failure so
+// per-submission feedback stays on its slower fallback path.
+function schedulePrecomputes(newQuestion, { correctAnswer }) {
+  setImmediate(async () => {
+    try {
+      const [sessionId, teacherId] = await Promise.all([
+        resolveSessionIdForRoom(newQuestion.roomId, newQuestion.lessonName || null),
+        resolveTeacherIdForRoom(newQuestion.roomId),
+      ]);
+
+      let questionImageText = "";
+      if (newQuestion.image) {
+        questionImageText = await precomputeQuestionImageText({
+          imageSource: newQuestion.image,
+          sessionId,
+        });
+        if (questionImageText) {
+          await ClassworkModel.updateOne(
+            { _id: newQuestion._id },
+            { $set: { questionImageText } },
+          );
+        }
+      }
+
+      if (!newQuestion.standardSolution) {
+        const solution = await precomputeStandardSolution({
+          questionText: newQuestion.question,
+          questionImageText,
+          imageSource: newQuestion.image,
+          correctAnswer,
+          format: newQuestion.format,
+          teacherId,
+          sessionId,
+          maxOutputTokens: newQuestion.maxOutputTokens,
+        });
+        if (solution) {
+          await ClassworkModel.updateOne(
+            { _id: newQuestion._id },
+            {
+              $set: {
+                standardSolution: solution,
+                solutionCapturedAt: new Date(),
+              },
+            },
+          );
+        }
+      }
+    } catch (err) {
+      console.error(
+        "[Classwork] schedulePrecomputes failed:",
+        err?.message || err,
+      );
+    }
+  });
+}
+
 // Cheap sessionId lookup used only for AI-usage bucketing on the classwork
 // submit path. Prefers the Lesson row (indexed on roomId) because the same
 // room may back multiple sessions historically. Falls back to the sessionUrl
@@ -720,19 +810,28 @@ async function generateAndStoreClassReport(lessonDoc) {
 
   const classroomDoc = lessonDoc.classroomId
     ? await Classroom.findById(lessonDoc.classroomId)
-        .select('teacherId studentIds')
+        .select('teacherId studentIds scope')
         .lean()
     : null;
   const teacherId = classroomDoc?.teacherId || null;
   const studentCount = Array.isArray(classroomDoc?.studentIds)
     ? classroomDoc.studentIds.length
     : 0;
+  // Instruction language is a session-level knob, not a classroom one, so
+  // pull it off the Session doc that owns this lesson.
+  const sessionDoc = lessonDoc.sessionId
+    ? await Session.findById(lessonDoc.sessionId)
+        .select('instructionLanguage')
+        .lean()
+    : null;
 
   const classReport = await generateClassReportSummary({
     lessonName: lessonDoc.name,
     questions: lessonQuestions,
     teacherId,
     studentCount,
+    scope: classroomDoc?.scope || null,
+    instructionLanguage: sessionDoc?.instructionLanguage || 'English',
     sessionId: lessonDoc.sessionId,
   });
 
@@ -1019,7 +1118,13 @@ export const addQuestion = async (req, res) => {
     if (req.file){
       newQuestion.image = req.file.location;
     }
-    newQuestion.save()
+    await newQuestion.save();
+
+    // Fire the OCR + standard-solution precomputes off the response path.
+    // Both write back to this doc when they succeed; per-submission feedback
+    // will read them via aiFeedbackCache/questionImageText.
+    schedulePrecomputes(newQuestion, { correctAnswer: question?.correctAnswer });
+
     const createdAtTime = new Date(newQuestion.createdAt).getTime();
     const expiresAt = Number.isFinite(createdAtTime)
       ? new Date(createdAtTime + (newQuestion.expiryTime * 1000)).toISOString()
@@ -1080,150 +1185,448 @@ export const releaseQuestion = async (req, res) => {
   }
 };
 
+// Resolve teacherId + class size from a roomId by walking Session → Classroom.
+// Both callers below (submitAnswer, submitAnswerStream) need the same lookup.
+async function resolveTeacherAndClassSize({ roomId, teacherId }) {
+  let resolvedTeacherId = teacherId || null;
+  let resolvedClassSize = null;
+  if (!roomId) return { resolvedTeacherId, resolvedClassSize };
+
+  const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  if (!resolvedTeacherId) {
+    try {
+      const session = await Session.findOne({
+        sessionUrl: { $regex: escapedRoomId, $options: 'i' },
+      });
+      if (session?.classroomId) {
+        const classroom = await Classroom.findById(session.classroomId)
+          .select('teacherId studentIds')
+          .lean();
+        resolvedTeacherId = classroom?.teacherId || null;
+        resolvedClassSize = Array.isArray(classroom?.studentIds)
+          ? classroom.studentIds.length
+          : null;
+      }
+    } catch (err) {
+      console.error('[Classwork] Failed to resolve teacherId from roomId:', err);
+    }
+  }
+
+  if (resolvedClassSize == null) {
+    try {
+      const session = await Session.findOne({
+        sessionUrl: { $regex: escapedRoomId, $options: 'i' },
+      }).select('classroomId');
+      if (session?.classroomId) {
+        const classroom = await Classroom.findById(session.classroomId)
+          .select('studentIds')
+          .lean();
+        resolvedClassSize = Array.isArray(classroom?.studentIds)
+          ? classroom.studentIds.length
+          : null;
+      }
+    } catch (err) {
+      console.error('[Classwork] Failed to resolve class size from roomId:', err);
+    }
+  }
+
+  return { resolvedTeacherId, resolvedClassSize };
+}
+
+// Everything both submit paths need before touching the AI, packaged up.
+// Returns either { error: { status, body } } (bail out and respond) or the
+// prepared context that both paths feed into the AI call.
+async function prepareClassworkSubmission(req) {
+  const {
+    id,
+    questionId,
+    studentId,
+    studentName,
+    answer,
+    roomId,
+    aiUsed,
+    teacherId,
+    overrideQuestionText,
+    gradeLevel,
+  } = req.body;
+
+  const requestedGradeLevel = normalizeGradeLevel(gradeLevel);
+  const { resolvedTeacherId, resolvedClassSize } = await resolveTeacherAndClassSize({
+    roomId,
+    teacherId,
+  });
+
+  const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
+  const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
+
+  if (!question) {
+    return {
+      error: {
+        status: 404,
+        body: { message: roomId ? 'Question not found for this room' : 'Question not found' },
+      },
+    };
+  }
+  if (!question.roomId && roomId) question.roomId = roomId;
+
+  if (!question.released) {
+    return {
+      error: {
+        status: 403,
+        body: { message: 'This question has not been released yet.' },
+      },
+    };
+  }
+
+  if (question.format === 'textbox') {
+    const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
+    const answerText = typeof answer === 'string' ? answer : '';
+    if (answerText.length > textboxLimit) {
+      return {
+        error: {
+          status: 400,
+          body: { message: `Answer exceeds ${textboxLimit} character limit.` },
+        },
+      };
+    }
+  }
+
+  // aiExpiryTime on the question is the per-click AI cooldown enforced by
+  // the FE, not a total window since createdAt. The answer-window check
+  // above already gates whether the student can submit at all. So AI runs
+  // whenever aiAllowed is true.
+  const aiAllowed = question.aiAllowed !== false;
+  const aiExpired = !aiAllowed;
+
+  const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
+    roomId: question.roomId || roomId,
+    questionId: question.id || questionId,
+    studentId,
+  });
+
+  // When the student is iterating on an AI-generated follow-up question,
+  // the frontend sends `overrideQuestionText` so AI sees the new question.
+  const questionTextForAi = (typeof overrideQuestionText === 'string' && overrideQuestionText.trim())
+    ? overrideQuestionText.trim()
+    : question.question;
+  const isFollowUp = questionTextForAi !== question.question;
+
+  const existingReport = await ClassworkAiReport.findOne({
+    roomId: question.roomId,
+    questionId: question.id,
+    studentId,
+  })
+    .select('interactions._id')
+    .lean();
+  const previousInteractionId = Array.isArray(existingReport?.interactions) && existingReport.interactions.length > 0
+    ? existingReport.interactions[existingReport.interactions.length - 1]._id
+    : null;
+  const interactionId = new mongoose.Types.ObjectId();
+  const cachedContext = buildCachedContext(question);
+
+  // Resolve the session that owns this room so the AI usage row lands in
+  // the right (month, session) bucket. If no active lesson is found we
+  // fall back to the sessionless monthly bucket.
+  const sessionIdForUsage = await resolveSessionIdForRoom(
+    question.roomId || roomId,
+    question.lessonName,
+  );
+
+  return {
+    question,
+    studentId,
+    studentName,
+    aiUsed,
+    aiAllowed,
+    aiExpired,
+    resolvedTeacherId,
+    resolvedClassSize,
+    requestedGradeLevel,
+    normalizedAnswer,
+    questionTextForAi,
+    isFollowUp,
+    previousInteractionId,
+    interactionId,
+    cachedContext,
+    sessionIdForUsage,
+    roomId,
+    questionId,
+  };
+}
+
+// Everything both submit paths do AFTER the AI has returned: fold the
+// canonical solution back, update the common-mistake bank + threshold
+// state, mutate the submission row, save the question, and upsert the
+// per-student AI report. Kept in one place so the non-stream and stream
+// controllers can't drift apart.
+async function persistClassworkFeedback({ ctx, aiResult }) {
+  const {
+    question,
+    studentId,
+    studentName,
+    aiUsed,
+    aiExpired,
+    resolvedClassSize,
+    requestedGradeLevel,
+    normalizedAnswer,
+    questionTextForAi,
+    previousInteractionId,
+    interactionId,
+  } = ctx;
+
+  if (!question.standardSolution && aiResult.standardSolution) {
+    question.standardSolution = String(aiResult.standardSolution).trim();
+    question.solutionCapturedAt = new Date();
+  }
+
+  const isCorrect = Boolean(aiResult.correct);
+  const feedback = aiResult.hintStream || '';
+
+  const effectiveClassSize = Number(resolvedClassSize) > 0
+    ? Number(resolvedClassSize)
+    : 0;
+  const commonMistakeThreshold = resolveCommonMistakeThreshold({
+    classSize: effectiveClassSize,
+    gradeLevel: requestedGradeLevel,
+  });
+
+  const aiCache = question.aiFeedbackCache || {};
+  aiCache.threshold = commonMistakeThreshold;
+  if (commonMistakeThreshold <= 0) {
+    aiCache.enabled = false;
+  }
+
+  const currentMistakeBank = Array.isArray(question.commonMistakeBank)
+    ? [...question.commonMistakeBank]
+    : [];
+  const rawMistakeTitle = aiResult?.commonMistake?.title || '';
+  const normalizedTitle = normalizeMistakeTitle(rawMistakeTitle);
+  const isCommonMistake = Boolean(aiResult?.commonMistake?.isCommon);
+  if (
+    commonMistakeThreshold > 0 &&
+    !isCorrect &&
+    isCommonMistake &&
+    normalizedTitle
+  ) {
+    const hasTitleAlready = currentMistakeBank.some(
+      (m) => normalizeMistakeTitle(m?.title) === normalizedTitle,
+    );
+    if (!hasTitleAlready) {
+      const answerLatex = String(aiResult?.commonMistake?.answerLatex || '').trim();
+      currentMistakeBank.push({
+        title: String(rawMistakeTitle).trim(),
+        studentId,
+        studentName,
+        studentAnswer: answerLatex || formatSubmittedAnswerText(normalizedAnswer),
+        feedback,
+        answerLatex,
+        interactionId,
+        createdAt: new Date(),
+      });
+    }
+  }
+  question.commonMistakeBank = currentMistakeBank;
+
+  const distinctTitles = new Set(
+    currentMistakeBank
+      .map((m) => normalizeMistakeTitle(m?.title))
+      .filter(Boolean),
+  ).size;
+
+  if (
+    commonMistakeThreshold > 0 &&
+    !aiCache.enabled &&
+    distinctTitles >= commonMistakeThreshold
+  ) {
+    aiCache.enabled = true;
+    aiCache.cachedAt = new Date();
+    aiCache.promptSnapshot = String(aiResult?.standardPromptText || '').trim();
+    aiCache.teacherPromptSnapshot = String(aiResult?.teacherPromptText || '').trim();
+    aiCache.questionSnapshot = question.question || '';
+    aiCache.standardSolution = String(
+      question.standardSolution || aiResult.standardSolution || ''
+    ).trim();
+    aiCache.commonMistakes = currentMistakeBank;
+  }
+  question.aiFeedbackCache = aiCache;
+
+  const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
+  if (existingSubmissionIndex !== -1) {
+    const submission = question.submitted[existingSubmissionIndex];
+    submission.answer = normalizedAnswer;
+    submission.isCorrect = isCorrect;
+    submission.aiUsed = aiUsed;
+    submission.studentName = studentName;
+    submission.feedback = feedback;
+    submission.submittedAt = new Date();
+  } else {
+    question.submitted.push({
+      studentId,
+      studentName,
+      answer: normalizedAnswer,
+      isCorrect,
+      aiUsed,
+      feedback,
+      submittedAt: new Date(),
+    });
+  }
+  await question.save();
+
+  // Persist per-interaction AI report data (questions, answer, hint,
+  // diagnostic training). Each interaction gets its own ObjectId so the
+  // matching `trainingHistory` entry can reference it via `interactionId`.
+  try {
+    const interactionAt = new Date();
+    const part1 = toStringArray(aiResult.part1);
+    const part2 = toStringArray(aiResult.part2);
+    const part3 = toStringArray(aiResult.part3);
+    const interaction = {
+      _id: interactionId,
+      previousInteractionId,
+      questionText: questionTextForAi,
+      studentAnswer: normalizedAnswer,
+      hintStream: aiResult.hintStream || '',
+      part1,
+      part2,
+      part3,
+      standardSolution: aiResult.standardSolution || '',
+      commonMistake: {
+        title: aiResult?.commonMistake?.title || '',
+        isCommon: Boolean(aiResult?.commonMistake?.isCommon),
+        answerLatex: aiResult?.commonMistake?.answerLatex || '',
+      },
+      advancedChallenge: {
+        congratulations: aiResult.advancedChallenge?.congratulations || '',
+        question: aiResult.advancedChallenge?.question || '',
+      },
+      correct: isCorrect,
+      timestamp: interactionAt,
+    };
+
+    const pushOps = { interactions: interaction };
+    if (part3.length > 0) {
+      pushOps.trainingHistory = {
+        interactionId,
+        part3,
+        timestamp: interactionAt,
+      };
+    }
+
+    const reportSet = {
+      studentName: studentName || 'Unknown',
+      lastAnswer: normalizedAnswer,
+      lastHintStream: aiResult.hintStream || '',
+    };
+    if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
+      reportSet.standardPromptHash = aiResult.standardPromptHash;
+    }
+
+    await ClassworkAiReport.findOneAndUpdate(
+      { roomId: question.roomId, questionId: question.id, studentId },
+      {
+        $setOnInsert: {
+          roomId: question.roomId,
+          questionId: question.id,
+          studentId,
+          originalQuestion: question.question,
+        },
+        $set: reportSet,
+        $push: pushOps,
+      },
+      { upsert: true, new: true }
+    );
+  } catch (reportErr) {
+    console.error('[Classwork] Failed to upsert AI report:', reportErr);
+  }
+
+  return {
+    isCorrect,
+    feedback,
+    commonMistakeThreshold,
+    distinctTitles,
+  };
+}
+
+function buildSubmissionResponseBody({ ctx, aiResult, isCorrect, feedback, commonMistakeThreshold, distinctTitles }) {
+  const {
+    question,
+    normalizedAnswer,
+    questionTextForAi,
+    isFollowUp,
+    interactionId,
+    previousInteractionId,
+    aiAllowed,
+    aiExpired,
+  } = ctx;
+  return {
+    message: 'Answer submitted',
+    isCorrect,
+    aiAllowed,
+    aiExpired,
+    debug: {
+      originalQuestion: question.question,
+      questionTextForAi,
+      isFollowUp,
+      studentAnswer: normalizedAnswer,
+      format: question.format,
+      expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
+      interactionId: String(interactionId),
+      previousInteractionId: previousInteractionId ? String(previousInteractionId) : null,
+      commonMistakeThreshold,
+      cachedCommonMistakeCount: distinctTitles,
+      hasCachedSolution: Boolean(question.standardSolution),
+    },
+    // DIAGNOSTIC: student sees hintStream + part1 + part2. Teacher's
+    //             report shows the full part1/part2/part3 per attempt.
+    // MASTERY: student sees advancedChallenge (congratulations + question);
+    //          teacher sees the final answer marked correct.
+    // part3 is intentionally NOT returned to the student — it belongs only
+    // in the teacher report.
+    ai: projectAiForStudent(aiResult),
+    feedback,
+    correctAnswer: question.correctAnswer,
+    data: question.submitted,
+  };
+}
+
 // Submit answer + get AI feedback (single merged endpoint replacing /submit + /ai-hint)
 export const submitAnswer = async (req, res) => {
   try {
-    const {
-      id,
-      questionId,
-      studentId,
-      studentName,
-      answer,
-      roomId,
-      aiUsed,
-      teacherId,
-      overrideQuestionText,
-      gradeLevel,
-    } = req.body;
-
-    const requestedGradeLevel = normalizeGradeLevel(gradeLevel);
-
-    let resolvedTeacherId = teacherId;
-    let resolvedClassSize = null;
-    if (!resolvedTeacherId && roomId) {
-      try {
-        const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-        const session = await Session.findOne({
-            sessionUrl: { $regex: escapedRoomId, $options: "i" }
-        });
-        if (session?.classroomId) {
-          const classroom = await Classroom.findById(session.classroomId)
-            .select("teacherId studentIds")
-            .lean();
-          resolvedTeacherId = classroom?.teacherId || null;
-          resolvedClassSize = Array.isArray(classroom?.studentIds)
-            ? classroom.studentIds.length
-            : null;
-        }
-      } catch (err) {
-        console.error("[Classwork] Failed to resolve teacherId from roomId:", err);
-      }
+    const prepared = await prepareClassworkSubmission(req);
+    if (prepared.error) {
+      return res.status(prepared.error.status).json(prepared.error.body);
     }
-    if (resolvedClassSize == null && roomId) {
-      try {
-        const escapedRoomId = roomId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const session = await Session.findOne({
-          sessionUrl: { $regex: escapedRoomId, $options: "i" },
-        }).select('classroomId');
-        if (session?.classroomId) {
-          const classroom = await Classroom.findById(session.classroomId)
-            .select('studentIds')
-            .lean();
-          resolvedClassSize = Array.isArray(classroom?.studentIds)
-            ? classroom.studentIds.length
-            : null;
-        }
-      } catch (err) {
-        console.error('[Classwork] Failed to resolve class size from roomId:', err);
-      }
-    }
-
-    const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
-    const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
-
-    if (!question) {
-      return res.status(404).json({
-        message: roomId ? 'Question not found for this room' : 'Question not found',
-      });
-    }
-    if (!question.roomId && roomId) question.roomId = roomId;
-
-    if (!question.released) {
-      return res.status(403).json({ message: 'This question has not been released yet.' });
-    }
-    const answerExpiryState = getExpiryState(getQuestionTimerStart(question), getQuestionExpirySeconds(question));
-    // if (answerExpiryState.isExpired) {
-    //   return res.status(403).json({ message: 'Time expired. You can no longer submit an answer for this question.' });
-    // }
-
-    if (question.format === 'textbox') {
-      const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
-      const answerText = typeof answer === 'string' ? answer : '';
-      if (answerText.length > textboxLimit) {
-        return res.status(400).json({ message: `Answer exceeds ${textboxLimit} character limit.` });
-      }
-    }
-
-    // aiExpiryTime on the question is the per-click AI cooldown enforced by the FE,
-    // not a total window since createdAt. The answer-window check above already gates
-    // whether the student can submit at all. So AI runs whenever aiAllowed is true.
-    const aiAllowed = question.aiAllowed !== false;
-    const aiExpired = !aiAllowed;
-
-    const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
-      roomId: question.roomId || roomId,
-      questionId: question.id || questionId,
-      studentId,
-    });
-
-    // When the student is iterating on an AI-generated follow-up question (case b),
-    // the frontend sends `overrideQuestionText` so AI sees the new question, not the original.
-    const questionTextForAi = (typeof overrideQuestionText === 'string' && overrideQuestionText.trim())
-      ? overrideQuestionText.trim()
-      : question.question;
-    const isFollowUp = questionTextForAi !== question.question;
-
-    const existingReport = await ClassworkAiReport.findOne({
-      roomId: question.roomId,
-      questionId: question.id,
-      studentId,
-    })
-      .select('interactions._id')
-      .lean();
-    const previousInteractionId = Array.isArray(existingReport?.interactions) && existingReport.interactions.length > 0
-      ? existingReport.interactions[existingReport.interactions.length - 1]._id
-      : null;
-    const interactionId = new mongoose.Types.ObjectId();
-    const cachedContext = buildCachedContext(question);
+    const ctx = prepared;
 
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
 
-    // Resolve the session that owns this room so the AI usage row lands in
-    // the right (month, session) bucket. If no active lesson is found (e.g.
-    // legacy room without a Lesson row yet), sessionId stays null and the
-    // usage falls into the sessionless monthly bucket.
-    const sessionIdForUsage = await resolveSessionIdForRoom(
-      question.roomId || roomId,
-      question.lessonName,
-    );
-
-    if (!aiExpired) {
+    if (!ctx.aiExpired) {
       try {
+        // Skip the per-call solution compute when we've already precomputed
+        // one at question-create time — buildCachedContext folds it into
+        // the stable systemInstruction prefix.
+        const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
         aiResult = await getClassworkAiFeedback({
-          questionText: questionTextForAi,
-          answer: normalizedAnswer,
-          correctAnswer: isFollowUp ? '' : question.correctAnswer,
-          questionImage: isFollowUp ? null : question.image,
-          format: question.format,
-          studentName,
-          teacherId: resolvedTeacherId,
-          maxOutputTokens: question.maxOutputTokens,
-          sessionId: sessionIdForUsage,
-          interactionId: String(interactionId),
-          previousInteractionId: previousInteractionId ? String(previousInteractionId) : '',
-          cachedContext,
+          questionText: ctx.questionTextForAi,
+          questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
+          answer: ctx.normalizedAnswer,
+          correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+          questionImage: ctx.isFollowUp || ctx.question.questionImageText
+            ? null
+            : ctx.question.image,
+          format: ctx.question.format,
+          studentName: ctx.studentName,
+          studentId: ctx.studentId,
+          classroomId: ctx.question.classroomId || null,
+          teacherId: ctx.resolvedTeacherId,
+          maxOutputTokens: ctx.question.maxOutputTokens,
+          sessionId: ctx.sessionIdForUsage,
+          interactionId: String(ctx.interactionId),
+          previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
+          cachedContext: ctx.cachedContext,
+          computeStandardSolution: !hasPrecomputedSolution,
         });
       } catch (aiErr) {
         console.error('[Classwork] AI feedback failed:', aiErr);
@@ -1231,218 +1634,148 @@ export const submitAnswer = async (req, res) => {
       }
     }
 
-    if (!question.standardSolution && aiResult.standardSolution) {
-      question.standardSolution = String(aiResult.standardSolution).trim();
-      question.solutionCapturedAt = new Date();
-    }
-
-    const effectiveClassSize = Number(resolvedClassSize) > 0
-      ? Number(resolvedClassSize)
-      : Number(question?.submitted?.length || 0);
-    const commonMistakeThreshold = resolveCommonMistakeThreshold({
-      classSize: effectiveClassSize,
-      gradeLevel: requestedGradeLevel,
-    });
-
-    const aiCache = question.aiFeedbackCache || {};
-    aiCache.threshold = commonMistakeThreshold;
-    if (commonMistakeThreshold <= 0) {
-      aiCache.enabled = false;
-    }
-
-    const currentMistakeBank = Array.isArray(question.commonMistakeBank)
-      ? [...question.commonMistakeBank]
-      : [];
-    const rawMistakeTitle = aiResult?.commonMistake?.title || '';
-    const normalizedTitle = normalizeMistakeTitle(rawMistakeTitle);
-    const isCommonMistake = Boolean(aiResult?.commonMistake?.isCommon);
-    if (
-      commonMistakeThreshold > 0 &&
-      !isCorrect &&
-      isCommonMistake &&
-      normalizedTitle
-    ) {
-      const hasTitleAlready = currentMistakeBank.some(
-        (m) => normalizeMistakeTitle(m?.title) === normalizedTitle,
-      );
-      if (!hasTitleAlready) {
-        const answerLatex = String(aiResult?.commonMistake?.answerLatex || '').trim();
-        currentMistakeBank.push({
-          title: String(rawMistakeTitle).trim(),
-          studentId,
-          studentName,
-          studentAnswer: answerLatex || formatSubmittedAnswerText(normalizedAnswer),
-          feedback,
-          answerLatex,
-          interactionId,
-          createdAt: new Date(),
-        });
-      }
-    }
-    question.commonMistakeBank = currentMistakeBank;
-
-    const distinctTitles = new Set(
-      currentMistakeBank
-        .map((m) => normalizeMistakeTitle(m?.title))
-        .filter(Boolean),
-    ).size;
-
-    if (
-      commonMistakeThreshold > 0 &&
-      !aiCache.enabled &&
-      distinctTitles >= commonMistakeThreshold
-    ) {
-      aiCache.enabled = true;
-      aiCache.cachedAt = new Date();
-      aiCache.promptSnapshot = String(aiResult?.standardPromptText || '').trim();
-      aiCache.teacherPromptSnapshot = String(aiResult?.teacherPromptText || '').trim();
-      aiCache.questionSnapshot = question.question || '';
-      aiCache.standardSolution = String(
-        question.standardSolution || aiResult.standardSolution || ''
-      ).trim();
-      aiCache.commonMistakes = currentMistakeBank;
-    }
-    question.aiFeedbackCache = aiCache;
-
-    // If AI failed entirely, don't penalize the student: skip saving the submission
-    // and let the frontend roll back the hint count / cooldown.
     if (aiFailed) {
       return res.status(503).json({
         message: 'AI feedback is temporarily unavailable. Please try again shortly.',
         aiFailed: true,
-        aiAllowed,
-        aiExpired,
+        aiAllowed: ctx.aiAllowed,
+        aiExpired: ctx.aiExpired,
       });
     }
 
-    const isCorrect = Boolean(aiResult.correct);
-    const feedback = aiResult.hintStream || '';
+    const { isCorrect, feedback, commonMistakeThreshold, distinctTitles } =
+      await persistClassworkFeedback({ ctx, aiResult });
 
-    const existingSubmissionIndex = question.submitted.findIndex((s) => s.studentId === studentId);
-    if (existingSubmissionIndex !== -1) {
-      const submission = question.submitted[existingSubmissionIndex];
-      submission.answer = normalizedAnswer;
-      submission.isCorrect = isCorrect;
-      submission.aiUsed = aiUsed;
-      submission.studentName = studentName;
-      submission.feedback = feedback;
-      submission.submittedAt = new Date();
-    } else {
-      question.submitted.push({
-        studentId,
-        studentName,
-        answer: normalizedAnswer,
+    res.status(200).json(
+      buildSubmissionResponseBody({
+        ctx,
+        aiResult,
         isCorrect,
-        aiUsed,
         feedback,
-        submittedAt: new Date(),
-      });
-    }
-    await question.save();
-
-    // Persist case-c report data: questions, latest answer, latest hint
-    // string, full diagnostic-training history. Each interaction is assigned
-    // its own ObjectId so the matching `trainingHistory` entry can reference
-    // it via `interactionId`.
-    try {
-      const interactionAt = new Date();
-      const part1 = toStringArray(aiResult.part1);
-      const part2 = toStringArray(aiResult.part2);
-      const part3 = toStringArray(aiResult.part3);
-      const interaction = {
-        _id: interactionId,
-        previousInteractionId,
-        questionText: questionTextForAi,
-        studentAnswer: normalizedAnswer,
-        hintStream: aiResult.hintStream || '',
-        part1,
-        part2,
-        part3,
-        standardSolution: aiResult.standardSolution || '',
-        commonMistake: {
-          title: aiResult?.commonMistake?.title || '',
-          isCommon: Boolean(aiResult?.commonMistake?.isCommon),
-          answerLatex: aiResult?.commonMistake?.answerLatex || '',
-        },
-        advancedChallenge: {
-          congratulations: aiResult.advancedChallenge?.congratulations || '',
-          question: aiResult.advancedChallenge?.question || '',
-        },
-        correct: isCorrect,
-        timestamp: interactionAt,
-      };
-
-      const pushOps = { interactions: interaction };
-      if (part3.length > 0) {
-        pushOps.trainingHistory = {
-          interactionId,
-          part3,
-          timestamp: interactionAt,
-        };
-      }
-
-      const reportSet = {
-        studentName: studentName || 'Unknown',
-        lastAnswer: normalizedAnswer,
-        lastHintStream: aiResult.hintStream || '',
-      };
-      // Audit-only: record which standard-prompt version Gemini just saw.
-      if (!aiExpired && typeof aiResult.standardPromptHash === 'string') {
-        reportSet.standardPromptHash = aiResult.standardPromptHash;
-      }
-
-      await ClassworkAiReport.findOneAndUpdate(
-        { roomId: question.roomId, questionId: question.id, studentId },
-        {
-          $setOnInsert: {
-            roomId: question.roomId,
-            questionId: question.id,
-            studentId,
-            originalQuestion: question.question,
-          },
-          $set: reportSet,
-          $push: pushOps,
-        },
-        { upsert: true, new: true }
-      );
-    } catch (reportErr) {
-      console.error('[Classwork] Failed to upsert AI report:', reportErr);
-    }
-
-    await question.save();
-
-    res.status(200).json({
-      message: 'Answer submitted',
-      isCorrect,
-      aiAllowed,
-      aiExpired,
-      // Debug echo — surface exactly what the AI saw so we can verify the inputs.
-      debug: {
-        originalQuestion: question.question,
-        questionTextForAi,
-        isFollowUp,
-        studentAnswer: normalizedAnswer,
-        format: question.format,
-        expectedAnswer: isFollowUp ? null : (question.correctAnswer ?? null),
-        interactionId: String(interactionId),
-        previousInteractionId: previousInteractionId ? String(previousInteractionId) : null,
         commonMistakeThreshold,
-        cachedCommonMistakeCount: distinctTitles,
-        hasCachedSolution: Boolean(question.standardSolution),
-      },
-      // DIAGNOSTIC: student sees hintStream + part1 + part2. Teacher's
-      //             report shows the full part1/part2/part3 per attempt.
-      // MASTERY: student sees advancedChallenge (congratulations + question);
-      //          teacher sees the final answer marked correct.
-      // part3 is intentionally NOT returned to the student — it belongs only
-      // in the teacher report.
-      ai: projectAiForStudent(aiResult),
-      feedback,
-      correctAnswer: question.correctAnswer,
-      data: question.submitted,
-    });
+        distinctTitles,
+      }),
+    );
   } catch (err) {
+    console.error('[Classwork] submitAnswer error:', err);
     res.status(500).json({ message: 'Error submitting answer', error: err.message });
+  }
+};
+
+// Small SSE writer. Each event is a single `event:` + `data:` pair
+// terminated by a blank line, per the spec. Keeps the payload one JSON
+// object per event so the client can `JSON.parse(evt.data)` uniformly.
+function writeSseEvent(res, event, data) {
+  if (res.writableEnded) return;
+  try {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
+  } catch (err) {
+    console.error('[Classwork][stream] Failed to write SSE event:', err);
+  }
+}
+
+// Streaming variant of submitAnswer. Emits `hint` events with decoded
+// `hintStream` deltas as Gemini produces them, then a single `done`
+// event whose payload matches the non-stream /submit response body
+// exactly — client renderers stay identical after the stream ends.
+export const submitAnswerStream = async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  // Nginx-style buffers can starve short SSE messages; the header is a
+  // no-op elsewhere and safe to always set.
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  let clientGone = false;
+  req.on('close', () => {
+    clientGone = true;
+  });
+
+  try {
+    const prepared = await prepareClassworkSubmission(req);
+    if (prepared.error) {
+      writeSseEvent(res, 'error', {
+        status: prepared.error.status,
+        ...prepared.error.body,
+      });
+      return res.end();
+    }
+    const ctx = prepared;
+
+    let aiResult = emptyAiFeedback();
+    let aiFailed = false;
+
+    if (!ctx.aiExpired) {
+      try {
+        const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
+        aiResult = await getClassworkAiFeedbackStream({
+          questionText: ctx.questionTextForAi,
+          questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
+          answer: ctx.normalizedAnswer,
+          correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+          questionImage: ctx.isFollowUp || ctx.question.questionImageText
+            ? null
+            : ctx.question.image,
+          format: ctx.question.format,
+          studentName: ctx.studentName,
+          studentId: ctx.studentId,
+          classroomId: ctx.question.classroomId || null,
+          teacherId: ctx.resolvedTeacherId,
+          maxOutputTokens: ctx.question.maxOutputTokens,
+          sessionId: ctx.sessionIdForUsage,
+          interactionId: String(ctx.interactionId),
+          previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
+          cachedContext: ctx.cachedContext,
+          computeStandardSolution: !hasPrecomputedSolution,
+          onHintDelta: (chunk) => {
+            if (clientGone) return;
+            writeSseEvent(res, 'hint', { chunk });
+          },
+        });
+      } catch (aiErr) {
+        console.error('[Classwork][stream] AI feedback failed:', aiErr);
+        aiFailed = true;
+      }
+    }
+
+    if (aiFailed) {
+      writeSseEvent(res, 'error', {
+        status: 503,
+        message: 'AI feedback is temporarily unavailable. Please try again shortly.',
+        aiFailed: true,
+        aiAllowed: ctx.aiAllowed,
+        aiExpired: ctx.aiExpired,
+      });
+      return res.end();
+    }
+
+    const { isCorrect, feedback, commonMistakeThreshold, distinctTitles } =
+      await persistClassworkFeedback({ ctx, aiResult });
+
+    writeSseEvent(
+      res,
+      'done',
+      buildSubmissionResponseBody({
+        ctx,
+        aiResult,
+        isCorrect,
+        feedback,
+        commonMistakeThreshold,
+        distinctTitles,
+      }),
+    );
+    res.end();
+  } catch (err) {
+    console.error('[Classwork][stream] error:', err);
+    writeSseEvent(res, 'error', {
+      status: 500,
+      message: 'Error submitting answer',
+      error: err.message,
+    });
+    if (!res.writableEnded) res.end();
   }
 };
 

@@ -125,6 +125,13 @@ finished. Respect these rules exactly:
 - imagePromptHint: optional 1-line phrase that would help a downstream
   image generator illustrate the question. Leave empty if visualisation
   doesn't add value (e.g. a pure vocabulary item).
+- math: write every math expression as LaTeX so it renders identically on
+  the teacher and student sides. Use inline delimiters \\( ... \\) (or $ ... $)
+  and display delimiters \\[ ... \\] for standalone equations. This applies to
+  questionText, options, correctAnswer, blanks, and any explanation/rubric —
+  emit literal LaTeX commands (\\frac, \\sqrt, \\int, \\alpha, ...) inside the
+  JSON strings; the renderer is MathJax. Prose stays in the question language;
+  only the math itself is LaTeX.
 Return ONLY the JSON object that matches the schema; no prose.
 `.trim();
 

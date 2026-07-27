@@ -1,9 +1,12 @@
+
 import crypto from "crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import fetch from "node-fetch";
-import TeacherAIConfig from "../models/teacherAiConfigModel.js";
-import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
+import {
+  getStandardPromptCached,
+  getTeacherPromptCached,
+} from "./promptCache.js";
 import {
   recordAiTokenUsage,
   logAiUsage,
@@ -12,10 +15,31 @@ import {
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = "gemini-2.5-flash";
-const FEEDBACK_THINKING_CONFIG = { thinkingBudget: -1 };
+// Thinking budget is derived from the resolved output-token budget as a
+// share. Applies only on the no-precompute path — when the canonical
+// solution already rides in systemInstruction we set thinking to 0.
+const THINKING_BUDGET_RATIO = 0.2;
+// Formats whose answer is open-ended enough that the model still needs to
+// think even when the canonical solution is cached: handwriting images must
+// be transcribed/studied, textbox answers are free-form. For these we keep
+// half the no-cache budget instead of dropping thinking to 0.
+const STUDY_HEAVY_FORMATS = new Set(["handwriting", "textbox"]);
 const DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS = 800;
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
+
+// Derive the Gemini thinking budget from the resolved output-token budget.
+// No cached solution -> full share. Cached solution -> the model has the
+// canonical answer, so 0 for most formats; but handwriting/textbox answers
+// still need room to study the image/open-ended text, so keep half the share.
+function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format) {
+  const fullBudget = Math.round(resolvedMaxOutputTokens * THINKING_BUDGET_RATIO);
+  if (!hasCachedSolution) return fullBudget;
+  if (STUDY_HEAVY_FORMATS.has(format)) {
+    return Math.round((resolvedMaxOutputTokens * THINKING_BUDGET_RATIO) / 2);
+  }
+  return 0;
+}
 
 // Attached to the user prompt on the first classwork submission for a
 // question so Gemini computes the canonical solution once; every later
@@ -39,13 +63,17 @@ const COMMON_MISTAKE_COMPUTE_INSTRUCTION = [
 ].join("\n");
 const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
 
-const CLASSWORK_RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    correct: { type: Type.BOOLEAN },
+// Property order matters: Gemini emits structured-JSON fields in the
+// order they appear in the schema, so the student-facing text
+// (`hintStream`, `part1`, `part2`) is placed first to unlock incremental
+// streaming — the client can render the hint before the trailing
+// metadata (`commonMistake`, `standardSolution`) has finished.
+function buildClassworkResponseSchema({ includeStandardSolution }) {
+  const properties = {
     hintStream: { type: Type.STRING },
     part1: { type: Type.ARRAY, items: { type: Type.STRING } },
     part2: { type: Type.ARRAY, items: { type: Type.STRING } },
+    correct: { type: Type.BOOLEAN },
     part3: { type: Type.ARRAY, items: { type: Type.STRING } },
     advancedChallenge: {
       type: Type.OBJECT,
@@ -55,7 +83,6 @@ const CLASSWORK_RESPONSE_SCHEMA = {
       },
       required: ["congratulations", "question"],
     },
-    standardSolution: { type: Type.STRING },
     commonMistake: {
       type: Type.OBJECT,
       properties: {
@@ -65,16 +92,28 @@ const CLASSWORK_RESPONSE_SCHEMA = {
       },
       required: ["isCommon", "title"],
     },
-  },
-  required: [
-    "correct",
-    "hintStream",
-    "part1",
-    "part2",
-    "part3",
-    "advancedChallenge",
-  ],
-};
+  };
+
+  // Only advertise `standardSolution` when the caller actually wants it
+  // computed — when a precompute already rode in on systemInstruction
+  // there's nothing to derive and the field wastes output tokens.
+  if (includeStandardSolution) {
+    properties.standardSolution = { type: Type.STRING };
+  }
+
+  return {
+    type: Type.OBJECT,
+    properties,
+    required: [
+      "hintStream",
+      "part1",
+      "part2",
+      "correct",
+      "part3",
+      "advancedChallenge",
+    ],
+  };
+}
 
 function formatCorrectAnswerForPrompt(value) {
   if (Array.isArray(value)) {
@@ -177,37 +216,6 @@ async function sourceToInlineData(source) {
   };
 }
 
-async function buildTeacherSection(teacherId) {
-  if (!teacherId) return "";
-  try {
-    const config = await TeacherAIConfig.findOne({ user: teacherId })
-      .select("prompt")
-      .lean();
-    const prompt = (config?.prompt || "").trim();
-    return prompt;
-  } catch (err) {
-    console.error("[ClassworkFeedback] Failed to load TeacherAIConfig:", err);
-    return "";
-  }
-}
-
-function hashStandardPrompt(text) {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return "";
-  return crypto.createHash("sha1").update(trimmed).digest("hex");
-}
-
-async function loadStandardPrompt() {
-  try {
-    const doc = await StandardPrompt.findOne({ key: "global" }).lean();
-    const text = (doc?.aiHintPrompt || "").trim();
-    return { text, hash: hashStandardPrompt(text) };
-  } catch (err) {
-    console.error("[ClassworkFeedback] Failed to load StandardPrompt:", err);
-    return { text: "", hash: "" };
-  }
-}
-
 function newReqId() {
   return crypto.randomBytes(3).toString("hex");
 }
@@ -276,6 +284,7 @@ function logGeminiResponse(reqId, rawText, parsed) {
 async function buildGeminiRequest({
   reqId,
   questionText,
+  questionImageText,
   answer,
   correctAnswer,
   questionImage,
@@ -292,11 +301,29 @@ async function buildGeminiRequest({
   console.log(`[ClassworkFeedback][req=${reqId}] teacherId:`, teacherId || "(missing)");
 
   const [{ text: standardText, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
-    loadStandardPrompt(),
-    buildTeacherSection(teacherId),
+    getStandardPromptCached(),
+    getTeacherPromptCached(teacherId),
   ]);
 
-  const systemInstruction = [standardText, teacherPrompt].filter(Boolean).join("\n\n");
+  const cachedSolution =
+    typeof cachedContext?.standardSolution === "string"
+      ? cachedContext.standardSolution.trim()
+      : "";
+  const cachedMistakes = Array.isArray(cachedContext?.commonMistakes)
+    ? cachedContext.commonMistakes
+    : [];
+
+  // Cache-friendly stable prefix: standard prompt + teacher prompt +
+  // precomputed canonical solution. Every submission for this question gets
+  // exactly this systemInstruction, so Gemini's implicit prefix cache can
+  // hit across submissions. Common mistakes are DELIBERATELY excluded —
+  // they change as new mistakes accumulate and would invalidate the cache.
+  const solutionBlock = cachedSolution
+    ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
+    : "";
+  const systemInstruction = [standardText, teacherPrompt, solutionBlock]
+    .filter(Boolean)
+    .join("\n\n");
 
   const normalizedAnswerText = normalizeAnswerText(answer);
   const referenceAnswer = formatCorrectAnswerForPrompt(correctAnswer);
@@ -307,13 +334,23 @@ async function buildGeminiRequest({
       : 0;
   const answerImageSource = getAnswerImageSource(answer);
 
+  // Fold the pre-OCR'd question image transcription into the question text
+  // so per-submission calls don't have to re-attach the raw image. The image
+  // itself is only sent as inlineData when OCR wasn't available.
+  const effectiveQuestionText = questionImageText && questionImageText.trim()
+    ? `${questionText || ""}\n\n[Question image transcription:]\n${questionImageText.trim()}`
+    : questionText || "";
+  const includeRawQuestionImage = Boolean(
+    questionImage && !(questionImageText && questionImageText.trim()),
+  );
+
   const promptLines = [
     interactionId ? `interaction_id: ${interactionId}` : null,
     previousInteractionId
       ? `previous_interaction_id: ${previousInteractionId}`
       : "previous_interaction_id: null",
     studentName ? `Student name: ${studentName}` : null,
-    `Question: ${questionText}`,
+    `Question: ${effectiveQuestionText}`,
     format ? `Answer Format: ${format}` : null,
     referenceAnswer
       ? referenceCount > 1
@@ -321,7 +358,7 @@ async function buildGeminiRequest({
         : `Reference / Correct Answer: ${referenceAnswer}`
       : null,
     `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
-    questionImage ? "A question image is attached." : null,
+    includeRawQuestionImage ? "A question image is attached." : null,
     answerImageSource
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
@@ -333,33 +370,27 @@ async function buildGeminiRequest({
       : COMMON_MISTAKE_SKIP_INSTRUCTION,
   ].filter(Boolean);
 
-  const cachedSolution =
-    typeof cachedContext?.standardSolution === "string"
-      ? cachedContext.standardSolution.trim()
-      : "";
-  const cachedMistakes = Array.isArray(cachedContext?.commonMistakes)
-    ? cachedContext.commonMistakes
-    : [];
-
-  const cacheLines = [];
-  if (cachedSolution) {
-    cacheLines.push(`Cached canonical solution: ${cachedSolution}`);
-  }
+  // Common mistakes rendered as their own attachment part AFTER the main
+  // prompt. Kept out of both systemInstruction and the shared user prompt
+  // so accumulating new mistakes doesn't bust the implicit cache prefix.
+  const mistakeLines = [];
   if (cachedMistakes.length > 0) {
-    cacheLines.push("Cached common mistakes and feedback:");
+    mistakeLines.push(
+      "Reference bank of common mistakes previously seen for this question (use to shape feedback but do NOT copy verbatim):",
+    );
     cachedMistakes.forEach((m, index) => {
       const title = String(m?.title || "").trim() || `Mistake ${index + 1}`;
       const answerText = String(m?.answerLatex || m?.studentAnswer || "").trim();
       const fb = String(m?.feedback || "").trim();
-      cacheLines.push(`${index + 1}. ${title}`);
-      if (answerText) cacheLines.push(`   Student answer: ${answerText}`);
-      if (fb) cacheLines.push(`   Feedback: ${fb}`);
+      mistakeLines.push(`${index + 1}. ${title}`);
+      if (answerText) mistakeLines.push(`   Student answer: ${answerText}`);
+      if (fb) mistakeLines.push(`   Feedback: ${fb}`);
     });
   }
 
   const parts = [];
 
-  if (questionImage) {
+  if (includeRawQuestionImage) {
     const imageData = await sourceToInlineData(questionImage).catch(() => null);
     if (imageData) {
       parts.push({ text: "Question image:" });
@@ -377,17 +408,17 @@ async function buildGeminiRequest({
     }
   }
 
-  if (cacheLines.length > 0) {
-    parts.push({ text: cacheLines.join("\n") });
-  }
-
   parts.push({ text: promptLines.join("\n") });
 
+  if (mistakeLines.length > 0) {
+    parts.push({ text: mistakeLines.join("\n") });
+  }
+
   // Full text of the user-side prompt so the admin call log can persist
-  // exactly what was sent (question + cached context + runtime directives).
+  // exactly what was sent (question + runtime directives + mistake bank).
   const userPromptText = [
-    cacheLines.length > 0 ? cacheLines.join("\n") : null,
     promptLines.join("\n"),
+    mistakeLines.length > 0 ? mistakeLines.join("\n") : null,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -402,12 +433,14 @@ async function buildGeminiRequest({
   );
   console.log(
     `[ClassworkFeedback][req=${reqId}] Question image attached:`,
-    Boolean(questionImage),
+    includeRawQuestionImage,
+    "· OCR text available:",
+    Boolean(questionImageText && questionImageText.trim()),
     "· Answer image attached:",
     Boolean(answerImageSource),
-    "· Cached solution:",
+    "· Cached solution in systemInstruction:",
     Boolean(cachedSolution),
-    "· Cached mistakes:",
+    "· Attached mistakes:",
     cachedMistakes.length,
   );
   console.log(
@@ -465,6 +498,7 @@ function shapeFeedback(parsed, responseText) {
 
 export async function getClassworkAiFeedback({
   questionText,
+  questionImageText,
   answer,
   correctAnswer,
   questionImage,
@@ -493,6 +527,7 @@ export async function getClassworkAiFeedback({
   } = await buildGeminiRequest({
     reqId,
     questionText,
+    questionImageText,
     answer,
     correctAnswer,
     questionImage,
@@ -510,12 +545,24 @@ export async function getClassworkAiFeedback({
     Number(maxOutputTokens) > 0
       ? Number(maxOutputTokens)
       : DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS;
+  // Bind thinking to a fixed share of the output budget (see
+  // THINKING_BUDGET_RATIO / resolveThinkingBudget). When the canonical
+  // solution is cached the model has nothing left to derive, so thinking
+  // drops to 0 — except for handwriting/textbox, which still need room to
+  // study the image or open-ended answer.
+  const thinkingBudget = resolveThinkingBudget(
+    resolvedMaxOutputTokens,
+    hasCachedSolution,
+    format
+  );
 
   const config = {
     systemInstruction,
     responseMimeType: "application/json",
-    responseSchema: CLASSWORK_RESPONSE_SCHEMA,
-    thinkingConfig: hasCachedSolution ? { thinkingBudget: 0 } : FEEDBACK_THINKING_CONFIG,
+    responseSchema: buildClassworkResponseSchema({
+      includeStandardSolution: Boolean(computeStandardSolution),
+    }),
+    thinkingConfig: { thinkingBudget },
     maxOutputTokens: resolvedMaxOutputTokens,
   };
 
@@ -538,10 +585,6 @@ export async function getClassworkAiFeedback({
   );
 
   logAiUsage(reqId, result?.usageMetadata, "ClassworkFeedback");
-  await recordAiTokenUsage(result?.usageMetadata, {
-    sessionId,
-    tag: `ClassworkFeedback:${reqId}`,
-  });
 
   const responseText = result.text || "";
   const parsed = parseFirstJsonObject(responseText, {
@@ -554,25 +597,331 @@ export async function getClassworkAiFeedback({
   feedback.standardPromptText = standardPromptText;
   feedback.teacherPromptText = teacherPromptText;
 
-  // Per-call audit log for the admin panel. Best-effort — errors are
-  // swallowed inside recordAiCallLog so a log write can't break feedback.
-  await recordAiCallLog({
-    reqId,
-    tag: "ClassworkFeedback",
-    model: MODEL,
-    sessionId,
-    classroomId,
-    teacherId,
-    studentId,
-    studentName,
-    questionText,
-    studentAnswer: normalizeAnswerText(answer),
-    aiResponseSummary: responseText,
-    userPromptText,
-    standardPromptSnippet: standardPromptText,
+  // Analytics + audit writes are fire-and-forget: they don't gate the
+  // student's response and their failures must never surface as a 500.
+  // recordAiCallLog already swallows its own errors; the token-usage
+  // path is wrapped defensively in case a Mongo hiccup would otherwise
+  // become an unhandled rejection.
+  setImmediate(() => {
+    recordAiTokenUsage(result?.usageMetadata, {
+      sessionId,
+      tag: `ClassworkFeedback:${reqId}`,
+    }).catch((err) => {
+      console.error(
+        `[ClassworkFeedback][req=${reqId}] deferred token-usage write failed:`,
+        err,
+      );
+    });
+    recordAiCallLog({
+      reqId,
+      tag: "ClassworkFeedback",
+      model: MODEL,
+      sessionId,
+      classroomId,
+      teacherId,
+      studentId,
+      studentName,
+      questionText,
+      studentAnswer: normalizeAnswerText(answer),
+      aiResponseSummary: responseText,
+      userPromptText,
+      standardPromptSnippet: standardPromptText,
+      standardPromptHash,
+      teacherPromptSnippet: teacherPromptText,
+      usageMetadata: result?.usageMetadata,
+    });
+  });
+
+  return feedback;
+}
+
+// Incremental scanner that extracts the value of the first `"hintStream"`
+// string in a growing JSON buffer and emits decoded text via `onDelta`.
+// Handles `\n`, `\"`, `\\`, `\t`, `\r`, and the trivial ASCII escapes;
+// when it sees `\u` it waits for all six characters before decoding so we
+// never emit a half-formed code point.
+// Decoded characters are batched per push(): each Gemini network chunk
+// produces at most ONE onDelta call carrying every character decoded from
+// it, instead of one call per character. This keeps the downstream SSE
+// event count at the stream's natural chunk cadence (a few dozen events
+// per hint) rather than one event per character, with no added latency.
+// The final, fully-parsed `hintStream` from the server-side JSON parse
+// still supersedes whatever we streamed — the client is told to prefer
+// it — so this scanner is best-effort: it exists to hide 3-15s of
+// perceived latency, not to be the authoritative source of the string.
+export function createHintStreamScanner({ onDelta }) {
+  const KEY = '"hintStream"';
+  let buffer = "";
+  let cursor = 0;
+  let state = "SEARCH_KEY"; // SEARCH_KEY -> AWAIT_QUOTE -> IN_STRING -> DONE
+  let escape = false;
+  // Hex digits accumulated after `\u`; null means "not inside a \u escape".
+  // (Must be null-sentinel, not "": an empty string can't distinguish
+  // "just saw \u, expecting digits" from "no escape in progress".)
+  let unicodePending = null;
+  let pending = ""; // decoded chars accumulated during the current push()
+
+  function emit(char) {
+    if (!char) return;
+    pending += char;
+  }
+
+  // Deliver everything decoded during this push() as a single chunk.
+  function flush() {
+    if (!pending) return;
+    const chunk = pending;
+    pending = "";
+    try {
+      onDelta(chunk);
+    } catch (err) {
+      console.error("[HintStreamScanner] onDelta threw:", err);
+    }
+  }
+
+  function scan() {
+    while (cursor < buffer.length && state !== "DONE") {
+        if (state === "SEARCH_KEY") {
+          const keyIdx = buffer.indexOf(KEY, cursor);
+          if (keyIdx === -1) {
+            // Keep the tail so a KEY split across two chunks still matches.
+            cursor = Math.max(buffer.length - KEY.length, cursor);
+            return;
+          }
+          cursor = keyIdx + KEY.length;
+          state = "AWAIT_QUOTE";
+          continue;
+        }
+
+        if (state === "AWAIT_QUOTE") {
+          const ch = buffer[cursor];
+          cursor += 1;
+          if (ch === '"') {
+            state = "IN_STRING";
+          } else if (ch !== ":" && ch !== " " && ch !== "\t" && ch !== "\n") {
+            // Unexpected between the key and its opening quote — bail
+            // out silently rather than mis-emit garbage.
+            state = "DONE";
+            return;
+          }
+          continue;
+        }
+
+        if (state === "IN_STRING") {
+          const ch = buffer[cursor];
+          cursor += 1;
+          if (unicodePending !== null) {
+            unicodePending += ch;
+            if (unicodePending.length === 4) {
+              const code = parseInt(unicodePending, 16);
+              unicodePending = null;
+              if (Number.isFinite(code)) emit(String.fromCharCode(code));
+            }
+            continue;
+          }
+          if (escape) {
+            escape = false;
+            if (ch === "n") emit("\n");
+            else if (ch === "t") emit("\t");
+            else if (ch === "r") emit("\r");
+            else if (ch === "u") unicodePending = "";
+            else if (ch === "\\" || ch === '"' || ch === "/") emit(ch);
+            else emit(ch); // unknown escape — pass through best-effort
+            continue;
+          }
+          if (ch === "\\") {
+            // The next character decides how to decode; if it hasn't
+            // arrived yet we rewind so the next push() re-enters here.
+            if (cursor >= buffer.length) {
+              cursor -= 1;
+              return;
+            }
+            escape = true;
+            continue;
+          }
+          if (ch === '"') {
+            state = "DONE";
+            return;
+          }
+          emit(ch);
+        }
+      }
+  }
+
+  return {
+    push(chunk) {
+      if (typeof chunk !== "string" || chunk.length === 0) return;
+      buffer += chunk;
+      try {
+        scan();
+      } finally {
+        // Emit whatever this chunk decoded, even when scan() bailed
+        // early (split escape, key straddling chunks, string ended).
+        flush();
+      }
+    },
+    isDone() {
+      return state === "DONE";
+    },
+  };
+}
+
+// Streaming twin of getClassworkAiFeedback. Runs the same Gemini call via
+// generateContentStream, forwards decoded `hintStream` characters to
+// `onHintDelta` the moment they arrive, and — once the full stream ends
+// — parses the concatenated JSON exactly the same way the non-stream
+// path does, so persistence + return shape stay identical.
+export async function getClassworkAiFeedbackStream({
+  questionText,
+  questionImageText,
+  answer,
+  correctAnswer,
+  questionImage,
+  format,
+  studentName,
+  studentId,
+  classroomId,
+  teacherId,
+  maxOutputTokens,
+  sessionId,
+  interactionId,
+  previousInteractionId,
+  cachedContext,
+  computeStandardSolution = false,
+  computeCommonMistake = false,
+  onHintDelta,
+}) {
+  const reqId = newReqId();
+  const {
+    systemInstruction,
+    contents,
     standardPromptHash,
-    teacherPromptSnippet: teacherPromptText,
-    usageMetadata: result?.usageMetadata,
+    standardPromptText,
+    teacherPromptText,
+    userPromptText,
+    hasCachedSolution,
+  } = await buildGeminiRequest({
+    reqId,
+    questionText,
+    questionImageText,
+    answer,
+    correctAnswer,
+    questionImage,
+    format,
+    studentName,
+    teacherId,
+    interactionId,
+    previousInteractionId,
+    cachedContext,
+    computeStandardSolution,
+    computeCommonMistake,
+  });
+
+  const resolvedMaxOutputTokens =
+    Number(maxOutputTokens) > 0
+      ? Number(maxOutputTokens)
+      : DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS;
+  const thinkingBudget = resolveThinkingBudget(
+    resolvedMaxOutputTokens,
+    hasCachedSolution,
+    format
+  );
+
+  const config = {
+    systemInstruction,
+    responseMimeType: "application/json",
+    responseSchema: buildClassworkResponseSchema({
+      includeStandardSolution: Boolean(computeStandardSolution),
+    }),
+    thinkingConfig: { thinkingBudget },
+    maxOutputTokens: resolvedMaxOutputTokens,
+  };
+
+  console.log(`[ClassworkFeedback][req=${reqId}][stream] Gemini request:`, {
+    model: MODEL,
+    contents: summarizeContentsForLog(contents),
+    config: {
+      ...config,
+      systemInstruction: `<${systemInstruction.length} chars — see PROMPT block above>`,
+    },
+  });
+
+  const scanner = createHintStreamScanner({
+    onDelta: typeof onHintDelta === "function" ? onHintDelta : () => {},
+  });
+
+  // The SDK's streaming call doesn't return a status code the retry
+  // wrapper knows how to inspect until we start iterating — so we retry
+  // the whole stream-open + drain sequence together. The classwork
+  // budget is small (3 attempts) so failure is quickly visible.
+  let responseText = "";
+  let finalResponse = null;
+
+  const openAndDrain = async () => {
+    responseText = "";
+    finalResponse = null;
+    const stream = await ai.models.generateContentStream({
+      model: MODEL,
+      contents,
+      config,
+    });
+    for await (const chunk of stream) {
+      const piece = chunk?.text ?? "";
+      if (piece) {
+        responseText += piece;
+        scanner.push(piece);
+      }
+      if (chunk?.usageMetadata) finalResponse = chunk;
+    }
+    return finalResponse;
+  };
+
+  const usageBearingChunk = await withGeminiRetry(openAndDrain, {
+    maxAttempts: MAX_ATTEMPTS,
+    baseDelayMs: BASE_DELAY_MS,
+    tag: `ClassworkFeedback:${reqId}:stream`,
+  });
+
+  const usageMetadata = usageBearingChunk?.usageMetadata;
+  logAiUsage(reqId, usageMetadata, "ClassworkFeedback:stream");
+
+  const parsed = parseFirstJsonObject(responseText, {
+    tag: `ClassworkFeedback:${reqId}:stream`,
+  });
+  logGeminiResponse(reqId, responseText, parsed);
+
+  const feedback = shapeFeedback(parsed, responseText);
+  feedback.standardPromptHash = standardPromptHash;
+  feedback.standardPromptText = standardPromptText;
+  feedback.teacherPromptText = teacherPromptText;
+
+  setImmediate(() => {
+    recordAiTokenUsage(usageMetadata, {
+      sessionId,
+      tag: `ClassworkFeedback:${reqId}:stream`,
+    }).catch((err) => {
+      console.error(
+        `[ClassworkFeedback][req=${reqId}][stream] deferred token-usage write failed:`,
+        err,
+      );
+    });
+    recordAiCallLog({
+      reqId,
+      tag: "ClassworkFeedback:stream",
+      model: MODEL,
+      sessionId,
+      classroomId,
+      teacherId,
+      studentId,
+      studentName,
+      questionText,
+      studentAnswer: normalizeAnswerText(answer),
+      aiResponseSummary: responseText,
+      userPromptText,
+      standardPromptSnippet: standardPromptText,
+      standardPromptHash,
+      teacherPromptSnippet: teacherPromptText,
+      usageMetadata,
+    });
   });
 
   return feedback;
