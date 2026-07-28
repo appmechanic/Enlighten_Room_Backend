@@ -45,6 +45,18 @@ const questionSchema = new mongoose.Schema(
     // Per-blank answers for fill-blanks (one string per blank).
     blanks: { type: [String], default: [] },
     correctAnswer: [{ type: String }],
+    // Step-by-step worked solution emitted by the AI at generation time. Shown
+    // to the teacher on the Test page as the "suggested answer" they can edit
+    // before the start date; also usable as reference when hint-grading.
+    solution: { type: String, default: "" },
+    // When the parent assignment is in "individual" mode, this is the student
+    // this question was personalised for. Empty on general (class-wide) or
+    // legacy questions — those apply to every student in the classroom.
+    belongsToStudentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
     // Per-question image URL (DO Spaces) when image generation is on.
     image: { type: String, default: "" },
     // Cap on AI hints copied from the parent assignment task. Enforced by the

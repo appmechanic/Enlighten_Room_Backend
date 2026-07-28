@@ -96,8 +96,12 @@ const QUESTION_RESPONSE_SCHEMA = {
             type: Type.STRING,
             enum: ["easy", "medium", "hard"],
           },
+          // Step-by-step worked solution, in the student's language, with math
+          // in LaTeX. Persisted on the Question doc so the teacher can review
+          // and edit it before the assignment start date.
+          solution: { type: Type.STRING },
         },
-        required: ["format", "questionText", "correctAnswer"],
+        required: ["format", "questionText", "correctAnswer", "solution"],
       },
     },
   },
@@ -125,13 +129,20 @@ finished. Respect these rules exactly:
 - imagePromptHint: optional 1-line phrase that would help a downstream
   image generator illustrate the question. Leave empty if visualisation
   doesn't add value (e.g. a pure vocabulary item).
+- solution: REQUIRED. A step-by-step worked solution the teacher will review
+  before the assignment starts and the grader may reference at hint time. Show
+  the reasoning path a strong student would follow — not just the final
+  answer. Number the steps ("1) …", "2) …") when there are 2+ steps. Keep
+  each step to one or two short sentences. If the format is mcq, explain why
+  the correct option is correct AND why each distractor is wrong. If
+  fill-blanks, walk through what determines each blank in order.
 - math: write every math expression as LaTeX so it renders identically on
   the teacher and student sides. Use inline delimiters \\( ... \\) (or $ ... $)
   and display delimiters \\[ ... \\] for standalone equations. This applies to
-  questionText, options, correctAnswer, blanks, and any explanation/rubric —
-  emit literal LaTeX commands (\\frac, \\sqrt, \\int, \\alpha, ...) inside the
-  JSON strings; the renderer is MathJax. Prose stays in the question language;
-  only the math itself is LaTeX.
+  questionText, options, correctAnswer, blanks, solution, and any
+  explanation/rubric — emit literal LaTeX commands (\\frac, \\sqrt, \\int,
+  \\alpha, ...) inside the JSON strings; the renderer is MathJax. Prose stays
+  in the question language; only the math itself is LaTeX.
 Return ONLY the JSON object that matches the schema; no prose.
 `.trim();
 
@@ -332,7 +343,19 @@ function normalizeQuestion(q, { maxAiHints }) {
     difficulty: ["easy", "medium", "hard"].includes(q?.difficulty)
       ? q.difficulty
       : "medium",
+    solution: String(q?.solution || "").trim(),
   };
 }
+
+// Re-exported so the individual-assignment generator can share the same
+// schema + guidance + normalisation without duplicating them.
+export {
+  QUESTION_RESPONSE_SCHEMA,
+  SCHEMA_GUIDANCE,
+  normalizeQuestion,
+  loadStandardPrompt,
+  loadTeacherAssignmentPrompt,
+  DEFAULT_STANDARD_PROMPT,
+};
 
 export const ASSIGNMENT_QUESTION_MODEL = MODEL;

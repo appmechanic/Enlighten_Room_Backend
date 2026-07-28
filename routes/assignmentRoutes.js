@@ -18,6 +18,7 @@ import {
   getSubAssignmentById,
   listLessonsForSession,
   updateAssignmentByAdmin,
+  updateAssignmentQuestionPreStart,
 } from "../controllers/assignmentController.js";
 import {
   getAssignmentAiHint,
@@ -79,6 +80,16 @@ router.patch(
   auth_token,
   allowTeacherOrAdmin,
   updateAssignmentByAdmin
+);
+
+// Teacher pre-start edit of a single AI-generated question (text /
+// correctAnswer / solution). 409s if the assignment has already started.
+router.patch(
+  "/:assignmentId/task/:taskId/question/:questionId",
+  auth_key_header,
+  auth_token,
+  allowTeacherOrAdmin,
+  updateAssignmentQuestionPreStart
 );
 
 router.put(

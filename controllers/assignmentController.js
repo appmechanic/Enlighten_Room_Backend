@@ -13,6 +13,10 @@ import {
   ASSIGNMENT_QUESTION_MODEL,
 } from "../utils/geminiAssignmentQuestions.js";
 import {
+  generateIndividualAssignmentQuestions,
+  INDIVIDUAL_ASSIGNMENT_QUESTION_MODEL,
+} from "../utils/geminiIndividualAssignmentQuestions.js";
+import {
   generateAssignmentQuestionImage,
   ASSIGNMENT_IMAGE_MODEL,
 } from "../utils/geminiAssignmentImage.js";
@@ -684,16 +688,21 @@ export const getSubAssignmentById = async (req, res) => {
       .select("_id firstName lastName email parentId")
       .populate({ path: "parentId", select: "_id firstName lastName email" });
 
-    // 4️⃣ Manually populate questions
+    // 4️⃣ Manually populate questions. `solution`, `belongsToStudentId`, and
+    // `blanks` are pulled through so the teacher Test-page can render the
+    // per-student view + inline edit affordance.
     const questions = await Question.find({
       _id: { $in: subAssignment.questions },
     }).select(
-      "_id course topic questionText type correctAnswer fineTuningInstructions language options hints answer"
+      "_id course topic questionText type correctAnswer solution belongsToStudentId blanks fineTuningInstructions language options hints answer metadata image maxAiHints aiHintCooldownSeconds assignmentId"
     );
 
-    // 6️⃣ Return the populated sub-assignment
+    // 6️⃣ Return the populated sub-assignment. Include the parent Assignment
+    // doc id so the PATCH-question route (which uses the parent id in its
+    // URL) can be constructed on the client.
     res.status(200).json({
       message: "Sub-assignment retrieved successfully",
+      assignmentId: assignment._id,
       subAssignment: {
         ...subAssignment,
         studentIds: students,
@@ -1162,6 +1171,95 @@ async function buildAggregatedReportForClassroom({ classroomId }) {
   };
 }
 
+// For individual mode: fetch the classwork bank + each selected student's
+// AI-report history for the picked lesson(s). Returns the shape the
+// individual generator expects. Falls back to the classroom-wide aggregate
+// when lessonIds is empty, mirroring buildLessonsReport /
+// buildAggregatedReportForClassroom.
+async function buildIndividualBundle({
+  lessonIds,
+  classroomId,
+  studentIds,
+}) {
+  const normalizedLessonIds = Array.isArray(lessonIds)
+    ? lessonIds.map((id) => String(id)).filter(Boolean)
+    : [];
+
+  let lessons = [];
+  if (normalizedLessonIds.length) {
+    lessons = await Lesson.find({ _id: { $in: normalizedLessonIds } })
+      .select("_id name roomId sessionId")
+      .lean();
+  } else if (classroomId) {
+    const sessions = await Session.find({ classroomId }).select("_id").lean();
+    lessons = (
+      await Promise.all(
+        sessions.map((s) =>
+          Lesson.findOne({ sessionId: s._id })
+            .sort({ startedAt: -1 })
+            .select("_id name roomId sessionId")
+            .lean(),
+        ),
+      )
+    ).filter(Boolean);
+  }
+
+  if (!lessons.length) {
+    return { classworkQuestions: [], perStudentData: [] };
+  }
+  const roomIds = lessons.map((l) => l.roomId).filter(Boolean);
+
+  const stringStudentIds = studentIds.map((id) => String(id));
+  const [classwork, aiReports, users] = await Promise.all([
+    ClassworkModel.find({
+      $or: lessons.map((l) => ({ roomId: l.roomId, lessonName: l.name })),
+    }).lean(),
+    ClassworkAiReport.find({
+      roomId: { $in: roomIds },
+      studentId: { $in: stringStudentIds },
+    }).lean(),
+    User.find({ _id: { $in: stringStudentIds } })
+      .select("_id firstName lastName userName")
+      .lean(),
+  ]);
+
+  const nameById = new Map();
+  users.forEach((u) => {
+    const name = [u.firstName, u.lastName].filter(Boolean).join(" ").trim();
+    nameById.set(String(u._id), name || u.userName || "");
+  });
+
+  const classworkQuestions = classwork.map((q) => ({
+    question: q.question || "",
+    format: q.format || "",
+    correctAnswer: q.correctAnswer,
+    standardSolution: q.standardSolution || "",
+  }));
+
+  const reportsByStudent = new Map();
+  aiReports.forEach((r) => {
+    const key = String(r.studentId);
+    const list = reportsByStudent.get(key) || [];
+    list.push({
+      originalQuestion: r.originalQuestion || "",
+      lastAnswer: r.lastAnswer,
+      interactions: Array.isArray(r.interactions) ? r.interactions : [],
+      trainingHistory: Array.isArray(r.trainingHistory)
+        ? r.trainingHistory
+        : [],
+    });
+    reportsByStudent.set(key, list);
+  });
+
+  const perStudentData = stringStudentIds.map((sid) => ({
+    studentId: sid,
+    studentName: nameById.get(sid) || "",
+    studentReports: reportsByStudent.get(sid) || [],
+  }));
+
+  return { classworkQuestions, perStudentData };
+}
+
 // Map a generated question (gemini shape) onto a Question doc.
 function buildQuestionDoc({
   generated,
@@ -1172,6 +1270,7 @@ function buildQuestionDoc({
   topic,
   maxAiHints,
   aiHintCooldownSeconds,
+  belongsToStudentId = null,
 }) {
   return {
     classroomId,
@@ -1185,6 +1284,8 @@ function buildQuestionDoc({
     blanks: generated.blanks || [],
     correctAnswer: generated.correctAnswer || [],
     hints: generated.hints || [],
+    solution: generated.solution || "",
+    belongsToStudentId,
     answer: [],
     maxAiHints,
     aiHintCooldownSeconds,
@@ -1238,7 +1339,15 @@ export const createAssignmentWithAI = async (req, res) => {
     course,
     topic,
     lessonIds = [],
+    // "general" (default) preserves the historic classroom-wide flow.
+    // "individual" fans out one AI call per selected student.
+    assignmentMode: rawAssignmentMode = "general",
+    // Whitelist of student IDs to personalise for. Required (and non-empty)
+    // when assignmentMode==="individual"; ignored otherwise.
+    individualStudentIds = [],
   } = req.body || {};
+  const assignmentMode =
+    rawAssignmentMode === "individual" ? "individual" : "general";
 
   // Basic guards. Most validation is shape-checking — heavier checks (Mongo
   // ID validity, classroom membership) happen during the Mongoose lookups.
@@ -1286,34 +1395,97 @@ export const createAssignmentWithAI = async (req, res) => {
       ? String(derivedSession._id)
       : undefined;
 
-    const sessionReport = isGlobalScope
-      ? await buildAggregatedReportForClassroom({ classroomId })
-      : await buildLessonsReport({ lessonIds: normalizedLessonIds });
     const classroomPrompt = classroom.classroom_prompt || "";
-
-    // Resolve teacher prompt: explicit body value wins so the panel can let
-    // the teacher tweak it before generating; otherwise fall back to stored
-    // TeacherAIConfig.assignmentPrompt (handled inside the gemini util).
     const useExplicitTeacherPrompt =
-      typeof teacherPromptOverride === "string" && teacherPromptOverride.trim() !== "";
+      typeof teacherPromptOverride === "string" &&
+      teacherPromptOverride.trim() !== "";
 
-    const resolvedTopic =
-      topic || derivedSession?.topic || sessionReport.lessonName || "";
-    const { questions: generatedQuestions, generation } = await generateAssignmentQuestions({
-      sessionReport,
-      perFormatCounts,
-      maxAiHints,
-      course: course || classroom.subject?.name,
-      topic: resolvedTopic,
-      classroomPrompt,
-      // If we have an explicit override, slip it into TeacherAIConfig path
-      // by passing null teacherId and prepending to the prompt manually. The
-      // simpler approach: pass teacherId always so the stored prompt loads,
-      // and if override exists we re-decorate the standard prompt block here.
-      teacherId: useExplicitTeacherPrompt ? null : teacherId,
-    });
-    if (useExplicitTeacherPrompt) {
-      generation.teacherPrompt = teacherPromptOverride.trim();
+    // Individual mode: personalised per-student generation using each
+    // student's classwork AI reports as attachment context. General mode
+    // preserves the historic classroom-wide flow (one shared question set).
+    const isIndividual = assignmentMode === "individual";
+    let generatedQuestions; // flat union for image gen + persistence
+    let generation;
+    let perStudentGeneration = []; // [{ studentId, questions }] for individual only
+    let resolvedTopic;
+
+    if (isIndividual) {
+      const normalizedStudentIds = Array.isArray(individualStudentIds)
+        ? individualStudentIds.map((id) => String(id)).filter(Boolean)
+        : [];
+      if (normalizedStudentIds.length === 0) {
+        return res.status(400).json({
+          error:
+            "individualStudentIds is required (non-empty) when assignmentMode is 'individual'.",
+        });
+      }
+      const classroomStudentIdSet = new Set(
+        (classroom.studentIds || []).map((id) => String(id)),
+      );
+      const invalid = normalizedStudentIds.filter(
+        (id) => !classroomStudentIdSet.has(id),
+      );
+      if (invalid.length) {
+        return res.status(400).json({
+          error: `Some individualStudentIds are not enrolled in this classroom: ${invalid.join(", ")}`,
+        });
+      }
+
+      const { classworkQuestions, perStudentData } = await buildIndividualBundle(
+        {
+          lessonIds: normalizedLessonIds,
+          classroomId,
+          studentIds: normalizedStudentIds,
+        },
+      );
+      resolvedTopic = topic || derivedSession?.topic || "";
+
+      const {
+        perStudent,
+        generation: gen,
+      } = await generateIndividualAssignmentQuestions({
+        classworkQuestions,
+        perFormatCounts,
+        maxAiHints,
+        course: course || classroom.subject?.name,
+        topic: resolvedTopic,
+        classroomPrompt,
+        teacherId: useExplicitTeacherPrompt ? null : teacherId,
+        perStudentData,
+      });
+      if (useExplicitTeacherPrompt) {
+        gen.teacherPrompt = teacherPromptOverride.trim();
+      }
+      generation = gen;
+      perStudentGeneration = perStudent;
+      // Flatten to a single ordered list so we can insertMany + fan out image
+      // generation exactly the same way general mode does.
+      generatedQuestions = perStudent.flatMap((entry) =>
+        (entry.questions || []).map((q) => ({
+          ...q,
+          _belongsToStudentId: entry.studentId,
+        })),
+      );
+    } else {
+      const sessionReport = isGlobalScope
+        ? await buildAggregatedReportForClassroom({ classroomId })
+        : await buildLessonsReport({ lessonIds: normalizedLessonIds });
+      resolvedTopic =
+        topic || derivedSession?.topic || sessionReport.lessonName || "";
+      const { questions, generation: gen } = await generateAssignmentQuestions({
+        sessionReport,
+        perFormatCounts,
+        maxAiHints,
+        course: course || classroom.subject?.name,
+        topic: resolvedTopic,
+        classroomPrompt,
+        teacherId: useExplicitTeacherPrompt ? null : teacherId,
+      });
+      if (useExplicitTeacherPrompt) {
+        gen.teacherPrompt = teacherPromptOverride.trim();
+      }
+      generatedQuestions = questions;
+      generation = gen;
     }
 
     if (!generatedQuestions.length) {
@@ -1334,6 +1506,7 @@ export const createAssignmentWithAI = async (req, res) => {
         topic: resolvedTopic,
         maxAiHints,
         aiHintCooldownSeconds,
+        belongsToStudentId: q._belongsToStudentId || null,
       }),
     );
     const savedQuestions = await Question.insertMany(baseDocs);
@@ -1372,13 +1545,33 @@ export const createAssignmentWithAI = async (req, res) => {
       if (okCount > 0) generation.imageModel = ASSIGNMENT_IMAGE_MODEL;
     }
 
-    // AI-generated assignments are class-wide: seed the task with every
-    // student in the classroom so it shows up on their side. Without this,
-    // `getAssignedAssignments` (which filters on `assignments.studentIds`)
-    // returns nothing for any student.
+    // General assignments seed every student in the classroom. Individual
+    // assignments only seed the whitelisted student subset so unaffected
+    // students don't see an empty homework tab.
     const classroomStudentIds = (classroom.studentIds || []).map((id) =>
       String(id),
     );
+    const taskStudentIds = isIndividual
+      ? individualStudentIds.map((id) => String(id))
+      : classroomStudentIds;
+
+    // For individual mode, map each saved Question doc back to the student
+    // it was generated for using the order-preserving `perStudentGeneration`
+    // fan-out. `savedQuestions` is in the same order as `generatedQuestions`,
+    // which was built by flatMapping `perStudentGeneration` in order.
+    const perStudentQuestions = [];
+    if (isIndividual) {
+      let cursor = 0;
+      perStudentGeneration.forEach((entry) => {
+        const count = (entry.questions || []).length;
+        const slice = savedQuestions.slice(cursor, cursor + count);
+        cursor += count;
+        perStudentQuestions.push({
+          studentId: entry.studentId,
+          questionIds: slice.map((q) => q._id),
+        });
+      });
+    }
 
     const task = {
       title,
@@ -1386,7 +1579,7 @@ export const createAssignmentWithAI = async (req, res) => {
       startDate: startDate ? new Date(startDate) : new Date(),
       dueDate: new Date(dueDate),
       maxMarks,
-      studentIds: classroomStudentIds,
+      studentIds: taskStudentIds,
       resources,
       perFormatCounts,
       perFormatImages,
@@ -1394,6 +1587,8 @@ export const createAssignmentWithAI = async (req, res) => {
       aiHintCooldownSeconds,
       questions: savedQuestions.map((q) => q._id),
       generation,
+      assignmentMode,
+      perStudentQuestions,
     };
 
     const assignmentDoc = await Assignment.create({
@@ -1432,12 +1627,111 @@ export const createAssignmentWithAI = async (req, res) => {
       assignment: assignmentDoc,
       stats: {
         questionsGenerated: savedQuestions.length,
-        questionModel: ASSIGNMENT_QUESTION_MODEL,
+        questionModel: isIndividual
+          ? INDIVIDUAL_ASSIGNMENT_QUESTION_MODEL
+          : ASSIGNMENT_QUESTION_MODEL,
         imageRequested: targetsForImages.length,
+        assignmentMode,
+        individualStudentCount: isIndividual
+          ? perStudentGeneration.length
+          : 0,
+        cachedContentTokenCount: generation.cachedContentTokenCount || 0,
       },
     });
   } catch (err) {
     console.error("createAssignmentWithAI error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// PATCH /api/assignments/:assignmentId/task/:taskId/question/:questionId
+// Teacher-only edit of an AI-generated question's text / correctAnswer /
+// solution BEFORE the assignment's startDate. Once startDate has passed we
+// reject the edit so submissions in progress don't shift under the students.
+export const updateAssignmentQuestionPreStart = async (req, res) => {
+  const { assignmentId, taskId, questionId } = req.params;
+  const { questionText, correctAnswer, solution } = req.body || {};
+
+  if (!assignmentId || !taskId || !questionId) {
+    return res.status(400).json({
+      error: "assignmentId, taskId, and questionId are required.",
+    });
+  }
+
+  try {
+    const assignmentDoc = await Assignment.findById(assignmentId);
+    if (!assignmentDoc) {
+      return res.status(404).json({ error: "Assignment not found." });
+    }
+    // Only the teacher who created the assignment (or an admin) can edit.
+    const role = req.user?.userRole;
+    if (
+      role !== "admin" &&
+      String(assignmentDoc.teacherId) !== String(req.user?._id)
+    ) {
+      return res
+        .status(403)
+        .json({ error: "Only the assignment's teacher can edit questions." });
+    }
+
+    const task = assignmentDoc.assignments.id(taskId);
+    if (!task) {
+      return res.status(404).json({ error: "Sub-assignment not found." });
+    }
+
+    const now = Date.now();
+    const startMs = task.startDate ? new Date(task.startDate).getTime() : now;
+    if (Number.isFinite(startMs) && now >= startMs) {
+      return res.status(409).json({
+        error:
+          "This assignment has already started. Questions can only be edited before the start date.",
+      });
+    }
+
+    // Question must actually belong to this task — guards against a teacher
+    // editing another assignment's question via a swapped URL.
+    const belongs = task.questions.some(
+      (id) => String(id) === String(questionId),
+    );
+    if (!belongs) {
+      return res.status(404).json({
+        error: "Question does not belong to the specified sub-assignment.",
+      });
+    }
+
+    const update = {};
+    if (typeof questionText === "string") {
+      const trimmed = questionText.trim();
+      if (!trimmed) {
+        return res
+          .status(400)
+          .json({ error: "questionText cannot be empty." });
+      }
+      update.questionText = trimmed;
+    }
+    if (Array.isArray(correctAnswer)) {
+      update.correctAnswer = correctAnswer
+        .map((s) => String(s ?? "").trim())
+        .filter(Boolean);
+    }
+    if (typeof solution === "string") {
+      update.solution = solution;
+    }
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: "No editable fields supplied." });
+    }
+
+    const updated = await Question.findByIdAndUpdate(
+      questionId,
+      { $set: update },
+      { new: true },
+    ).lean();
+    if (!updated) {
+      return res.status(404).json({ error: "Question not found." });
+    }
+    return res.json({ ok: true, question: updated });
+  } catch (err) {
+    console.error("updateAssignmentQuestionPreStart error:", err);
     return res.status(500).json({ error: err.message });
   }
 };

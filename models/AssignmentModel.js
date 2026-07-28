@@ -112,6 +112,41 @@ const AssignmentTaskSchema = new mongoose.Schema({
     model: { type: String, default: "" },
     imageModel: { type: String, default: "" },
     generatedAt: { type: Date },
+    // Gemini explicit-cache handle name (e.g. "cachedContents/…") that was
+    // reused across per-student calls in individual mode. Kept for audit /
+    // billing debugging; not used at runtime.
+    cachedContentName: { type: String, default: "" },
+    // Sum of `cachedContentTokenCount` reported by the fan-out calls.
+    cachedContentTokenCount: { type: Number, default: 0 },
+  },
+  // "general" (default) = one question set shared by every student in the
+  // classroom (the historic behaviour). "individual" = per-student personalised
+  // sets driven by each student's own classwork interactions/reports.
+  assignmentMode: {
+    type: String,
+    enum: ["general", "individual"],
+    default: "general",
+  },
+  // For individual mode, the per-student split of `questions[]`. Each entry
+  // lists the question IDs that belong to one student; on read, the student
+  // endpoint filters `questions[]` down to their own subset. Empty on general.
+  perStudentQuestions: {
+    type: [
+      new mongoose.Schema(
+        {
+          studentId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true,
+          },
+          questionIds: [
+            { type: mongoose.Schema.Types.ObjectId, ref: "Question" },
+          ],
+        },
+        { _id: false },
+      ),
+    ],
+    default: [],
   },
   // filePath: {
   //   type: String,
