@@ -85,6 +85,29 @@ const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
 const HINT_STREAM_INSTRUCTION =
   "hintStream: This is the ONLY text the student watches stream live, so it must stand alone as a genuinely useful hint. Write 2-4 complete sentences in the language of the original question that (1) greet the student by first name, (2) briefly acknowledge what they did right, and (3) give the single most important next-step nudge toward the correct method — WITHOUT revealing the final answer. Do NOT put only a greeting here, and do NOT just repeat part1.";
 
+// Judge answers by mathematical value, NOT string form. Students routinely
+// write `sin4x` for `sin(4x)`, `1/x^3` for `x^-3`, `\frac{1}{2}` for `1/2`,
+// etc. Without this directive Gemini has been flagging these as wrong even
+// when the underlying expression matches the reference answer. Always
+// attached to every classwork + assignment judgment call.
+const MATH_EQUIVALENCE_INSTRUCTION = [
+  "MATHEMATICAL EQUIVALENCE — CRITICAL:",
+  "When deciding if the student's answer matches the reference answer, judge by MATHEMATICAL VALUE, not string form. Two expressions that simplify to the same thing are the SAME answer, regardless of notation. Do NOT mark an answer wrong for a notation/format difference alone.",
+  "Treat ALL of the following as equivalent:",
+  "- Implicit parentheses around single-term function arguments: sin4x = sin(4x) = \\sin(4x) = \\sin 4x; cos2x = cos(2x); tan(x/2) = tan x/2; log5x = log(5x); ln2x = ln(2x); sqrt2x = sqrt(2x) = \\sqrt{2x}.",
+  "- Implicit multiplication: 2x = 2*x = 2·x = 2 \\cdot x; 3cos(x) = 3*cos(x) = 3 cos(x); (2)(3) = 2·3 = 6.",
+  "- LaTeX vs plain text: \\sin, \\cos, \\tan, \\log, \\ln, \\sqrt, \\pi, \\theta, \\alpha, \\infty are the same as sin, cos, tan, log, ln, sqrt, pi, theta, alpha, infinity/∞.",
+  "- Fractions: \\frac{a}{b} = a/b = (a)/(b) = a÷b; \\dfrac and \\tfrac behave the same as \\frac.",
+  "- Exponents & roots: x^-3 = x^{-3} = 1/x^3 = 1/(x^3) = \\frac{1}{x^3}; x^(1/2) = x^{1/2} = sqrt(x) = \\sqrt{x}; x^2 = x*x = x·x.",
+  "- Negative / reciprocal forms: -2x^-3 = -2/x^3 = -\\frac{2}{x^3}.",
+  "- Coefficient placement: (3/2)cos(x) = 3/2 · cos(x) = 1.5cos(x) = \\frac{3}{2}\\cos(x) = \\frac{3\\cos(x)}{2}.",
+  "- Order of commutative terms: a+b = b+a; a·b = b·a; sums/products can be reordered.",
+  "- Equivalent constants: 0.5 = 1/2 = \\frac{1}{2}; π ≈ 3.14159 (any exact symbolic form counts).",
+  "- Whitespace, capitalization of function names (SIN vs sin), and stray surrounding parentheses do not change the answer.",
+  "- Trigonometric / algebraic identities that produce the SAME simplified form (e.g. 2sin(x)cos(x) = sin(2x)).",
+  "ONLY mark the answer incorrect when the expressions evaluate to different mathematical values. If you are unsure whether two forms are equivalent, mentally substitute a sample value (e.g. x=1, x=2) into both — if they agree for every value in the domain, they are equivalent.",
+].join("\n");
+
 // Ask/Tell pedagogy. The backend passes the 1-based attempt number for this
 // (student, question); odd attempts coach the student to RECALL the method
 // themselves (no formula given), even attempts EXPLAIN it. This alternation
@@ -449,6 +472,7 @@ async function buildGeminiRequest({
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
     askTellInstruction,
+    MATH_EQUIVALENCE_INSTRUCTION,
     HINT_STREAM_INSTRUCTION,
     computeStandardSolution
       ? STANDARD_SOLUTION_COMPUTE_INSTRUCTION
