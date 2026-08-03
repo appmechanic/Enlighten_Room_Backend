@@ -54,6 +54,16 @@ const StandardPromptSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    // Gemini model IDs used by every AI call site. `default` covers all text
+    // generation (classwork feedback, precompute, class report, assignment
+    // generation, whiteboard). `fallback` is used by classwork feedback when
+    // the default model returns an overload error. `image` is a different
+    // modality (text-to-image) and needs its own slot.
+    models: {
+      default: { type: String, trim: true, default: "gemini-2.5-flash" },
+      fallback: { type: String, trim: true, default: "gemini-2.5-flash-lite" },
+      image: { type: String, trim: true, default: "gemini-3-pro-image-preview" },
+    },
     updatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

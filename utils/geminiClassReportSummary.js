@@ -7,6 +7,7 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
+import { getAiModel } from "./aiModels.js";
 
 // Output-token budget scales with class size so bigger classes have room to
 // cover more per-student difficulties. Capped so we don't blow past a
@@ -14,6 +15,13 @@ import {
 const REPORT_BASE_MAX_OUTPUT_TOKENS = 2000;
 const REPORT_PER_STUDENT_MAX_OUTPUT_TOKENS = 25;
 const REPORT_MAX_OUTPUT_TOKENS_CAP = 4000;
+// Bounded thinking budget. The class report is pattern-matching over a
+// serialized snapshot (who got what wrong on which question), not deep
+// symbolic reasoning — an unlimited budget (thinkingBudget: -1) has been
+// observed to add many seconds of pre-response delay for no measurable
+// quality win. 1024 leaves room to group difficulties across students
+// while capping the visible wait teachers see after end-lesson.
+const REPORT_THINKING_BUDGET = 1024;
 
 function reportMaxOutputTokens(studentCount) {
   const n = Number(studentCount) > 0 ? Number(studentCount) : 0;
@@ -33,7 +41,9 @@ function reportMaxOutputTokens(studentCount) {
 // students' submitted answers are passed in as the user content.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-2.5-flash";
+// Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
+// 60s in-memory cache). Captured into a local const at the top of
+// generateClassReportSummary so downstream closures see a stable value.
 
 // Generation is now run in the background after the end-lesson HTTP response
 // has been sent, so we can ride out long Gemini demand spikes instead of
@@ -103,9 +113,16 @@ async function buildStandardSection() {
   }
 }
 
-// Gemini structured-output schema mirroring the Mongoose classReport subdoc.
-// Forces the model to return valid JSON in the exact shape we persist.
-const CLASS_REPORT_RESPONSE_SCHEMA = {
+// The report is generated as TWO parallel Gemini calls whose outputs are
+// merged: (A) studentDifficulties (per-student pattern-matching over the
+// snapshot) and (B) nextLessonStrategy + targetedHomework (planning derived
+// from those difficulties). Splitting halves the per-call output-token
+// budget, lets both calls run concurrently, and — because each call gets a
+// narrower responseSchema — Gemini spends thinking tokens on the section it
+// actually has to fill, cutting end-to-end latency roughly in half compared
+// to one big triple-field call. Each call keeps its own subset of the
+// admin-authored shape so structured-output enforcement stays strict.
+const DIFFICULTIES_ONLY_SCHEMA = {
   type: Type.OBJECT,
   properties: {
     studentDifficulties: {
@@ -122,6 +139,13 @@ const CLASS_REPORT_RESPONSE_SCHEMA = {
         required: ["difficulty", "affectedStudents"],
       },
     },
+  },
+  required: ["studentDifficulties"],
+};
+
+const STRATEGIES_ONLY_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
     nextLessonStrategy: {
       type: Type.ARRAY,
       items: {
@@ -145,8 +169,17 @@ const CLASS_REPORT_RESPONSE_SCHEMA = {
       },
     },
   },
-  required: ["studentDifficulties", "nextLessonStrategy", "targetedHomework"],
+  required: ["nextLessonStrategy", "targetedHomework"],
 };
+
+// Prompt suffixes appended to the snapshot per call to tell Gemini which
+// section it's answering. The systemInstruction still carries the admin's
+// full 3-section guidance so tone and structure are preserved; these
+// suffixes just narrow the current call's focus.
+const DIFFICULTIES_DIRECTIVE =
+  "For this call, produce ONLY the studentDifficulties section — a list of the specific difficulties students had and which students were affected. Do NOT include nextLessonStrategy or targetedHomework.";
+const STRATEGIES_DIRECTIVE =
+  "For this call, produce ONLY the nextLessonStrategy and targetedHomework sections — pedagogical strategies for the next lesson and targeted homework suggestions. Do NOT include studentDifficulties. If you need difficulty context, infer common difficulties from the snapshot yourself.";
 
 // Compact the lesson's classwork + submissions into a textual snapshot the
 // model can summarize. Per-student answers are listed under each question so
@@ -200,9 +233,10 @@ export async function generateClassReportSummary({
     return null;
   }
 
-  const [standardSection, teacherSection] = await Promise.all([
+  const [standardSection, teacherSection, MODEL] = await Promise.all([
     buildStandardSection(),
     buildTeacherSection(teacherId),
+    getAiModel(),
   ]);
 
   console.log(
@@ -230,73 +264,148 @@ export async function generateClassReportSummary({
   });
 
   const maxOutputTokens = reportMaxOutputTokens(studentCount);
+  // Difficulties is the section whose length grows with class size
+  // (one bullet per distinct difficulty × affectedStudents list). Strategies
+  // + homework are effectively fixed-shape planning bullets and don't need
+  // to scale with student count.
+  const difficultiesMaxTokens = maxOutputTokens;
+  const strategiesMaxTokens = Math.min(1400, REPORT_MAX_OUTPUT_TOKENS_CAP);
   console.log(
-    `[ClassReportSummary] studentCount=${studentCount ?? "?"} → maxOutputTokens=${maxOutputTokens}`,
+    `[ClassReportSummary] studentCount=${studentCount ?? "?"} → difficulties=${difficultiesMaxTokens}, strategies=${strategiesMaxTokens}`,
   );
 
-  const result = await withGeminiRetry(
-    () =>
-      ai.models.generateContent({
-        model: MODEL,
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: snapshot }],
+  const callGemini = ({ tag, schema, directive, maxOutputTokensForCall }) =>
+    withGeminiRetry(
+      () =>
+        ai.models.generateContent({
+          model: MODEL,
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `${snapshot}\n\n${directive}` }],
+            },
+          ],
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: schema,
+            thinkingConfig: { thinkingBudget: REPORT_THINKING_BUDGET },
+            maxOutputTokens: maxOutputTokensForCall,
           },
-        ],
-        config: {
-          systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: CLASS_REPORT_RESPONSE_SCHEMA,
-          thinkingConfig: { thinkingBudget: -1 },
-          maxOutputTokens,
-        },
-      }),
-    {
-      maxAttempts: MAX_ATTEMPTS,
-      baseDelayMs: BASE_DELAY_MS,
-      maxDelayMs: MAX_DELAY_MS,
-      tag: "ClassReportSummary",
-    }
-  );
+        }),
+      {
+        maxAttempts: MAX_ATTEMPTS,
+        baseDelayMs: BASE_DELAY_MS,
+        maxDelayMs: MAX_DELAY_MS,
+        tag,
+      },
+    );
 
-  logAiUsage(null, result?.usageMetadata, "ClassReportSummary");
-  await recordAiTokenUsage(result?.usageMetadata, {
-    sessionId,
-    tag: "ClassReportSummary",
-  });
+  // Run both calls concurrently. allSettled so a single-call failure still
+  // returns a partial (but useful) report instead of nothing.
+  const [difficultiesSettled, strategiesSettled] = await Promise.allSettled([
+    callGemini({
+      tag: "ClassReportSummary:difficulties",
+      schema: DIFFICULTIES_ONLY_SCHEMA,
+      directive: DIFFICULTIES_DIRECTIVE,
+      maxOutputTokensForCall: difficultiesMaxTokens,
+    }),
+    callGemini({
+      tag: "ClassReportSummary:strategies",
+      schema: STRATEGIES_ONLY_SCHEMA,
+      directive: STRATEGIES_DIRECTIVE,
+      maxOutputTokensForCall: strategiesMaxTokens,
+    }),
+  ]);
 
-  const text = (result?.text || "").trim();
-
-  // Per-call audit log. No student answer here — it's a class-wide summary —
-  // but the snapshot input and AI text still go into the log for the admin
-  // panel to inspect.
-  await recordAiCallLog({
-    tag: "ClassReportSummary",
-    model: MODEL,
-    sessionId,
-    teacherId,
-    questionText: `Lesson: ${lessonName || ""} (${questions.length} questions, ${totalSubmissions} submissions)`,
-    studentAnswer: snapshot,
-    aiResponseSummary: text,
-    userPromptText: snapshot,
-    standardPromptSnippet: standardSection,
-    teacherPromptSnippet: teacherSection,
-    usageMetadata: result?.usageMetadata,
-  });
-  if (!text) {
-    console.warn("[ClassReportSummary] Gemini returned empty text.");
-    return null;
+  if (difficultiesSettled.status === "rejected") {
+    console.error(
+      "[ClassReportSummary] difficulties call failed:",
+      difficultiesSettled.reason?.message || difficultiesSettled.reason,
+    );
   }
+  if (strategiesSettled.status === "rejected") {
+    console.error(
+      "[ClassReportSummary] strategies call failed:",
+      strategiesSettled.reason?.message || strategiesSettled.reason,
+    );
+  }
+
+  const difficultiesResult =
+    difficultiesSettled.status === "fulfilled" ? difficultiesSettled.value : null;
+  const strategiesResult =
+    strategiesSettled.status === "fulfilled" ? strategiesSettled.value : null;
+
+  // Both calls failed — give up like the single-call path used to.
+  if (!difficultiesResult && !strategiesResult) return null;
+
+  logAiUsage(null, difficultiesResult?.usageMetadata, "ClassReportSummary:difficulties");
+  logAiUsage(null, strategiesResult?.usageMetadata, "ClassReportSummary:strategies");
+  await Promise.all([
+    difficultiesResult?.usageMetadata
+      ? recordAiTokenUsage(difficultiesResult.usageMetadata, {
+          sessionId,
+          tag: "ClassReportSummary:difficulties",
+        })
+      : null,
+    strategiesResult?.usageMetadata
+      ? recordAiTokenUsage(strategiesResult.usageMetadata, {
+          sessionId,
+          tag: "ClassReportSummary:strategies",
+        })
+      : null,
+  ].filter(Boolean));
+
+  const difficultiesText = (difficultiesResult?.text || "").trim();
+  const strategiesText = (strategiesResult?.text || "").trim();
+
+  // Per-call audit log. Two rows so admins can inspect each split call
+  // separately when investigating a bad summary.
+  await Promise.all([
+    difficultiesResult
+      ? recordAiCallLog({
+          tag: "ClassReportSummary:difficulties",
+          model: MODEL,
+          sessionId,
+          teacherId,
+          questionText: `Lesson: ${lessonName || ""} (${questions.length} questions, ${totalSubmissions} submissions)`,
+          studentAnswer: snapshot,
+          aiResponseSummary: difficultiesText,
+          userPromptText: `${snapshot}\n\n${DIFFICULTIES_DIRECTIVE}`,
+          standardPromptSnippet: standardSection,
+          teacherPromptSnippet: teacherSection,
+          usageMetadata: difficultiesResult.usageMetadata,
+        })
+      : null,
+    strategiesResult
+      ? recordAiCallLog({
+          tag: "ClassReportSummary:strategies",
+          model: MODEL,
+          sessionId,
+          teacherId,
+          questionText: `Lesson: ${lessonName || ""} (${questions.length} questions, ${totalSubmissions} submissions)`,
+          studentAnswer: snapshot,
+          aiResponseSummary: strategiesText,
+          userPromptText: `${snapshot}\n\n${STRATEGIES_DIRECTIVE}`,
+          standardPromptSnippet: standardSection,
+          teacherPromptSnippet: teacherSection,
+          usageMetadata: strategiesResult.usageMetadata,
+        })
+      : null,
+  ].filter(Boolean));
 
   // responseMimeType=application/json should guarantee raw JSON, but in
   // practice the model occasionally still wraps output in ```json fences
   // or leaks a leading note. Extract the first { ... } block defensively.
-  const parsed = parseFirstJsonObject(text, { tag: "ClassReportSummary" });
-  if (!parsed) return null;
+  const difficultiesParsed = difficultiesText
+    ? parseFirstJsonObject(difficultiesText, { tag: "ClassReportSummary:difficulties" })
+    : null;
+  const strategiesParsed = strategiesText
+    ? parseFirstJsonObject(strategiesText, { tag: "ClassReportSummary:strategies" })
+    : null;
 
-  const studentDifficulties = Array.isArray(parsed?.studentDifficulties)
-    ? parsed.studentDifficulties
+  const studentDifficulties = Array.isArray(difficultiesParsed?.studentDifficulties)
+    ? difficultiesParsed.studentDifficulties
         .map((entry) => ({
           difficulty: String(entry?.difficulty || "").trim(),
           affectedStudents: Array.isArray(entry?.affectedStudents)
@@ -305,22 +414,35 @@ export async function generateClassReportSummary({
         }))
         .filter((entry) => entry.difficulty)
     : [];
-  const nextLessonStrategy = Array.isArray(parsed?.nextLessonStrategy)
-    ? parsed.nextLessonStrategy
+  const nextLessonStrategy = Array.isArray(strategiesParsed?.nextLessonStrategy)
+    ? strategiesParsed.nextLessonStrategy
         .map((entry) => ({
           difficulty: String(entry?.difficulty || "").trim(),
           teachingStrategy: String(entry?.teachingStrategy || "").trim(),
         }))
         .filter((entry) => entry.difficulty || entry.teachingStrategy)
     : [];
-  const targetedHomework = Array.isArray(parsed?.targetedHomework)
-    ? parsed.targetedHomework
+  const targetedHomework = Array.isArray(strategiesParsed?.targetedHomework)
+    ? strategiesParsed.targetedHomework
         .map((entry) => ({
           kindsOfTraining: String(entry?.kindsOfTraining || "").trim(),
           link: String(entry?.link || "").trim(),
         }))
         .filter((entry) => entry.kindsOfTraining)
     : [];
+
+  // If both parsed to nothing, the report is truly empty — bail like the
+  // old path did on parse failure.
+  if (
+    studentDifficulties.length === 0 &&
+    nextLessonStrategy.length === 0 &&
+    targetedHomework.length === 0
+  ) {
+    console.warn(
+      "[ClassReportSummary] Both split calls returned empty payloads — no report to save.",
+    );
+    return null;
+  }
 
   return {
     studentDifficulties,

@@ -10,15 +10,15 @@ import { generateAIQuestions } from "./Ai-tasks/generateQuestions.js";
 import { notifyNewAssignment } from "../utils/notify.js";
 import {
   generateAssignmentQuestions,
-  ASSIGNMENT_QUESTION_MODEL,
+  getAssignmentQuestionModel,
 } from "../utils/geminiAssignmentQuestions.js";
 import {
   generateIndividualAssignmentQuestions,
-  INDIVIDUAL_ASSIGNMENT_QUESTION_MODEL,
+  getIndividualAssignmentQuestionModel,
 } from "../utils/geminiIndividualAssignmentQuestions.js";
 import {
   generateAssignmentQuestionImage,
-  ASSIGNMENT_IMAGE_MODEL,
+  getAssignmentImageModel,
 } from "../utils/geminiAssignmentImage.js";
 import Lesson from "../models/LessonModel.js";
 import ClassworkModel from "../models/ClassworkModel.js";
@@ -1542,7 +1542,7 @@ export const createAssignmentWithAI = async (req, res) => {
       console.log(
         `[createAssignmentWithAI] generated ${okCount}/${targetsForImages.length} images`,
       );
-      if (okCount > 0) generation.imageModel = ASSIGNMENT_IMAGE_MODEL;
+      if (okCount > 0) generation.imageModel = await getAssignmentImageModel();
     }
 
     // General assignments seed every student in the classroom. Individual
@@ -1628,8 +1628,8 @@ export const createAssignmentWithAI = async (req, res) => {
       stats: {
         questionsGenerated: savedQuestions.length,
         questionModel: isIndividual
-          ? INDIVIDUAL_ASSIGNMENT_QUESTION_MODEL
-          : ASSIGNMENT_QUESTION_MODEL,
+          ? await getIndividualAssignmentQuestionModel()
+          : await getAssignmentQuestionModel(),
         imageRequested: targetsForImages.length,
         assignmentMode,
         individualStudentCount: isIndividual

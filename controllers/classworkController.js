@@ -11,6 +11,12 @@ import {
   getClassworkAiFeedbackStream,
 } from '../utils/geminiClassworkFeedback.js';
 import {
+  fingerprintAnswer,
+  buildCacheKey as buildFeedbackCacheKey,
+  getCachedFeedback,
+  setCachedFeedback,
+} from '../utils/classworkFeedbackCache.js';
+import {
   precomputeQuestionImageText,
   precomputeStandardSolution,
 } from '../utils/geminiClassworkPrecompute.js';
@@ -550,6 +556,78 @@ async function resolveTeacherIdForRoom(roomId) {
   }
 }
 
+// Fires a synthetic feedback call after a question is released so Gemini's
+// implicit prefix cache is warm before the first real student submission
+// arrives. The systemInstruction (standard prompt + teacher prompt + cached
+// solution block) is identical across every submission for a question, so
+// one warm-up primes the cache for every student that follows.
+//
+// Silent no-op on any error. Deliberately runs off the release HTTP
+// response via setImmediate so it never delays the teacher's release
+// action, and skips itself when the standardSolution precompute hasn't
+// finished (in that case the systemInstruction prefix isn't stable yet).
+const FEEDBACK_WARMUP_ENABLED =
+  String(process.env.CLASSWORK_FEEDBACK_WARMUP_DISABLED || '').toLowerCase() !== 'true';
+
+function scheduleFeedbackWarmup(question) {
+  if (!FEEDBACK_WARMUP_ENABLED) return;
+  if (!question || !question.roomId || !question.id) return;
+  if (question.aiAllowed === false) return;
+  // Without a cached solution the systemInstruction prefix is unstable, so
+  // warming would prime a prefix the real submissions won't reuse.
+  if (!question.standardSolution) return;
+
+  setImmediate(async () => {
+    try {
+      const [sessionIdForUsage, resolvedTeacherId] = await Promise.all([
+        resolveSessionIdForRoom(question.roomId, question.lessonName || null),
+        resolveTeacherIdForRoom(question.roomId),
+      ]);
+      const cachedContext = buildCachedContext(question);
+      // Use the teacher's reference answer as the synthetic student answer
+      // — Gemini returns a quick "correct + congratulations" response with
+      // the same systemInstruction prefix a real submission will hit.
+      const referenceAnswer = Array.isArray(question.correctAnswer)
+        ? question.correctAnswer.find((v) => String(v ?? '').trim()) || 'warm-up'
+        : (typeof question.correctAnswer === 'string' && question.correctAnswer.trim())
+          ? question.correctAnswer
+          : 'warm-up';
+      await getClassworkAiFeedback({
+        questionText: question.question || '',
+        questionImageText: question.questionImageText || '',
+        answer: referenceAnswer,
+        correctAnswer: question.correctAnswer,
+        // OCR already covers the image — don't re-upload it on the warm-up.
+        questionImage: null,
+        format: question.format,
+        studentName: 'warm-up',
+        studentId: null,
+        classroomId: question.classroomId || null,
+        teacherId: resolvedTeacherId,
+        maxOutputTokens: question.maxOutputTokens,
+        sessionId: sessionIdForUsage,
+        interactionId: String(new mongoose.Types.ObjectId()),
+        previousInteractionId: '',
+        // 0 skips the ASK/TELL instruction so the warm-up doesn't bias the
+        // prefix toward one parity — both real-student parities can reuse it.
+        submissionNumber: 0,
+        cachedContext,
+        computeStandardSolution: false,
+        computeCommonMistake: false,
+      });
+      console.log('[Classwork] Feedback warm-up completed', {
+        questionId: question.id,
+        roomId: question.roomId,
+      });
+    } catch (err) {
+      console.warn(
+        '[Classwork] Feedback warm-up failed (non-fatal):',
+        err?.message || err,
+      );
+    }
+  });
+}
+
 // Fires the OCR + standard-solution precomputes in the background so the
 // question-create HTTP response returns immediately. Persists both results
 // on the ClassworkModel doc when they succeed; silent no-op on failure so
@@ -697,6 +775,88 @@ export const startLessonForRoom = async (req, res) => {
   }
 };
 
+// ─── Rolling class-report checkpoints ─────────────────────────────────────
+// Every time a student submits an answer, we opportunistically pre-generate
+// the class report in the background so end-lesson can reuse a fresh copy
+// instead of paying a cold Gemini call. Thresholds keep the checkpoint
+// cadence sane: at least MIN_NEW_SUBMISSIONS since the last one AND at
+// least MIN_INTERVAL_MS elapsed, and at most one checkpoint per lesson
+// in flight at a time (deduped via the map below).
+const REPORT_CHECKPOINT_MIN_NEW_SUBMISSIONS = 15;
+const REPORT_CHECKPOINT_MIN_INTERVAL_MS = 5 * 60 * 1000;
+// At end-lesson, if the last checkpoint is at most this old AND the current
+// submission count matches, skip regeneration entirely — the teacher sees
+// the pre-generated report immediately in the response.
+const REPORT_CHECKPOINT_FRESHNESS_MS = 3 * 60 * 1000;
+
+// Per-lesson state, keyed by lesson _id: { inFlight, lastAt, lastSubs }.
+// In-memory only — a process restart just means the first post-restart
+// submission after the threshold will trigger a fresh checkpoint, which
+// is exactly what we want.
+const reportCheckpointState = new Map();
+
+function getCheckpointState(lessonId) {
+  const key = String(lessonId);
+  let entry = reportCheckpointState.get(key);
+  if (!entry) {
+    entry = { inFlight: false, lastAt: 0, lastSubs: -1 };
+    reportCheckpointState.set(key, entry);
+  }
+  return entry;
+}
+
+// Fires a background class-report generation for the active lesson in this
+// room, but only when enough time and submissions have accumulated since
+// the last checkpoint. Silent no-op on any failure.
+function maybeScheduleReportCheckpoint({ roomId, lessonName }) {
+  if (!roomId) return;
+  setImmediate(async () => {
+    try {
+      const lesson = await Lesson.findOne({ roomId, status: 'active' })
+        .sort({ startedAt: -1 });
+      if (!lesson) return;
+      // The submit path may have a different lessonName than what Lesson
+      // has if the teacher renamed mid-flight — but the Lesson row wins
+      // for report scoping, so ignore the passed lessonName here.
+      const state = getCheckpointState(lesson._id);
+      if (state.inFlight) return;
+
+      const currentSubs = await ClassworkModel.aggregate([
+        { $match: { roomId, lessonName: lesson.name } },
+        { $project: { subs: { $size: { $ifNull: ['$submitted', []] } } } },
+        { $group: { _id: null, total: { $sum: '$subs' } } },
+      ]);
+      const submissionCount = currentSubs?.[0]?.total || 0;
+      const now = Date.now();
+      const newSubs = state.lastSubs < 0
+        ? submissionCount
+        : submissionCount - state.lastSubs;
+
+      if (newSubs < REPORT_CHECKPOINT_MIN_NEW_SUBMISSIONS) return;
+      if (now - state.lastAt < REPORT_CHECKPOINT_MIN_INTERVAL_MS) return;
+
+      state.inFlight = true;
+      try {
+        console.log('[ClassReport] Rolling checkpoint firing', {
+          lessonId: String(lesson._id),
+          submissionCount,
+          newSubsSinceLast: newSubs,
+        });
+        await generateAndStoreClassReport(lesson);
+        state.lastAt = Date.now();
+        state.lastSubs = submissionCount;
+      } finally {
+        state.inFlight = false;
+      }
+    } catch (err) {
+      console.warn(
+        '[ClassReport] Rolling checkpoint failed (non-fatal):',
+        err?.message || err,
+      );
+    }
+  });
+}
+
 // End the active lesson in a room. Marks the Lesson row ended and clears
 // the staged classwork buffer (lessonName === '') so the next session starts
 // with an empty tray. Classwork already tagged with this lesson's name is
@@ -717,16 +877,58 @@ export const endLessonForRoom = async (req, res) => {
       lessonName: '',
     });
 
+    let reusedCheckpoint = false;
     if (ended) {
-      generateAndStoreClassReport(ended).catch((err) => {
-        console.error('[endLessonForRoom] background class report failed:', err);
-      });
+      // If the rolling-checkpoint pipeline pre-generated a report that's
+      // still fresh AND covers every current submission, skip the cold
+      // end-lesson regen — teacher already has the up-to-date report on
+      // the `lesson` field of this response.
+      const cr = ended.classReport;
+      const generatedAt = cr?.generatedAt ? new Date(cr.generatedAt).getTime() : 0;
+      const isFreshByTime =
+        generatedAt > 0 &&
+        Date.now() - generatedAt <= REPORT_CHECKPOINT_FRESHNESS_MS;
+      let submissionCountMatches = false;
+      if (isFreshByTime) {
+        try {
+          const currentSubs = await ClassworkModel.aggregate([
+            { $match: { roomId: ended.roomId, lessonName: ended.name } },
+            {
+              $project: {
+                subs: { $size: { $ifNull: ['$submitted', []] } },
+              },
+            },
+            { $group: { _id: null, total: { $sum: '$subs' } } },
+          ]);
+          const submissionCount = currentSubs?.[0]?.total || 0;
+          const state = getCheckpointState(ended._id);
+          submissionCountMatches = state.lastSubs === submissionCount;
+        } catch (err) {
+          console.warn(
+            '[endLessonForRoom] freshness submission count check failed:',
+            err?.message || err,
+          );
+        }
+      }
+
+      if (isFreshByTime && submissionCountMatches) {
+        reusedCheckpoint = true;
+        console.log(
+          '[endLessonForRoom] Reusing fresh checkpoint — skipping regeneration',
+          { lessonId: String(ended._id), generatedAt: cr.generatedAt },
+        );
+      } else {
+        generateAndStoreClassReport(ended).catch((err) => {
+          console.error('[endLessonForRoom] background class report failed:', err);
+        });
+      }
     }
 
     return res.status(200).json({
       message: ended ? 'Lesson ended.' : 'No active lesson found; staged buffer cleared.',
       lesson: ended,
       clearedStaged: clearedStaged?.deletedCount ?? 0,
+      reusedCheckpoint,
     });
   } catch (err) {
     console.error('endLessonForRoom error:', err);
@@ -1170,6 +1372,10 @@ export const releaseQuestion = async (req, res) => {
     if (!question) {
       return res.status(404).json({ message: 'Question not found' });
     }
+    // Warm Gemini's implicit prefix cache with a synthetic submission so
+    // the first real student pays a warm-cache latency instead of a cold
+    // one. Fire-and-forget — never blocks the release response.
+    scheduleFeedbackWarmup(question);
     res.status(200).json({
       message: 'Question released',
       question: {
@@ -1612,35 +1818,62 @@ export const submitAnswer = async (req, res) => {
     let aiFailed = false;
 
     if (!ctx.aiExpired) {
-      try {
-        // Skip the per-call solution compute when we've already precomputed
-        // one at question-create time — buildCachedContext folds it into
-        // the stable systemInstruction prefix.
-        const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
-        aiResult = await getClassworkAiFeedback({
-          questionText: ctx.questionTextForAi,
-          questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
-          answer: ctx.normalizedAnswer,
-          correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
-          questionImage: ctx.isFollowUp || ctx.question.questionImageText
-            ? null
-            : ctx.question.image,
-          format: ctx.question.format,
-          studentName: ctx.studentName,
-          studentId: ctx.studentId,
-          classroomId: ctx.question.classroomId || null,
-          teacherId: ctx.resolvedTeacherId,
-          maxOutputTokens: ctx.question.maxOutputTokens,
-          sessionId: ctx.sessionIdForUsage,
-          interactionId: String(ctx.interactionId),
-          previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
-          submissionNumber: ctx.submissionNumber,
-          cachedContext: ctx.cachedContext,
-          computeStandardSolution: !hasPrecomputedSolution,
+      // Answer-hash dedup: if another student already got Gemini feedback
+      // for this same (question, normalized answer, ASK/TELL parity) within
+      // the cache TTL, reuse it instead of paying for a fresh call.
+      const answerHash = fingerprintAnswer({
+        answer: ctx.normalizedAnswer,
+        format: ctx.question.format,
+        normalizedAnswerText: typeof ctx.normalizedAnswer === 'string'
+          ? ctx.normalizedAnswer
+          : '',
+        isFollowUp: ctx.isFollowUp,
+      });
+      const cacheKey = buildFeedbackCacheKey({
+        questionId: ctx.question.id,
+        answerHash,
+        submissionNumber: ctx.submissionNumber,
+      });
+      const cachedAiResult = cacheKey ? getCachedFeedback(cacheKey) : null;
+
+      if (cachedAiResult) {
+        console.log('[Classwork] Answer-hash cache HIT — skipping Gemini call', {
+          questionId: ctx.question.id,
+          cacheKey,
         });
-      } catch (aiErr) {
-        console.error('[Classwork] AI feedback failed:', aiErr);
-        aiFailed = true;
+        aiResult = cachedAiResult;
+      } else {
+        try {
+          // Skip the per-call solution compute when we've already precomputed
+          // one at question-create time — buildCachedContext folds it into
+          // the stable systemInstruction prefix.
+          const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
+          aiResult = await getClassworkAiFeedback({
+            questionText: ctx.questionTextForAi,
+            questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
+            answer: ctx.normalizedAnswer,
+            correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+            questionImage: ctx.isFollowUp || ctx.question.questionImageText
+              ? null
+              : ctx.question.image,
+            format: ctx.question.format,
+            studentName: ctx.studentName,
+            studentId: ctx.studentId,
+            classroomId: ctx.question.classroomId || null,
+            teacherId: ctx.resolvedTeacherId,
+            maxOutputTokens: ctx.question.maxOutputTokens,
+            sessionId: ctx.sessionIdForUsage,
+            interactionId: String(ctx.interactionId),
+            previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
+            submissionNumber: ctx.submissionNumber,
+            cachedContext: ctx.cachedContext,
+            computeStandardSolution: !hasPrecomputedSolution,
+          });
+          if (cacheKey) setCachedFeedback(cacheKey, aiResult);
+        } catch (aiErr) {
+          console.error('[Classwork] AI feedback failed:', aiErr);
+          aiFailed = true;
+        }
       }
     }
 
@@ -1655,6 +1888,13 @@ export const submitAnswer = async (req, res) => {
 
     const { isCorrect, feedback, commonMistakeThreshold, distinctTitles } =
       await persistClassworkFeedback({ ctx, aiResult });
+
+    // Opportunistically pre-generate the class report in the background so
+    // end-lesson can reuse a fresh copy instead of paying a cold Gemini call.
+    maybeScheduleReportCheckpoint({
+      roomId: ctx.question.roomId,
+      lessonName: ctx.question.lessonName,
+    });
 
     res.status(200).json(
       buildSubmissionResponseBody({
@@ -1719,36 +1959,68 @@ export const submitAnswerStream = async (req, res) => {
     let aiFailed = false;
 
     if (!ctx.aiExpired) {
-      try {
-        const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
-        aiResult = await getClassworkAiFeedbackStream({
-          questionText: ctx.questionTextForAi,
-          questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
-          answer: ctx.normalizedAnswer,
-          correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
-          questionImage: ctx.isFollowUp || ctx.question.questionImageText
-            ? null
-            : ctx.question.image,
-          format: ctx.question.format,
-          studentName: ctx.studentName,
-          studentId: ctx.studentId,
-          classroomId: ctx.question.classroomId || null,
-          teacherId: ctx.resolvedTeacherId,
-          maxOutputTokens: ctx.question.maxOutputTokens,
-          sessionId: ctx.sessionIdForUsage,
-          interactionId: String(ctx.interactionId),
-          previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
-          submissionNumber: ctx.submissionNumber,
-          cachedContext: ctx.cachedContext,
-          computeStandardSolution: !hasPrecomputedSolution,
-          onHintDelta: (chunk) => {
-            if (clientGone) return;
-            writeSseEvent(res, 'hint', { chunk });
-          },
+      // Answer-hash dedup: if another student already got Gemini feedback
+      // for this same (question, normalized answer, ASK/TELL parity) within
+      // the cache TTL, replay the cached hintStream as a single SSE 'hint'
+      // event and skip the Gemini call entirely. The client's `done` event
+      // still carries the full projected AI shape.
+      const answerHash = fingerprintAnswer({
+        answer: ctx.normalizedAnswer,
+        format: ctx.question.format,
+        normalizedAnswerText: typeof ctx.normalizedAnswer === 'string'
+          ? ctx.normalizedAnswer
+          : '',
+        isFollowUp: ctx.isFollowUp,
+      });
+      const cacheKey = buildFeedbackCacheKey({
+        questionId: ctx.question.id,
+        answerHash,
+        submissionNumber: ctx.submissionNumber,
+      });
+      const cachedAiResult = cacheKey ? getCachedFeedback(cacheKey) : null;
+
+      if (cachedAiResult) {
+        console.log('[Classwork][stream] Answer-hash cache HIT — skipping Gemini call', {
+          questionId: ctx.question.id,
+          cacheKey,
         });
-      } catch (aiErr) {
-        console.error('[Classwork][stream] AI feedback failed:', aiErr);
-        aiFailed = true;
+        aiResult = cachedAiResult;
+        if (!clientGone && aiResult.hintStream) {
+          writeSseEvent(res, 'hint', { chunk: aiResult.hintStream });
+        }
+      } else {
+        try {
+          const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
+          aiResult = await getClassworkAiFeedbackStream({
+            questionText: ctx.questionTextForAi,
+            questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
+            answer: ctx.normalizedAnswer,
+            correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+            questionImage: ctx.isFollowUp || ctx.question.questionImageText
+              ? null
+              : ctx.question.image,
+            format: ctx.question.format,
+            studentName: ctx.studentName,
+            studentId: ctx.studentId,
+            classroomId: ctx.question.classroomId || null,
+            teacherId: ctx.resolvedTeacherId,
+            maxOutputTokens: ctx.question.maxOutputTokens,
+            sessionId: ctx.sessionIdForUsage,
+            interactionId: String(ctx.interactionId),
+            previousInteractionId: ctx.previousInteractionId ? String(ctx.previousInteractionId) : '',
+            submissionNumber: ctx.submissionNumber,
+            cachedContext: ctx.cachedContext,
+            computeStandardSolution: !hasPrecomputedSolution,
+            onHintDelta: (chunk) => {
+              if (clientGone) return;
+              writeSseEvent(res, 'hint', { chunk });
+            },
+          });
+          if (cacheKey) setCachedFeedback(cacheKey, aiResult);
+        } catch (aiErr) {
+          console.error('[Classwork][stream] AI feedback failed:', aiErr);
+          aiFailed = true;
+        }
       }
     }
 
@@ -1765,6 +2037,13 @@ export const submitAnswerStream = async (req, res) => {
 
     const { isCorrect, feedback, commonMistakeThreshold, distinctTitles } =
       await persistClassworkFeedback({ ctx, aiResult });
+
+    // Opportunistically pre-generate the class report in the background so
+    // end-lesson can reuse a fresh copy instead of paying a cold Gemini call.
+    maybeScheduleReportCheckpoint({
+      roomId: ctx.question.roomId,
+      lessonName: ctx.question.lessonName,
+    });
 
     writeSseEvent(
       res,

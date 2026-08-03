@@ -7,6 +7,7 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
+import { getAiModel } from "./aiModels.js";
 
 // Generates the question batch for a Create Assignment AI call. Produces a
 // mixed list covering up to all 4 classwork formats (mcq / fill-blanks /
@@ -27,7 +28,8 @@ import {
 // the spec calls for.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-2.5-flash";
+// Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
+// 60s in-memory cache).
 
 const MAX_ATTEMPTS = 10;
 const BASE_DELAY_MS = 1000;
@@ -225,9 +227,10 @@ export async function generateAssignmentQuestions({
     throw new Error("perFormatCounts must request at least one question.");
   }
 
-  const [standardPrompt, teacherPrompt] = await Promise.all([
+  const [standardPrompt, teacherPrompt, MODEL] = await Promise.all([
     loadStandardPrompt(),
     loadTeacherAssignmentPrompt(teacherId),
+    getAiModel(),
   ]);
 
   const systemInstruction = [
@@ -358,4 +361,8 @@ export {
   DEFAULT_STANDARD_PROMPT,
 };
 
-export const ASSIGNMENT_QUESTION_MODEL = MODEL;
+// Retained as an async helper for callers that only need the model ID for
+// audit metadata (e.g. assignmentController's stats.questionModel).
+export async function getAssignmentQuestionModel() {
+  return getAiModel();
+}

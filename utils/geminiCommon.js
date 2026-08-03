@@ -15,17 +15,22 @@ export function sleep(ms) {
 // while a background class-report can grind for ~15 minutes (20 attempts, 60s
 // cap).
 //
-//   callFn       — thunk that invokes ai.models.generateContent(...)
-//   maxAttempts  — total tries before giving up
-//   baseDelayMs  — first-attempt backoff; doubles each retry
-//   maxDelayMs   — optional cap on the doubled backoff (omit for uncapped)
-//   jitterMs     — max random jitter added to each backoff (default 500)
-//   tag          — log prefix used in retry warnings
+//   callFn         — thunk that invokes ai.models.generateContent(...)
+//   maxAttempts    — total tries before giving up
+//   baseDelayMs    — first-attempt backoff; doubles each retry
+//   maxDelayMs     — optional cap on the doubled backoff (omit for uncapped)
+//   jitterMs       — max random jitter added to each backoff (default 500)
+//   tag            — log prefix used in retry warnings
+//   fallbackCallFn — optional thunk against a lighter model; tried ONCE
+//                    after the first retryable failure, before the first
+//                    backoff sleep. If it succeeds we return immediately;
+//                    if it also fails we resume the primary backoff loop.
 export async function withGeminiRetry(
   callFn,
-  { maxAttempts, baseDelayMs, maxDelayMs, jitterMs = 500, tag }
+  { maxAttempts, baseDelayMs, maxDelayMs, jitterMs = 500, tag, fallbackCallFn }
 ) {
   let lastErr;
+  let fallbackTried = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       return await callFn();
@@ -34,6 +39,24 @@ export async function withGeminiRetry(
       const status = err?.status ?? err?.error?.code;
       if (!RETRYABLE_GEMINI_STATUSES.has(status) || attempt === maxAttempts) {
         throw err;
+      }
+      // Overload fallback: the primary model is under load, so before
+      // burning a backoff sleep try a lighter/faster model once. During
+      // Gemini spikes flash-lite typically has spare capacity, giving the
+      // student a hint in ~2s instead of waiting out the full retry ladder.
+      if (fallbackCallFn && !fallbackTried) {
+        fallbackTried = true;
+        console.warn(
+          `[${tag}] Gemini ${status} on attempt ${attempt}; trying fallback model before backoff`,
+        );
+        try {
+          return await fallbackCallFn();
+        } catch (fbErr) {
+          const fbStatus = fbErr?.status ?? fbErr?.error?.code;
+          console.warn(
+            `[${tag}] Fallback model also failed (${fbStatus}); resuming primary backoff`,
+          );
+        }
       }
       const exp = baseDelayMs * 2 ** (attempt - 1);
       const backoff = maxDelayMs ? Math.min(exp, maxDelayMs) : exp;

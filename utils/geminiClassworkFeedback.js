@@ -12,9 +12,17 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
+import { getAiModel } from "./aiModels.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-2.5-flash";
+// Model IDs come from StandardPrompt.models via getAiModel() (60s in-memory
+// cache with a hardcoded fallback if Mongo is unreachable). The fallback slot
+// is used ONCE when the primary is under load (503/UNAVAILABLE or another
+// retryable status). During Gemini spikes flash-lite typically has spare
+// capacity, so the student sees a hint in a couple of seconds instead of
+// waiting out the retry ladder. Same JSON shape as flash so the shaping code
+// below doesn't need to branch. An admin can disable the fallback by setting
+// StandardPrompt.models.fallback to the same value as models.default.
 // Thinking budget is derived from the resolved output-token budget as a
 // share. Applies only on the no-precompute path — when the canonical
 // solution already rides in systemInstruction we set thinking to 0.
@@ -630,6 +638,10 @@ export async function getClassworkAiFeedback({
   computeCommonMistake = false,
 }) {
   const reqId = newReqId();
+  const [MODEL, FALLBACK_MODEL] = await Promise.all([
+    getAiModel(),
+    getAiModel("fallback"),
+  ]);
   const {
     systemInstruction,
     contents,
@@ -696,6 +708,14 @@ export async function getClassworkAiFeedback({
       maxAttempts: MAX_ATTEMPTS,
       baseDelayMs: BASE_DELAY_MS,
       tag: `ClassworkFeedback:${reqId}`,
+      fallbackCallFn: FALLBACK_MODEL
+        ? () =>
+            ai.models.generateContent({
+              model: FALLBACK_MODEL,
+              contents,
+              config,
+            })
+        : undefined,
     },
   );
 
@@ -907,6 +927,10 @@ export async function getClassworkAiFeedbackStream({
   onHintDelta,
 }) {
   const reqId = newReqId();
+  const [MODEL, FALLBACK_MODEL] = await Promise.all([
+    getAiModel(),
+    getAiModel("fallback"),
+  ]);
   const {
     systemInstruction,
     contents,
@@ -973,11 +997,11 @@ export async function getClassworkAiFeedbackStream({
   let responseText = "";
   let finalResponse = null;
 
-  const openAndDrain = async () => {
+  const openAndDrainWith = (modelId) => async () => {
     responseText = "";
     finalResponse = null;
     const stream = await ai.models.generateContentStream({
-      model: MODEL,
+      model: modelId,
       contents,
       config,
     });
@@ -992,10 +1016,11 @@ export async function getClassworkAiFeedbackStream({
     return finalResponse;
   };
 
-  const usageBearingChunk = await withGeminiRetry(openAndDrain, {
+  const usageBearingChunk = await withGeminiRetry(openAndDrainWith(MODEL), {
     maxAttempts: MAX_ATTEMPTS,
     baseDelayMs: BASE_DELAY_MS,
     tag: `ClassworkFeedback:${reqId}:stream`,
+    fallbackCallFn: FALLBACK_MODEL ? openAndDrainWith(FALLBACK_MODEL) : undefined,
   });
 
   const usageMetadata = usageBearingChunk?.usageMetadata;

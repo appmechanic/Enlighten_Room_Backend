@@ -5,6 +5,7 @@ import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry } from "./geminiCommon.js";
 import { recordAiTokenUsage, logAiUsage } from "./aiTokenUsage.js";
+import { getAiModel } from "./aiModels.js";
 
 // Two one-off Gemini calls made at question CREATION time so every subsequent
 // per-student submission can skip the heavy work:
@@ -16,7 +17,8 @@ import { recordAiTokenUsage, logAiUsage } from "./aiTokenUsage.js";
 //      Gemini to re-derive the solution for every submission.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-2.5-flash";
+// Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
+// 60s in-memory cache).
 const MAX_ATTEMPTS = 3;
 const BASE_DELAY_MS = 500;
 
@@ -84,6 +86,7 @@ export async function precomputeQuestionImageText({ imageSource, sessionId }) {
     const inline = await sourceToInlineData(imageSource);
     if (!inline) return "";
 
+    const MODEL = await getAiModel();
     const instruction =
       "Transcribe every visible element of this question image into plain text so it can stand in for the image in later prompts. Use LaTeX for all math expressions and formulas. Preserve numbered/lettered lists and multi-line layouts using newlines. Do not solve the question. Return the transcription only, no preamble.";
 
@@ -154,9 +157,10 @@ export async function precomputeStandardSolution({
 }) {
   const reqId = newReqId();
   try {
-    const [standardText, teacherPrompt] = await Promise.all([
+    const [standardText, teacherPrompt, MODEL] = await Promise.all([
       loadStandardPromptText(),
       loadTeacherPrompt(teacherId),
+      getAiModel(),
     ]);
     const systemInstruction = [standardText, teacherPrompt]
       .filter(Boolean)

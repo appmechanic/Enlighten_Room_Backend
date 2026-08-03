@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { getAiModel } from "../utils/aiModels.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -46,7 +47,7 @@ Use a warm, encouraging, parent-like tone throughout. Keep responses concise, ch
       `;
   const base64Image = dataUrl.split(",")[1];
   const result = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: await getAiModel(),
     contents: [
       {
         inlineData: {

@@ -12,6 +12,7 @@ import {
   loadStandardPrompt,
   loadTeacherAssignmentPrompt,
 } from "./geminiAssignmentQuestions.js";
+import { getAiModel } from "./aiModels.js";
 
 // Individual-assignment generator: one AI call per selected student, all
 // sharing a single Gemini explicit-cache handle. The cache holds:
@@ -31,7 +32,9 @@ import {
 // per-student call.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = "gemini-2.5-flash";
+// Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
+// 60s in-memory cache) and threaded into helpers so the shared explicit-cache
+// and every per-student call use the same value.
 const CACHE_TTL_SECONDS = 3600;
 
 const MAX_ATTEMPTS = 8;
@@ -154,10 +157,11 @@ async function createSharedCache({
   systemInstruction,
   contextTurnText,
   tag,
+  model,
 }) {
   try {
     const cache = await ai.caches.create({
-      model: MODEL,
+      model,
       config: {
         systemInstruction,
         contents: [{ role: "user", parts: [{ text: contextTurnText }] }],
@@ -185,6 +189,7 @@ async function generateForStudent({
   teacherId,
   studentId,
   tag,
+  model,
 }) {
   const studentTurnText = buildStudentTurn({ studentName, studentReports });
 
@@ -208,7 +213,7 @@ async function generateForStudent({
       };
 
   const result = await withGeminiRetry(
-    () => ai.models.generateContent({ model: MODEL, contents, config }),
+    () => ai.models.generateContent({ model, contents, config }),
     {
       maxAttempts: MAX_ATTEMPTS,
       baseDelayMs: BASE_DELAY_MS,
@@ -226,7 +231,7 @@ async function generateForStudent({
   const raw = (result?.text || "").trim();
   await recordAiCallLog({
     tag,
-    model: MODEL,
+    model,
     teacherId,
     studentId,
     studentName,
@@ -276,9 +281,10 @@ export async function generateIndividualAssignmentQuestions({
     throw new Error("perFormatCounts must request at least one question.");
   }
 
-  const [standardPrompt, teacherPrompt] = await Promise.all([
+  const [standardPrompt, teacherPrompt, MODEL] = await Promise.all([
     loadStandardPrompt(),
     loadTeacherAssignmentPrompt(teacherId),
+    getAiModel(),
   ]);
 
   const systemInstruction = [
@@ -304,6 +310,7 @@ export async function generateIndividualAssignmentQuestions({
     systemInstruction,
     contextTurnText,
     tag,
+    model: MODEL,
   });
 
   const perStudent = new Array(perStudentData.length);
@@ -326,6 +333,7 @@ export async function generateIndividualAssignmentQuestions({
             teacherId,
             studentId: s.studentId,
             tag,
+            model: MODEL,
           });
           cachedContentTokenCount +=
             Number(usageMetadata?.cachedContentTokenCount) || 0;
@@ -365,4 +373,8 @@ export async function generateIndividualAssignmentQuestions({
   };
 }
 
-export const INDIVIDUAL_ASSIGNMENT_QUESTION_MODEL = MODEL;
+// Retained as an async helper for callers that only need the model ID for
+// audit metadata (e.g. assignmentController's stats.questionModel).
+export async function getIndividualAssignmentQuestionModel() {
+  return getAiModel();
+}

@@ -1,5 +1,6 @@
 import asyncHandler from "express-async-handler";
 import StandardPrompt from "../models/standardPromptModel.js";
+import { invalidateAiModelsCache } from "../utils/aiModels.js";
 
 const GLOBAL_KEY = "global";
 
@@ -70,6 +71,11 @@ export const getStandardPrompts = asyncHandler(async (req, res) => {
       reportPromptSections: reportSections,
       emailPrompt: doc?.emailPrompt || "",
       creatingAssignmentPrompt: doc?.creatingAssignmentPrompt || "",
+      models: {
+        default: doc?.models?.default || "",
+        fallback: doc?.models?.fallback || "",
+        image: doc?.models?.image || "",
+      },
       updatedAt: doc?.updatedAt || null,
     },
   });
@@ -83,6 +89,7 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     reportPrompt,
     emailPrompt,
     creatingAssignmentPrompt,
+    models,
   } = req.body || {};
 
   const aiHintSections = normalizeSections(
@@ -113,11 +120,25 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     updatedBy: userId || null,
   };
 
+  // Only overwrite the models field if the client actually sent one — older
+  // clients don't know about it and would otherwise wipe the config on save.
+  if (models && typeof models === "object") {
+    next.models = {
+      default: typeof models.default === "string" ? models.default.trim() : "",
+      fallback: typeof models.fallback === "string" ? models.fallback.trim() : "",
+      image: typeof models.image === "string" ? models.image.trim() : "",
+    };
+  }
+
   const doc = await StandardPrompt.findOneAndUpdate(
     { key: GLOBAL_KEY },
     next,
     { new: true, upsert: true, setDefaultsOnInsert: true }
   );
+
+  // Drop the in-memory model cache so the next AI call sees the new value
+  // instead of waiting up to 60s for the TTL.
+  invalidateAiModelsCache();
 
   return res.json({
     ok: true,
@@ -129,6 +150,11 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
       reportPromptSections: reportSectionsFromDoc(doc),
       emailPrompt: doc?.emailPrompt || "",
       creatingAssignmentPrompt: doc?.creatingAssignmentPrompt || "",
+      models: {
+        default: doc?.models?.default || "",
+        fallback: doc?.models?.fallback || "",
+        image: doc?.models?.image || "",
+      },
       updatedAt: doc?.updatedAt || null,
     },
   });

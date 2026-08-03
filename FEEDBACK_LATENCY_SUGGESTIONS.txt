@@ -1,0 +1,214 @@
+FEEDBACK LATENCY — NEW SUGGESTIONS (beyond A–G already shipped)
+================================================================
+Scope: further reduce perceived wait time for classwork AI feedback
+(student-facing, hot path) and class report summary (teacher-facing).
+
+Already shipped in this cycle:
+  A  Answer-hash dedup cache for identical (question, answer, parity)
+  B  Warm-cache ping on question release
+  C  gemini-2.5-flash-lite fallback on 503/UNAVAILABLE
+  D  Textbox thinking=0 when solution cached (verified pre-existing)
+  E  Cap class-report thinkingBudget at 1024 (was -1 / unlimited)
+  F  Rolling class-report checkpoints + reuse fresh at end-lesson
+  G  Split class-report into 2 parallel Gemini calls
+
+The ideas below are additional — none of them are implemented today.
+
+------------------------------------------------------------------
+CLASSWORK FEEDBACK  (student-facing, latency-critical)
+------------------------------------------------------------------
+
+H. Seed the answer-hash cache at question-release time.
+   Precompute feedback for (i) the reference correct answer and
+   (ii) 2–4 model-predicted common wrong answers, using a single
+   background Gemini call. Store each under the same key the live
+   dedup cache uses. First students almost always fall into one of
+   these buckets, so the first-real-submission latency collapses to
+   a cache hit instead of a warm Gemini call.
+   Impact:  HIGH  (many first submissions become 0-latency)
+   Effort:  Medium — reuses A's cache; needs one extra precompute util.
+
+I. Trivial-correct fast path (skip Gemini for exact matches).
+   If normalizedAnswer === correctAnswer under a light equivalence
+   check (whitespace/case/latex-vs-plain), emit a canned "correct +
+   congratulations" feedback with a challenge question pulled from a
+   tiny local generator (or cached). Only apply for formats where
+   exact match is meaningful (textbox with short reference, MCQ,
+   fill-blanks). Skip Gemini entirely for ~20–30% of submissions.
+   Impact:  HIGH  (whole population of easy-right answers)
+   Effort:  Low-medium — leverage existing MATH_EQUIVALENCE rules,
+            constrained to single-value refs to keep correctness safe.
+
+J. Trivial-empty / gibberish fast path.
+   Empty or single-character answers get a canned "please try again"
+   hint. Cheap regex/length check up front, before Gemini is called
+   at all. Avoids spending 10s of Gemini time on submissions that
+   can't produce useful feedback anyway.
+   Impact:  Low-medium (uncommon in practice)
+   Effort:  Trivial.
+
+K. Emit a "typing" placeholder SSE chunk at t=0.
+   The moment /submit-stream opens, write a `hint` event with a
+   short localized placeholder ("Reading your answer…") in the
+   question's instruction language. Real hintStream chunks then
+   overwrite it. Perceived latency drops to ~0ms even when Gemini
+   time-to-first-token is still 800ms+.
+   Impact:  Medium (perceived only, not real)
+   Effort:  Low — server: one writeSseEvent; client: replace chunk
+            when first real hint delta arrives.
+
+L. Micro-batch identical-answer submissions in a short window.
+   When N students submit the same answer within a few hundred ms,
+   coalesce into ONE Gemini call and fan the response out to all
+   waiting SSE streams. Complements A: A caches after the fact,
+   this batches concurrently. Requires an in-process per-key
+   promise map keyed by cache key.
+   Impact:  High during synchronised classes (all-submit-at-once)
+   Effort:  Medium — needs care around SSE lifecycle and cancellation.
+
+M. Explicit Gemini prompt cache instead of implicit.
+   The assignment path already uses `ai.caches.create` with a TTL
+   for its systemInstruction. Classwork relies on Gemini's implicit
+   prefix cache, which has a very short (unspecified) TTL and can
+   miss under load. Move the classwork systemInstruction (standard
+   prompt + teacher prompt + solutionBlock) into an explicit cache
+   per (teacherId, standardPromptHash, questionId) with e.g. 1-hour
+   TTL. Guarantees the prefix stays cached across an entire class.
+   Impact:  High under Gemini load and for the first submission
+            after a quiet minute (implicit cache decays fast).
+   Effort:  Medium — mirror utils/geminiIndividualAssignmentQuestions.js's
+            cache lifecycle, invalidate on question edit / standardPrompt hash change.
+
+N. Speculative pre-generate while the student is typing.
+   For textbox and fill-blanks, when the student pauses ≥2s the
+   FE speculatively fires a POST to a new /prefetch-feedback
+   endpoint with the current draft. Server runs the exact same
+   classwork feedback call and populates the answer-hash cache.
+   When the student actually submits, A/L short-circuits to the
+   cached result.
+   Impact:  High — the wait vanishes for students who pause before
+            submitting.
+   Effort:  High — new endpoint, FE debouncing, cost accounting
+            (need to cap prefetches per student per question to
+            avoid burning tokens on rapid typists).
+
+O. Drop the `commonMistake` field from Gemini's schema.
+   `commonMistake.isCommon` is currently derived by asking Gemini
+   at every call. Instead: (i) always ask Gemini to record the
+   mistake `title` (cheap); (ii) compute `isCommon` post-hoc from
+   the accumulated bank frequency (already stored). Removes one
+   piece of reasoning per submission → fewer output/thinking tokens.
+   Impact:  Low-medium
+   Effort:  Low — schema edit + tiny threshold in aiFeedbackCache.
+
+P. Lower DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS (currently 800).
+   Real hintStream is 2–4 sentences; part1/part2 are short bullet
+   arrays. 800 is generous, and the thinking-budget cap piggybacks
+   on it (share = 20% up to MAX_THINKING_BUDGET=2048). Halving to
+   400–500 caps the worst-case thinking delay proportionally.
+   Impact:  Small but free
+   Effort:  Trivial — measure on real classwork traces first to
+            confirm nothing is being truncated.
+
+Q. Pass answer image URLs directly to Gemini instead of re-uploading.
+   Handwriting answers today: browser → Spaces upload → Spaces URL
+   → server fetch → base64 → inlineData. If Gemini's SDK accepts a
+   direct file URL, that's one hop and ~100–500ms shaved.
+   Impact:  Medium (only affects handwriting submissions)
+   Effort:  Depends on SDK support — verify @google/genai file
+            reference API before implementing.
+
+R. Persist submissions off the hot path.
+   `persistClassworkFeedback` currently blocks the SSE `done` event
+   with question.save() and ClassworkAiReport upsert. Emit `done`
+   first, persist in setImmediate. Trade-off: on process crash
+   between emit and persist, the feedback shown to the student
+   isn't saved.
+   Impact:  Medium (saves ~50–200ms per submission on Mongo write time)
+   Effort:  Low, but be careful about ordering with the next student's
+            submission triggering the common-mistake bank read.
+
+S. Per-teacher latency-vs-quality knob.
+   Some teachers care more about fastest possible hint (drill sessions);
+   others want best quality. Add TeacherAIConfig.feedbackModel with
+   values 'flash' (default) or 'flash-lite' (always use lite model).
+   Cheap teacher-side control for a big latency win in sessions where
+   depth isn't required.
+   Impact:  High for opted-in teachers
+   Effort:  Low — thread one field through buildGeminiRequest.
+
+------------------------------------------------------------------
+CLASS REPORT SUMMARY  (teacher-facing, background but perceived wait)
+------------------------------------------------------------------
+
+T. Stream the report to the teacher.
+   Switch generateClassReportSummary to generateContentStream and
+   emit sections via SSE (or Socket.io) as they arrive: teacher sees
+   `studentDifficulties` items populating live, then `nextLessonStrategy`,
+   then `targetedHomework`. Combined with G (parallel calls), both
+   halves stream concurrently. Perceived report latency → seconds.
+   Impact:  High
+   Effort:  Medium — needs a report-streaming endpoint + FE consumer,
+            but generation utility is a smaller change than F was.
+
+U. Compress the lesson snapshot before sending.
+   For 30 students × 20 questions the snapshot easily exceeds 50KB.
+   Compact repeated question headers, drop student names in favor
+   of stable "S1/S2/S3" ids (add a legend at the top), collapse
+   identical answers into "same as: S1, S3, S7". Reduces input
+   tokens → faster prefill.
+   Impact:  Medium (mostly for big classes)
+   Effort:  Low.
+
+V. Skip the class-report gemini call entirely on tiny classes.
+   For classes with ≤3 students or ≤5 total submissions, the "AI
+   summary" is essentially a raw list. Render it deterministically
+   from the snapshot instead of asking Gemini. Trivially cheap and
+   instant.
+   Impact:  Small volume, but 100% latency saved for those cases.
+   Effort:  Trivial.
+
+W. Reuse the previous lesson's strategies section as a warm draft.
+   When rolling checkpoints fire (F), pass the previous checkpoint's
+   `nextLessonStrategy` and `targetedHomework` into the strategies
+   Gemini call as a "here's what you produced last time; update it
+   if needed" hint. Gemini can do a diff-style update using fewer
+   thinking tokens than a from-scratch generation.
+   Impact:  Medium
+   Effort:  Medium — needs prompt engineering + verifying the model
+            actually shortens output when told to.
+
+X. Move loadStandardSection / loadTeacherSection through promptCache.
+   The classwork path uses utils/promptCache.js (60s TTL). The
+   class-report path re-queries Mongo on every call. Cheap alignment,
+   but only matters if reports are generated frequently (which F now
+   causes them to be).
+   Impact:  Small
+   Effort:  Trivial.
+
+------------------------------------------------------------------
+CROSS-CUTTING
+------------------------------------------------------------------
+
+Y. Connection reuse / HTTP keep-alive to Gemini.
+   Verify the @google/genai SDK reuses TCP connections across
+   generateContent calls (not opening a new TLS handshake per call).
+   If not, wrap with a persistent https.Agent. Saves ~50–100ms per
+   call cold, less warm.
+   Impact:  Small but per-call
+   Effort:  Low if SDK exposes the http agent.
+
+Z. Regional Gemini endpoint routing.
+   Investigate whether @google/genai supports region pinning
+   (e.g. "asia-south1" if backend is in Mumbai). Cross-region hops
+   add tens to hundreds of ms per call.
+   Impact:  Depends on backend/region distance
+   Effort:  Low — SDK config.
+
+AA. Metrics dashboard for feedback latency.
+    Emit histograms: time-to-first-hint-chunk, time-to-done,
+    cache-hit rate, fallback-model invocations, checkpoint reuse rate.
+    Nothing to speed up without measuring what's slow first. Would
+    also validate whether A/B/C/G/F are actually paying off in prod.
+    Impact:  Meta — enables prioritising the rest.
+    Effort:  Low — hook into existing recordAiTokenUsage plumbing.

@@ -7,6 +7,7 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
+import { getAiModel } from "./aiModels.js";
 
 // Generates a question illustration with Gemini 3 Pro Image (Nano Banana Pro)
 // and uploads it to DigitalOcean Spaces, returning the public URL. Used by the
@@ -19,9 +20,9 @@ import {
 // create-assignment request feel slow on larger batches.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-// "Nano Banana Pro" public id. The preview suffix is what the API requires
-// today; if Google promotes it to GA the model id will change.
-const IMAGE_MODEL = "gemini-3-pro-image-preview";
+// Image model ("Nano Banana Pro" family, needs a different modality than the
+// text-generation models) resolved per call via getAiModel("image") from
+// StandardPrompt.models.image with a 60s in-memory cache.
 
 const MAX_ATTEMPTS = 4;
 const BASE_DELAY_MS = 1500;
@@ -99,6 +100,7 @@ export async function generateAssignmentQuestionImage({
   if (!questionText) return null;
 
   try {
+    const IMAGE_MODEL = await getAiModel("image");
     const result = await withGeminiRetry(
       () =>
         ai.models.generateContent({
@@ -166,4 +168,8 @@ export async function generateAssignmentQuestionImage({
   }
 }
 
-export const ASSIGNMENT_IMAGE_MODEL = IMAGE_MODEL;
+// Retained as an async helper for callers that only need the model ID for
+// audit metadata (e.g. assignmentController's generation.imageModel).
+export async function getAssignmentImageModel() {
+  return getAiModel("image");
+}
