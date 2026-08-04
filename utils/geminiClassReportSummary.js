@@ -7,27 +7,20 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
-import { getAiModel } from "./aiModels.js";
+import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
 
-// Output-token budget scales with class size so bigger classes have room to
-// cover more per-student difficulties. Capped so we don't blow past a
-// reasonable ceiling regardless of enrolment.
-const REPORT_BASE_MAX_OUTPUT_TOKENS = 2000;
-const REPORT_PER_STUDENT_MAX_OUTPUT_TOKENS = 25;
-const REPORT_MAX_OUTPUT_TOKENS_CAP = 4000;
-// Bounded thinking budget. The class report is pattern-matching over a
-// serialized snapshot (who got what wrong on which question), not deep
-// symbolic reasoning — an unlimited budget (thinkingBudget: -1) has been
-// observed to add many seconds of pre-response delay for no measurable
-// quality win. 1024 leaves room to group difficulties across students
-// while capping the visible wait teachers see after end-lesson.
-const REPORT_THINKING_BUDGET = 1024;
+// Output-token budget scales with class size (base + per-student × n) and
+// thinking budget are resolved per call from StandardPrompt.tuning.report
+// via getAiTuning("report"). Report generation is pattern-matching, not
+// deep reasoning, so an unlimited budget (thinkingBudget: -1) adds many
+// seconds of pre-response delay for no quality win — the tuning defaults
+// keep the visible wait bounded.
 
-function reportMaxOutputTokens(studentCount) {
+function reportMaxOutputTokens(studentCount, reportTuning) {
   const n = Number(studentCount) > 0 ? Number(studentCount) : 0;
   return Math.min(
-    REPORT_BASE_MAX_OUTPUT_TOKENS + REPORT_PER_STUDENT_MAX_OUTPUT_TOKENS * n,
-    REPORT_MAX_OUTPUT_TOKENS_CAP,
+    reportTuning.baseMaxOutputTokens + reportTuning.perStudentTokens * n,
+    reportTuning.maxOutputTokensCap,
   );
 }
 
@@ -47,12 +40,10 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Generation is now run in the background after the end-lesson HTTP response
 // has been sent, so we can ride out long Gemini demand spikes instead of
-// failing fast. ~20 attempts with exponential backoff capped at 60s gives
-// ~15 minutes of retry headroom — long enough to outlast typical 503/UNAVAILABLE
-// windows without leaking work forever.
-const MAX_ATTEMPTS = 20;
-const BASE_DELAY_MS = 1000;
-const MAX_DELAY_MS = 60 * 1000;
+// failing fast. Retry policy resolved per call via getAiRetry("classReport")
+// — defaults to ~20 attempts / 60s cap (~15 minutes of retry headroom),
+// enough to outlast typical 503/UNAVAILABLE windows without leaking work
+// forever. An admin can tune it via StandardPrompt.retry.classReport.
 
 function normalizeAnswerText(value) {
   if (value == null) return "";
@@ -175,11 +166,9 @@ const STRATEGIES_ONLY_SCHEMA = {
 // Prompt suffixes appended to the snapshot per call to tell Gemini which
 // section it's answering. The systemInstruction still carries the admin's
 // full 3-section guidance so tone and structure are preserved; these
-// suffixes just narrow the current call's focus.
-const DIFFICULTIES_DIRECTIVE =
-  "For this call, produce ONLY the studentDifficulties section — a list of the specific difficulties students had and which students were affected. Do NOT include nextLessonStrategy or targetedHomework.";
-const STRATEGIES_DIRECTIVE =
-  "For this call, produce ONLY the nextLessonStrategy and targetedHomework sections — pedagogical strategies for the next lesson and targeted homework suggestions. Do NOT include studentDifficulties. If you need difficulty context, infer common difficulties from the snapshot yourself.";
+// suffixes just narrow the current call's focus. Text resolved per call via
+// getAiDirective from StandardPrompt.directives — canonical defaults live
+// in config/standardPromptDefaults.js.
 
 // Compact the lesson's classwork + submissions into a textual snapshot the
 // model can summarize. Per-student answers are listed under each question so
@@ -233,10 +222,22 @@ export async function generateClassReportSummary({
     return null;
   }
 
-  const [standardSection, teacherSection, MODEL] = await Promise.all([
+  const [
+    standardSection,
+    teacherSection,
+    MODEL,
+    retryCfg,
+    reportTuning,
+    DIFFICULTIES_DIRECTIVE,
+    STRATEGIES_DIRECTIVE,
+  ] = await Promise.all([
     buildStandardSection(),
     buildTeacherSection(teacherId),
     getAiModel(),
+    getAiRetry("classReport"),
+    getAiTuning("report"),
+    getAiDirective("report.difficultiesDirective"),
+    getAiDirective("report.strategiesDirective"),
   ]);
 
   console.log(
@@ -263,13 +264,19 @@ export async function generateClassReportSummary({
     previousInteractionId,
   });
 
-  const maxOutputTokens = reportMaxOutputTokens(studentCount);
+  const maxOutputTokens = reportMaxOutputTokens(studentCount, reportTuning);
   // Difficulties is the section whose length grows with class size
   // (one bullet per distinct difficulty × affectedStudents list). Strategies
   // + homework are effectively fixed-shape planning bullets and don't need
   // to scale with student count.
   const difficultiesMaxTokens = maxOutputTokens;
-  const strategiesMaxTokens = Math.min(1400, REPORT_MAX_OUTPUT_TOKENS_CAP);
+  // Strategies + homework are fixed-shape planning bullets; the tuning
+  // default (900 tokens) is enough for a full-length plan without wasting
+  // budget. Output tokens are the #1 latency driver.
+  const strategiesMaxTokens = Math.min(
+    reportTuning.strategiesMaxTokens,
+    reportTuning.maxOutputTokensCap
+  );
   console.log(
     `[ClassReportSummary] studentCount=${studentCount ?? "?"} → difficulties=${difficultiesMaxTokens}, strategies=${strategiesMaxTokens}`,
   );
@@ -289,14 +296,14 @@ export async function generateClassReportSummary({
             systemInstruction,
             responseMimeType: "application/json",
             responseSchema: schema,
-            thinkingConfig: { thinkingBudget: REPORT_THINKING_BUDGET },
+            thinkingConfig: { thinkingBudget: reportTuning.thinkingBudget },
             maxOutputTokens: maxOutputTokensForCall,
           },
         }),
       {
-        maxAttempts: MAX_ATTEMPTS,
-        baseDelayMs: BASE_DELAY_MS,
-        maxDelayMs: MAX_DELAY_MS,
+        maxAttempts: retryCfg.max,
+        baseDelayMs: retryCfg.baseMs,
+        maxDelayMs: retryCfg.capMs,
         tag,
       },
     );

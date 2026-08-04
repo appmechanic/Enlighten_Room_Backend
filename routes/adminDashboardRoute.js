@@ -7,6 +7,7 @@ import {
 } from "../controllers/adminDashboardController.js";
 import {
   getStandardPrompts,
+  getStandardPromptDefaultsHandler,
   upsertStandardPrompts,
 } from "../controllers/standardPromptController.js";
 import {
@@ -37,6 +38,15 @@ router.get(
   auth_admin,
   auth_key_header,
   getStandardPrompts
+);
+// Read-only canonical defaults from config/standardPromptDefaults.js. Powers
+// the "Reset to default" buttons in the admin UI — the React side no longer
+// ships hardcoded copies of the canonical text.
+router.get(
+  "/standard-prompts/defaults",
+  auth_admin,
+  auth_key_header,
+  getStandardPromptDefaultsHandler
 );
 router.put(
   "/standard-prompts",

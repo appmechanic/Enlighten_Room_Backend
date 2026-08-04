@@ -1,9 +1,11 @@
 import { GoogleGenAI } from "@google/genai";
-import { getAiModel } from "../utils/aiModels.js";
+import { getAiModel, getAiDirective } from "../utils/aiConfig.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// Reusable helper
+// Reusable helper — systemInstruction resolved per call via getAiDirective
+// from StandardPrompt.directives["whiteboard.systemInstruction"]. Canonical
+// default lives in config/standardPromptDefaults.js.
 async function askVision({
   dataUrl,
   prompt = `Hello Tutor, I am sending a student's name and the student's ID for tracing, along with a photo of their classwork. Do not give the final answer or full step-by-step solutions.
@@ -35,19 +37,13 @@ Use a warm, encouraging, parent-like tone throughout. Keep responses concise, ch
   //     },
   //   ],
   // });
-  const systemInstruction = `
-      You are a warm, patient, and encouraging tutor (like a caring parent)
-      who reads a student's classwork image and provides short, supportive,
-      and educational guidance.
-
-      Rules:
-      - Start advice with the student's name if provided
-      - Never give final answers unless failed 3 times
-      - Be concise, child-friendly, and encouraging
-      `;
+  const [MODEL, systemInstruction] = await Promise.all([
+    getAiModel(),
+    getAiDirective("whiteboard.systemInstruction"),
+  ]);
   const base64Image = dataUrl.split(",")[1];
   const result = await ai.models.generateContent({
-    model: await getAiModel(),
+    model: MODEL,
     contents: [
       {
         inlineData: {

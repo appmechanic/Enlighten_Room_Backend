@@ -23,9 +23,19 @@
 // (Map iteration order is insertion order in Node).
 
 import crypto from "crypto";
+import { getAiTuningSync } from "./aiConfig.js";
 
-const CLASSWORK_FEEDBACK_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min
-const CLASSWORK_FEEDBACK_CACHE_MAX_ENTRIES = 500;
+// TTL and max size come from StandardPrompt.tuning.cache (see aiConfig.js).
+// Read via getAiTuningSync to keep the cache write path zero-await; falls
+// back to the hardcoded defaults on a cold cache — those match the tuned
+// speed-win values (60m / 500 entries).
+function cacheLimits() {
+  const cfg = getAiTuningSync("cache");
+  return {
+    ttlMs: Number(cfg?.feedbackTtlMs) > 0 ? Number(cfg.feedbackTtlMs) : 60 * 60 * 1000,
+    maxEntries: Number(cfg?.feedbackMaxEntries) > 0 ? Number(cfg.feedbackMaxEntries) : 500,
+  };
+}
 
 const cache = new Map();
 
@@ -107,9 +117,10 @@ export function setCachedFeedback(key, feedback) {
     return;
   }
   const now = Date.now();
-  if (cache.size >= CLASSWORK_FEEDBACK_CACHE_MAX_ENTRIES) {
+  const { ttlMs, maxEntries } = cacheLimits();
+  if (cache.size >= maxEntries) {
     evictExpired(now);
-    if (cache.size >= CLASSWORK_FEEDBACK_CACHE_MAX_ENTRIES) {
+    if (cache.size >= maxEntries) {
       // Still full after expiry sweep — drop the oldest entry.
       const oldestKey = cache.keys().next().value;
       if (oldestKey !== undefined) cache.delete(oldestKey);
@@ -117,7 +128,7 @@ export function setCachedFeedback(key, feedback) {
   }
   cache.set(key, {
     feedback: cloneFeedback(feedback),
-    expiresAt: now + CLASSWORK_FEEDBACK_CACHE_TTL_MS,
+    expiresAt: now + ttlMs,
   });
 }
 

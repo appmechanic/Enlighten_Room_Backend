@@ -64,6 +64,29 @@ const StandardPromptSchema = new mongoose.Schema(
       fallback: { type: String, trim: true, default: "gemini-2.5-flash-lite" },
       image: { type: String, trim: true, default: "gemini-3-pro-image-preview" },
     },
+    // Per-caller retry/backoff policy. Callers with a bigger budget
+    // (assignmentQuestions, classReport) are for background jobs; callers
+    // with a small budget (classworkFeedback, classworkPrecompute) are live
+    // paths where fast failure beats a long stall. See utils/aiConfig.js
+    // for the shape used at call sites.
+    retry: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined,
+    },
+    // Token/thinking budgets, grade bands, multipliers, cache TTLs.
+    // Free-form mixed doc so admins can add new tuning knobs without a
+    // schema migration; utils/aiConfig.js merges over hardcoded fallbacks.
+    tuning: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined,
+    },
+    // Prompt directive overrides keyed by dotted names, e.g.
+    // "classwork.mathEquivalence", "whiteboard.systemInstruction". Empty
+    // string / missing key means "use the code's hardcoded default".
+    directives: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined,
+    },
     updatedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

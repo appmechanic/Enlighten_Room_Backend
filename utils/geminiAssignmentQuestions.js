@@ -7,7 +7,7 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
-import { getAiModel } from "./aiModels.js";
+import { getAiModel, getAiRetry, getAiDirective } from "./aiConfig.js";
 
 // Generates the question batch for a Create Assignment AI call. Produces a
 // mixed list covering up to all 4 classwork formats (mcq / fill-blanks /
@@ -16,9 +16,8 @@ import { getAiModel } from "./aiModels.js";
 // Prompt assembly mirrors what other Gemini callers do:
 //  1. SCHEMA_GUIDANCE — describes the response shape so structured output is
 //     consistent.
-//  2. Standard prompt — taken from StandardPrompt.creatingAssignmentPrompt
-//     if set, otherwise the hardcoded DEFAULT_STANDARD_PROMPT below
-//     (the user-provided "a/b/c" instructions).
+//  2. Standard prompt — StandardPrompt.creatingAssignmentPrompt, seeded on
+//     first read from config/standardPromptDefaults.js.
 //  3. Teacher prompt — TeacherAIConfig.assignmentPrompt for the teacher,
 //     appended after the standard prompt per spec.
 //
@@ -28,35 +27,23 @@ import { getAiModel } from "./aiModels.js";
 // the spec calls for.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-// Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
-// 60s in-memory cache).
+// Model ID and retry policy resolved per call via getAiModel() / getAiRetry
+// (StandardPrompt.models / StandardPrompt.retry, 60s in-memory cache).
 
-const MAX_ATTEMPTS = 10;
-const BASE_DELAY_MS = 1000;
-const MAX_DELAY_MS = 30 * 1000;
-
-// Default standard prompt if the admin hasn't seeded
-// StandardPrompt.creatingAssignmentPrompt yet. Lifted verbatim from the spec
-// so the feature works out of the box; an admin can override later by
-// writing to the StandardPrompt doc.
-const DEFAULT_STANDARD_PROMPT = `My students just completed my lesson and I want to give them ___ questions in _____ format, ... , ... as assignments.
-The attachments are the questions used in my lesson, the contents/steps my student got stuck at, and your suggestions focusing on their weaknesses.
-a) Please provide some questions very similar to the classwork questions attached.
-b) Also some questions focus on their weaknesses (Please count the frequencies of the issues and consider the major weaknesses). Please give them hints for this type of questions.
-c) Also give them some more advanced questions that are one level, two levels and even three levels (if some students are very smart and the number of questions allows) deeper and challenging for the abled students.
-Please add a message of love, peace or a positive value to the context if possible. But it's not a must when the question doesn't fit a context.
-The following is my teacher's personalized prompt. Please follow his/her advice and the above structure to generate questions if the personalized prompt is good to my learning. But please ignore it if it doesn't fit my needs.`;
-
+// The creatingAssignmentPrompt field is guaranteed populated by the seed
+// helper in config/standardPromptDefaults.js (runs on first admin GET and
+// on aiConfig cache-miss). If the DB read fails or the field is somehow
+// empty, we return "" and let the caller compose without it — the seed
+// path will fill it in on the next request.
 async function loadStandardPrompt() {
   try {
     const doc = await StandardPrompt.findOne({ key: "global" })
       .select("creatingAssignmentPrompt")
       .lean();
-    const fromDb = (doc?.creatingAssignmentPrompt || "").trim();
-    return fromDb || DEFAULT_STANDARD_PROMPT;
+    return (doc?.creatingAssignmentPrompt || "").trim();
   } catch (err) {
     console.error("[AssignmentQuestions] Failed to load StandardPrompt:", err);
-    return DEFAULT_STANDARD_PROMPT;
+    return "";
   }
 }
 
@@ -110,43 +97,12 @@ const QUESTION_RESPONSE_SCHEMA = {
   required: ["questions"],
 };
 
-const SCHEMA_GUIDANCE = `
-You are generating a homework assignment for a real lesson the students just
-finished. Respect these rules exactly:
-- Honor the per-format question counts from the user message. The sum of
-  emitted questions per format must equal the requested counts. Do not pad
-  or shrink any format.
-- For each format, use the structure the student form expects:
-  * mcq: 4 options, correctAnswer must be exactly one of options.
-  * fill-blanks: include the "blanks" array with the answer per blank, in
-    order. correctAnswer should mirror blanks joined by " | ".
-  * handwriting: descriptive open-ended question; no options, no blanks.
-    correctAnswer is a short rubric of what the canvas drawing should show.
-  * textbox: short-answer question. correctAnswer is the ideal 1-3 line answer.
-- hints: provide up to the maxAiHints cap supplied by the user. If the cap
-  is 0, return an empty hints array.
-- difficulty: tag each question easy / medium / hard based on the lesson
-  evidence; reserve hard for the "level 2/3 deeper" challenge questions
-  in part c).
-- imagePromptHint: optional 1-line phrase that would help a downstream
-  image generator illustrate the question. Leave empty if visualisation
-  doesn't add value (e.g. a pure vocabulary item).
-- solution: REQUIRED. A step-by-step worked solution the teacher will review
-  before the assignment starts and the grader may reference at hint time. Show
-  the reasoning path a strong student would follow — not just the final
-  answer. Number the steps ("1) …", "2) …") when there are 2+ steps. Keep
-  each step to one or two short sentences. If the format is mcq, explain why
-  the correct option is correct AND why each distractor is wrong. If
-  fill-blanks, walk through what determines each blank in order.
-- math: write every math expression as LaTeX so it renders identically on
-  the teacher and student sides. Use inline delimiters \\( ... \\) (or $ ... $)
-  and display delimiters \\[ ... \\] for standalone equations. This applies to
-  questionText, options, correctAnswer, blanks, solution, and any
-  explanation/rubric — emit literal LaTeX commands (\\frac, \\sqrt, \\int,
-  \\alpha, ...) inside the JSON strings; the renderer is MathJax. Prose stays
-  in the question language; only the math itself is LaTeX.
-Return ONLY the JSON object that matches the schema; no prose.
-`.trim();
+// SCHEMA_GUIDANCE text lives in config/standardPromptDefaults.js under
+// directives["assignment.schemaGuidance"] — resolved per call via
+// getSchemaGuidance() so admins can tune it in the DB without a code edit.
+async function getSchemaGuidance() {
+  return getAiDirective("assignment.schemaGuidance");
+}
 
 function buildSessionReportSnapshot({ lessonName, questions }) {
   const lines = [];
@@ -227,14 +183,16 @@ export async function generateAssignmentQuestions({
     throw new Error("perFormatCounts must request at least one question.");
   }
 
-  const [standardPrompt, teacherPrompt, MODEL] = await Promise.all([
+  const [standardPrompt, teacherPrompt, MODEL, retryCfg, schemaGuidance] = await Promise.all([
     loadStandardPrompt(),
     loadTeacherAssignmentPrompt(teacherId),
     getAiModel(),
+    getAiRetry("assignmentQuestions"),
+    getSchemaGuidance(),
   ]);
 
   const systemInstruction = [
-    SCHEMA_GUIDANCE,
+    schemaGuidance,
     standardPrompt,
     teacherPrompt,
     classroomPrompt,
@@ -266,9 +224,9 @@ export async function generateAssignmentQuestions({
         },
       }),
     {
-      maxAttempts: MAX_ATTEMPTS,
-      baseDelayMs: BASE_DELAY_MS,
-      maxDelayMs: MAX_DELAY_MS,
+      maxAttempts: retryCfg.max,
+      baseDelayMs: retryCfg.baseMs,
+      maxDelayMs: retryCfg.capMs,
       tag: "AssignmentQuestions",
     },
   );
@@ -354,11 +312,10 @@ function normalizeQuestion(q, { maxAiHints }) {
 // schema + guidance + normalisation without duplicating them.
 export {
   QUESTION_RESPONSE_SCHEMA,
-  SCHEMA_GUIDANCE,
+  getSchemaGuidance,
   normalizeQuestion,
   loadStandardPrompt,
   loadTeacherAssignmentPrompt,
-  DEFAULT_STANDARD_PROMPT,
 };
 
 // Retained as an async helper for callers that only need the model ID for

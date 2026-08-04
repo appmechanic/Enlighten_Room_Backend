@@ -12,7 +12,7 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
-import { getAiModel } from "./aiModels.js";
+import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // Model IDs come from StandardPrompt.models via getAiModel() (60s in-memory
@@ -23,117 +23,33 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // waiting out the retry ladder. Same JSON shape as flash so the shaping code
 // below doesn't need to branch. An admin can disable the fallback by setting
 // StandardPrompt.models.fallback to the same value as models.default.
-// Thinking budget is derived from the resolved output-token budget as a
-// share. Applies only on the no-precompute path — when the canonical
-// solution already rides in systemInstruction we set thinking to 0.
-const THINKING_BUDGET_RATIO = 0.2;
-// When the canonical solution is already cached, the model has the answer and
-// needs (almost) no thinking to write a hint — so thinking drops to 0 to
-// minimize the pre-stream delay before the live hint starts typing. The ONE
-// exception is handwriting: the student's answer is an IMAGE the model must
-// still read/transcribe before it can give feedback, so it keeps a small
-// (capped) budget. Textbox used to be here too, but a cached solution makes
-// even a free-form textbox answer cheap to evaluate, and the extra thinking
-// was the main source of dead air — so it now gets 0 like every other format.
-const IMAGE_STUDY_FORMATS = new Set(["handwriting"]);
-const DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS = 800;
-// Absolute ceiling on the thinking budget. Thinking tokens are produced
-// BEFORE the first visible `hintStream` character, so they are pure
-// time-to-first-token latency on the streaming path. A teacher can set a
-// large maxOutputTokens (e.g. 70k for long handwriting answers); without
-// this cap the 0.2 share alone would be ~14k thinking tokens => many
-// seconds of dead air before the hint starts typing. 2048 keeps enough
-// room to reason about a single submission while bounding that delay.
-const MAX_THINKING_BUDGET = 2048;
-const MAX_ATTEMPTS = 3;
-const BASE_DELAY_MS = 500;
+// Tuning constants (thinkingBudgetRatio, maxThinkingBudget,
+// defaultMaxOutputTokens, imageStudyFormats) are resolved per call via
+// getAiTuning("feedback") from StandardPrompt.tuning.feedback. Retry budget
+// via getAiRetry("classworkFeedback"). All values have hardcoded fallbacks in
+// utils/aiConfig.js so a missing DB field never breaks the flow.
 
 // Derive the Gemini thinking budget from the resolved output-token budget.
 // No cached solution -> full share (the model must derive the answer).
-// Cached solution -> 0 for everything except handwriting, which keeps a small
-// capped budget to read the answer image. The result is capped by
-// MAX_THINKING_BUDGET so a huge output budget can't translate into a long
-// pre-stream thinking delay before the hint appears.
-function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format) {
-  const share = Math.round(resolvedMaxOutputTokens * THINKING_BUDGET_RATIO);
-  if (!hasCachedSolution) return Math.min(share, MAX_THINKING_BUDGET);
-  if (IMAGE_STUDY_FORMATS.has(format)) {
-    return Math.min(Math.round(share / 2), MAX_THINKING_BUDGET);
+// Cached solution -> 0 for everything except handwriting/imageStudy formats,
+// which keep a small capped budget to read the answer image. The result is
+// capped by tuning.maxThinkingBudget so a huge output budget can't translate
+// into a long pre-stream thinking delay before the hint appears.
+function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format, tuning) {
+  const share = Math.round(resolvedMaxOutputTokens * tuning.thinkingBudgetRatio);
+  const imageStudy = new Set(tuning.imageStudyFormats || []);
+  if (!hasCachedSolution) return Math.min(share, tuning.maxThinkingBudget);
+  if (imageStudy.has(format)) {
+    return Math.min(Math.round(share / 2), tuning.maxThinkingBudget);
   }
   return 0;
 }
 
-// Attached to the user prompt on the first classwork submission for a
-// question so Gemini computes the canonical solution once; every later
-// call in the class (and every assignment call) gets the "skip" line
-// instead to save output tokens.
-const STANDARD_SOLUTION_COMPUTE_INSTRUCTION =
-  'standardSolution: please return a string of the step-by-step solution of this question. Please use "\\n" to separate multiple lines. Please use Latex form for all math expressions and formulas. Please create a sample writing and rubrics for an essay writing question instead of step-by-step solution.';
-const STANDARD_SOLUTION_SKIP_INSTRUCTION = "standardSolution: Leave it empty";
-
-// Attached until the per-question aiFeedbackCache is finalized (classwork)
-// or omitted entirely (assignment). Once the cache is finalized we tell
-// Gemini to skip mistake analysis on every subsequent call.
-const COMMON_MISTAKE_COMPUTE_INSTRUCTION = [
-  "commonMistake: {",
-  "  properties: {",
-  "    isCommon: Type.BOOLEAN — return true if you predict the first mistake of this solution is very common (more than half of this grade's students would make it).",
-  "    title: Type.STRING — a short title for the mistake.",
-  "    answerLatex: Type.STRING — if the student's answer is a handwriting image, return the LaTeX transcription of the handwriting. Use LaTeX for all math expressions.",
-  "  }",
-  "}",
-].join("\n");
-const COMMON_MISTAKE_SKIP_INSTRUCTION = "commonMistake: Leave it empty";
-
-// `hintStream` is the ONLY field streamed to the student live, yet the
-// standard prompt never defined it — so the model was filling it with just
-// a greeting (≈ part1[0]) and the actually-useful guidance ended up in
-// part2, which the student only sees after the stream finishes. This
-// directive is always attached so the live hint stands on its own.
-const HINT_STREAM_INSTRUCTION =
-  "hintStream: This is the ONLY text the student watches stream live, so it must stand alone as a genuinely useful hint. Write 2-4 complete sentences in the language of the original question that (1) greet the student by first name, (2) briefly acknowledge what they did right, and (3) give the single most important next-step nudge toward the correct method — WITHOUT revealing the final answer. Do NOT put only a greeting here, and do NOT just repeat part1.";
-
-// Judge answers by mathematical value, NOT string form. Students routinely
-// write `sin4x` for `sin(4x)`, `1/x^3` for `x^-3`, `\frac{1}{2}` for `1/2`,
-// etc. Without this directive Gemini has been flagging these as wrong even
-// when the underlying expression matches the reference answer. Always
-// attached to every classwork + assignment judgment call.
-const MATH_EQUIVALENCE_INSTRUCTION = [
-  "MATHEMATICAL EQUIVALENCE — CRITICAL:",
-  "When deciding if the student's answer matches the reference answer, judge by MATHEMATICAL VALUE, not string form. Two expressions that simplify to the same thing are the SAME answer, regardless of notation. Do NOT mark an answer wrong for a notation/format difference alone.",
-  "Treat ALL of the following as equivalent:",
-  "- Implicit parentheses around single-term function arguments: sin4x = sin(4x) = \\sin(4x) = \\sin 4x; cos2x = cos(2x); tan(x/2) = tan x/2; log5x = log(5x); ln2x = ln(2x); sqrt2x = sqrt(2x) = \\sqrt{2x}.",
-  "- Implicit multiplication: 2x = 2*x = 2·x = 2 \\cdot x; 3cos(x) = 3*cos(x) = 3 cos(x); (2)(3) = 2·3 = 6.",
-  "- LaTeX vs plain text: \\sin, \\cos, \\tan, \\log, \\ln, \\sqrt, \\pi, \\theta, \\alpha, \\infty are the same as sin, cos, tan, log, ln, sqrt, pi, theta, alpha, infinity/∞.",
-  "- Fractions: \\frac{a}{b} = a/b = (a)/(b) = a÷b; \\dfrac and \\tfrac behave the same as \\frac.",
-  "- Exponents & roots: x^-3 = x^{-3} = 1/x^3 = 1/(x^3) = \\frac{1}{x^3}; x^(1/2) = x^{1/2} = sqrt(x) = \\sqrt{x}; x^2 = x*x = x·x.",
-  "- Negative / reciprocal forms: -2x^-3 = -2/x^3 = -\\frac{2}{x^3}.",
-  "- Coefficient placement: (3/2)cos(x) = 3/2 · cos(x) = 1.5cos(x) = \\frac{3}{2}\\cos(x) = \\frac{3\\cos(x)}{2}.",
-  "- Order of commutative terms: a+b = b+a; a·b = b·a; sums/products can be reordered.",
-  "- Equivalent constants: 0.5 = 1/2 = \\frac{1}{2}; π ≈ 3.14159 (any exact symbolic form counts).",
-  "- Whitespace, capitalization of function names (SIN vs sin), and stray surrounding parentheses do not change the answer.",
-  "- Trigonometric / algebraic identities that produce the SAME simplified form (e.g. 2sin(x)cos(x) = sin(2x)).",
-  "ONLY mark the answer incorrect when the expressions evaluate to different mathematical values. If you are unsure whether two forms are equivalent, mentally substitute a sample value (e.g. x=1, x=2) into both — if they agree for every value in the domain, they are equivalent.",
-].join("\n");
-
-// Ask/Tell pedagogy. The backend passes the 1-based attempt number for this
-// (student, question); odd attempts coach the student to RECALL the method
-// themselves (no formula given), even attempts EXPLAIN it. This alternation
-// is what a plain prompt cannot do on its own — it needs the runtime count.
-const ASK_MODE_INSTRUCTION = [
-  "PEDAGOGY MODE = ASK (this is an odd-numbered attempt).",
-  "Do NOT state the correct formula, operation, rule, or final answer. Instead, guide the student to recall it themselves:",
-  "- hintStream: acknowledge what they did right, then ask 1-2 leading questions that point at the method (e.g. \"Which operation undoes multiplication?\", \"What could you do to BOTH sides to isolate the variable?\"). Encourage them to try again.",
-  "- part2: keep the 🛑/✅/🔨 structure, but phrase ✅ and 🔨 as QUESTIONS or nudges that make the student think — do not name the formula outright.",
-  "Stay warm and encouraging so they feel safe trying again.",
-].join("\n");
-const TELL_MODE_INSTRUCTION = [
-  "PEDAGOGY MODE = TELL (this is an even-numbered attempt).",
-  "The student already had a turn to think, so now teach directly:",
-  "- part2: in ✅ state the correct formula/operation/rule plainly, and in 🔨 show step-by-step HOW to apply it to this problem. Be clear and instructive.",
-  "- hintStream: give the key explanation in plain language so it reads well live.",
-  "You may fully explain the method; still let the student carry out the final calculation themselves rather than only printing the final number.",
-].join("\n");
+// Every prompt directive attached below is resolved per call via
+// getAiDirective(key). The canonical text lives in
+// config/standardPromptDefaults.js and is seeded into StandardPrompt on
+// first read; admin edits in the AdminAiPrompts UI override the seed value.
+// See utils/aiConfig.js for the DB-read + 60s cache.
 
 // Property order matters: Gemini emits structured-JSON fields in the
 // order they appear in the schema, so the student-facing text
@@ -402,9 +318,28 @@ async function buildGeminiRequest({
   console.log(`[ClassworkFeedback][req=${reqId}] === PROMPT ===`);
   console.log(`[ClassworkFeedback][req=${reqId}] teacherId:`, teacherId || "(missing)");
 
-  const [{ text: standardText, hash: standardPromptHash }, teacherPrompt] = await Promise.all([
+  const [
+    { text: standardText, hash: standardPromptHash },
+    teacherPrompt,
+    STANDARD_SOLUTION_COMPUTE_INSTRUCTION,
+    STANDARD_SOLUTION_SKIP_INSTRUCTION,
+    COMMON_MISTAKE_COMPUTE_INSTRUCTION,
+    COMMON_MISTAKE_SKIP_INSTRUCTION,
+    HINT_STREAM_INSTRUCTION,
+    MATH_EQUIVALENCE_INSTRUCTION,
+    ASK_MODE_INSTRUCTION,
+    TELL_MODE_INSTRUCTION,
+  ] = await Promise.all([
     getStandardPromptCached(),
     getTeacherPromptCached(teacherId),
+    getAiDirective("classwork.solutionCompute"),
+    getAiDirective("classwork.solutionSkip"),
+    getAiDirective("classwork.mistakeCompute"),
+    getAiDirective("classwork.mistakeSkip"),
+    getAiDirective("classwork.hintStream"),
+    getAiDirective("classwork.mathEquivalence"),
+    getAiDirective("classwork.askMode"),
+    getAiDirective("classwork.tellMode"),
   ]);
 
   const cachedSolution =
@@ -638,9 +573,11 @@ export async function getClassworkAiFeedback({
   computeCommonMistake = false,
 }) {
   const reqId = newReqId();
-  const [MODEL, FALLBACK_MODEL] = await Promise.all([
+  const [MODEL, FALLBACK_MODEL, retryCfg, feedbackTuning] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
+    getAiRetry("classworkFeedback"),
+    getAiTuning("feedback"),
   ]);
   const {
     systemInstruction,
@@ -671,7 +608,7 @@ export async function getClassworkAiFeedback({
   const resolvedMaxOutputTokens =
     Number(maxOutputTokens) > 0
       ? Number(maxOutputTokens)
-      : DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS;
+      : feedbackTuning.defaultMaxOutputTokens;
   // Bind thinking to a fixed share of the output budget (see
   // THINKING_BUDGET_RATIO / resolveThinkingBudget). When the canonical
   // solution is cached the model has nothing left to derive, so thinking
@@ -680,7 +617,8 @@ export async function getClassworkAiFeedback({
   const thinkingBudget = resolveThinkingBudget(
     resolvedMaxOutputTokens,
     hasCachedSolution,
-    format
+    format,
+    feedbackTuning
   );
 
   const config = {
@@ -705,8 +643,9 @@ export async function getClassworkAiFeedback({
   const result = await withGeminiRetry(
     () => ai.models.generateContent({ model: MODEL, contents, config }),
     {
-      maxAttempts: MAX_ATTEMPTS,
-      baseDelayMs: BASE_DELAY_MS,
+      maxAttempts: retryCfg.max,
+      baseDelayMs: retryCfg.baseMs,
+      maxDelayMs: retryCfg.capMs,
       tag: `ClassworkFeedback:${reqId}`,
       fallbackCallFn: FALLBACK_MODEL
         ? () =>
@@ -927,9 +866,11 @@ export async function getClassworkAiFeedbackStream({
   onHintDelta,
 }) {
   const reqId = newReqId();
-  const [MODEL, FALLBACK_MODEL] = await Promise.all([
+  const [MODEL, FALLBACK_MODEL, retryCfg, feedbackTuning] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
+    getAiRetry("classworkFeedback"),
+    getAiTuning("feedback"),
   ]);
   const {
     systemInstruction,
@@ -960,11 +901,12 @@ export async function getClassworkAiFeedbackStream({
   const resolvedMaxOutputTokens =
     Number(maxOutputTokens) > 0
       ? Number(maxOutputTokens)
-      : DEFAULT_FEEDBACK_MAX_OUTPUT_TOKENS;
+      : feedbackTuning.defaultMaxOutputTokens;
   const thinkingBudget = resolveThinkingBudget(
     resolvedMaxOutputTokens,
     hasCachedSolution,
-    format
+    format,
+    feedbackTuning
   );
 
   const config = {
@@ -1017,8 +959,9 @@ export async function getClassworkAiFeedbackStream({
   };
 
   const usageBearingChunk = await withGeminiRetry(openAndDrainWith(MODEL), {
-    maxAttempts: MAX_ATTEMPTS,
-    baseDelayMs: BASE_DELAY_MS,
+    maxAttempts: retryCfg.max,
+    baseDelayMs: retryCfg.baseMs,
+    maxDelayMs: retryCfg.capMs,
     tag: `ClassworkFeedback:${reqId}:stream`,
     fallbackCallFn: FALLBACK_MODEL ? openAndDrainWith(FALLBACK_MODEL) : undefined,
   });

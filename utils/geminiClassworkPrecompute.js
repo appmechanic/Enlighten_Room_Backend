@@ -5,7 +5,7 @@ import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry } from "./geminiCommon.js";
 import { recordAiTokenUsage, logAiUsage } from "./aiTokenUsage.js";
-import { getAiModel } from "./aiModels.js";
+import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
 
 // Two one-off Gemini calls made at question CREATION time so every subsequent
 // per-student submission can skip the heavy work:
@@ -17,10 +17,8 @@ import { getAiModel } from "./aiModels.js";
 //      Gemini to re-derive the solution for every submission.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-// Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
-// 60s in-memory cache).
-const MAX_ATTEMPTS = 3;
-const BASE_DELAY_MS = 500;
+// Model ID and retry policy resolved per call via getAiModel() / getAiRetry
+// (StandardPrompt.models / StandardPrompt.retry, 60s in-memory cache).
 
 function newReqId() {
   return crypto.randomBytes(3).toString("hex");
@@ -86,9 +84,12 @@ export async function precomputeQuestionImageText({ imageSource, sessionId }) {
     const inline = await sourceToInlineData(imageSource);
     if (!inline) return "";
 
-    const MODEL = await getAiModel();
-    const instruction =
-      "Transcribe every visible element of this question image into plain text so it can stand in for the image in later prompts. Use LaTeX for all math expressions and formulas. Preserve numbered/lettered lists and multi-line layouts using newlines. Do not solve the question. Return the transcription only, no preamble.";
+    const [MODEL, retryCfg, precomputeTuning, instruction] = await Promise.all([
+      getAiModel(),
+      getAiRetry("classworkPrecompute"),
+      getAiTuning("precompute"),
+      getAiDirective("precompute.imageTranscribe"),
+    ]);
 
     console.log(`[ClassworkPrecompute][req=${reqId}] === IMAGE-TO-TEXT ===`);
 
@@ -109,13 +110,16 @@ export async function precomputeQuestionImageText({ imageSource, sessionId }) {
           ],
           config: {
             // Text output; no JSON schema — we want the raw transcription.
-            maxOutputTokens: 2000,
-            thinkingConfig: { thinkingBudget: 1200 },
+            // Budgets tunable via StandardPrompt.tuning.precompute
+            // (imageMaxTokens / imageThinkingBudget).
+            maxOutputTokens: precomputeTuning.imageMaxTokens,
+            thinkingConfig: { thinkingBudget: precomputeTuning.imageThinkingBudget },
           },
         }),
       {
-        maxAttempts: MAX_ATTEMPTS,
-        baseDelayMs: BASE_DELAY_MS,
+        maxAttempts: retryCfg.max,
+        baseDelayMs: retryCfg.baseMs,
+        maxDelayMs: retryCfg.capMs,
         tag: `ClassworkPrecompute:img:${reqId}`,
       },
     );
@@ -157,10 +161,13 @@ export async function precomputeStandardSolution({
 }) {
   const reqId = newReqId();
   try {
-    const [standardText, teacherPrompt, MODEL] = await Promise.all([
+    const [standardText, teacherPrompt, MODEL, retryCfg, precomputeTuning, solutionHeader] = await Promise.all([
       loadStandardPromptText(),
       loadTeacherPrompt(teacherId),
       getAiModel(),
+      getAiRetry("classworkPrecompute"),
+      getAiTuning("precompute"),
+      getAiDirective("precompute.solution"),
     ]);
     const systemInstruction = [standardText, teacherPrompt]
       .filter(Boolean)
@@ -172,7 +179,7 @@ export async function precomputeStandardSolution({
       : questionText || "";
 
     const instruction = [
-      "Produce the canonical step-by-step solution to the question below so it can be cached and reused for every student's submission. Use LaTeX for math expressions and formulas. For essay-writing questions, produce a sample response and rubric bullets rather than numeric steps. Use \"\\n\" between lines. Return the solution text only — no JSON wrapper, no preamble.",
+      solutionHeader,
       `Question format: ${format || "unspecified"}`,
       `Question: ${questionForPrompt}`,
       referenceAnswer
@@ -194,7 +201,9 @@ export async function precomputeStandardSolution({
     }
 
     const resolvedMax =
-      Number(maxOutputTokens) > 0 ? Number(maxOutputTokens) : 2000;
+      Number(maxOutputTokens) > 0
+        ? Number(maxOutputTokens)
+        : precomputeTuning.solutionMaxTokens;
 
     console.log(
       `[ClassworkPrecompute][req=${reqId}] === SOLUTION === teacherId=${teacherId || "(none)"} maxOutputTokens=${resolvedMax}`,
@@ -209,13 +218,14 @@ export async function precomputeStandardSolution({
             systemInstruction,
             maxOutputTokens: resolvedMax,
             thinkingConfig: {
-              thinkingBudget: Math.round(resolvedMax * 0.6),
+              thinkingBudget: Math.round(resolvedMax * precomputeTuning.solutionThinkingRatio),
             },
           },
         }),
       {
-        maxAttempts: MAX_ATTEMPTS,
-        baseDelayMs: BASE_DELAY_MS,
+        maxAttempts: retryCfg.max,
+        baseDelayMs: retryCfg.baseMs,
+        maxDelayMs: retryCfg.capMs,
         tag: `ClassworkPrecompute:sol:${reqId}`,
       },
     );

@@ -7,12 +7,12 @@ import {
 } from "./aiTokenUsage.js";
 import {
   QUESTION_RESPONSE_SCHEMA,
-  SCHEMA_GUIDANCE,
+  getSchemaGuidance,
   normalizeQuestion,
   loadStandardPrompt,
   loadTeacherAssignmentPrompt,
 } from "./geminiAssignmentQuestions.js";
-import { getAiModel } from "./aiModels.js";
+import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
 
 // Individual-assignment generator: one AI call per selected student, all
 // sharing a single Gemini explicit-cache handle. The cache holds:
@@ -35,32 +35,18 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // Model ID resolved per call via getAiModel() (StandardPrompt.models.default,
 // 60s in-memory cache) and threaded into helpers so the shared explicit-cache
 // and every per-student call use the same value.
-const CACHE_TTL_SECONDS = 3600;
+// Gemini explicit-cache TTL comes from tuning.cache.geminiExplicitCacheTtlSeconds
+// (default 3600). Resolved inside the entry function so admin edits take
+// effect within one 60s config-cache TTL.
 
-const MAX_ATTEMPTS = 8;
-const BASE_DELAY_MS = 1000;
-const MAX_DELAY_MS = 30 * 1000;
-// Cap parallel per-student calls so we don't blow through Gemini QPS or
-// stall the whole controller on a single retry storm.
-const STUDENT_CONCURRENCY = 3;
+// Retry policy + parallel-student concurrency resolved per call via
+// getAiRetry("individualAssignment"). Admin can tune both via
+// StandardPrompt.retry.individualAssignment (.max/.baseMs/.capMs/.concurrency).
+// Higher concurrency halves wall time for larger classes but risks 429s.
 
-// Instructions appended to every per-student user message. Enforces the
-// "discuss first, then generate" flow the teacher asked for and locks the
-// tier-A (hard) constraint.
-const PER_STUDENT_TASK_PROMPT = `
-Do this in order:
-1. Silently reason about the contents of the individual reports below —
-   which classwork questions this student struggled with, which Part-3
-   diagnostic-training advisories they've already been given, and what
-   the recurring weakness pattern is. Do NOT emit this reasoning as prose;
-   it only shapes your question choices.
-2. Emit ONLY hard-difficulty ("tier A") questions per the schema. Every
-   emitted question must have difficulty="hard". Target the weakness pattern
-   from step 1, but keep the questions solvable — challenging, not cruel.
-3. Honor the per-format counts exactly as requested in the shared context.
-4. Every question must include a complete step-by-step "solution" field
-   walking through the reasoning a strong student would follow. Math in LaTeX.
-`.trim();
+// Per-student task directive resolved per call via getAiDirective. Canonical
+// text lives in config/standardPromptDefaults.js under
+// directives["assignment.perStudentTask"].
 
 function buildSharedContextTurn({
   perFormatCounts,
@@ -94,7 +80,7 @@ function buildSharedContextTurn({
   return lines.join("\n");
 }
 
-function buildStudentTurn({ studentName, studentReports }) {
+function buildStudentTurn({ studentName, studentReports, taskPrompt }) {
   const lines = [];
   lines.push(`=== Individual reports for ${studentName || "this student"} ===`);
   if (!studentReports.length) {
@@ -131,7 +117,7 @@ function buildStudentTurn({ studentName, studentReports }) {
     }
   });
   lines.push("");
-  lines.push(PER_STUDENT_TASK_PROMPT);
+  lines.push(taskPrompt || "");
   return lines.join("\n");
 }
 
@@ -158,6 +144,7 @@ async function createSharedCache({
   contextTurnText,
   tag,
   model,
+  ttlSeconds,
 }) {
   try {
     const cache = await ai.caches.create({
@@ -165,7 +152,7 @@ async function createSharedCache({
       config: {
         systemInstruction,
         contents: [{ role: "user", parts: [{ text: contextTurnText }] }],
-        ttl: `${CACHE_TTL_SECONDS}s`,
+        ttl: `${ttlSeconds}s`,
       },
     });
     return { name: cache?.name || "", ok: true };
@@ -190,8 +177,10 @@ async function generateForStudent({
   studentId,
   tag,
   model,
+  retryCfg,
+  taskPrompt,
 }) {
-  const studentTurnText = buildStudentTurn({ studentName, studentReports });
+  const studentTurnText = buildStudentTurn({ studentName, studentReports, taskPrompt });
 
   const contents = cacheName
     ? [{ role: "user", parts: [{ text: studentTurnText }] }]
@@ -215,9 +204,9 @@ async function generateForStudent({
   const result = await withGeminiRetry(
     () => ai.models.generateContent({ model, contents, config }),
     {
-      maxAttempts: MAX_ATTEMPTS,
-      baseDelayMs: BASE_DELAY_MS,
-      maxDelayMs: MAX_DELAY_MS,
+      maxAttempts: retryCfg.max,
+      baseDelayMs: retryCfg.baseMs,
+      maxDelayMs: retryCfg.capMs,
       tag,
     },
   );
@@ -281,11 +270,16 @@ export async function generateIndividualAssignmentQuestions({
     throw new Error("perFormatCounts must request at least one question.");
   }
 
-  const [standardPrompt, teacherPrompt, MODEL] = await Promise.all([
+  const [standardPrompt, teacherPrompt, MODEL, retryCfg, cacheTuning, taskPrompt] = await Promise.all([
     loadStandardPrompt(),
     loadTeacherAssignmentPrompt(teacherId),
     getAiModel(),
+    getAiRetry("individualAssignment"),
+    getAiTuning("cache"),
+    getAiDirective("assignment.perStudentTask"),
   ]);
+  const STUDENT_CONCURRENCY = Math.max(1, Number(retryCfg.concurrency) || 5);
+  const explicitCacheTtl = Math.max(60, Number(cacheTuning?.geminiExplicitCacheTtlSeconds) || 3600);
 
   const systemInstruction = [
     SCHEMA_GUIDANCE,
@@ -311,6 +305,7 @@ export async function generateIndividualAssignmentQuestions({
     contextTurnText,
     tag,
     model: MODEL,
+    ttlSeconds: explicitCacheTtl,
   });
 
   const perStudent = new Array(perStudentData.length);
@@ -334,6 +329,8 @@ export async function generateIndividualAssignmentQuestions({
             studentId: s.studentId,
             tag,
             model: MODEL,
+            retryCfg,
+            taskPrompt,
           });
           cachedContentTokenCount +=
             Number(usageMetadata?.cachedContentTokenCount) || 0;

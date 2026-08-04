@@ -7,7 +7,7 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
-import { getAiModel } from "./aiModels.js";
+import { getAiModel, getAiRetry } from "./aiConfig.js";
 
 // Generates a question illustration with Gemini 3 Pro Image (Nano Banana Pro)
 // and uploads it to DigitalOcean Spaces, returning the public URL. Used by the
@@ -24,8 +24,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // text-generation models) resolved per call via getAiModel("image") from
 // StandardPrompt.models.image with a 60s in-memory cache.
 
-const MAX_ATTEMPTS = 4;
-const BASE_DELAY_MS = 1500;
+// Retry policy resolved per call via getAiRetry("assignmentImage").
 
 const bucketName = process.env.DO_SPACE_BUCKET;
 const spaceEndpoint = process.env.DO_SPACE_ENDPOINT;
@@ -100,7 +99,10 @@ export async function generateAssignmentQuestionImage({
   if (!questionText) return null;
 
   try {
-    const IMAGE_MODEL = await getAiModel("image");
+    const [IMAGE_MODEL, retryCfg] = await Promise.all([
+      getAiModel("image"),
+      getAiRetry("assignmentImage"),
+    ]);
     const result = await withGeminiRetry(
       () =>
         ai.models.generateContent({
@@ -119,8 +121,9 @@ export async function generateAssignmentQuestionImage({
           },
         }),
       {
-        maxAttempts: MAX_ATTEMPTS,
-        baseDelayMs: BASE_DELAY_MS,
+        maxAttempts: retryCfg.max,
+        baseDelayMs: retryCfg.baseMs,
+        maxDelayMs: retryCfg.capMs,
         tag: "AssignmentImage",
       },
     );

@@ -49,6 +49,7 @@ import articleRoutes from "./routes/articleRoutes.js";
 import connectToDatabase from "./config/db.js";
 import Keys from "./models/keys.js";
 import adminDashboardRoutes from "./routes/adminDashboardRoute.js";
+import aiConfigRoutes from "./routes/aiConfigRoutes.js";
 import whiteBoardRoutes from "./routes/whiteBoardRoute.js";
 import contactRoutes from "./routes/contactRoutes.js";
 import howItWorksRoutes from "./routes/howItWorks.routes.js";
@@ -148,6 +149,8 @@ app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/team", teamRoutes);
 // admin dashboard
 app.use("/api/admin", adminDashboardRoutes);
+// public AI tuning config (grade bands, multipliers) — read-only, no auth
+app.use("/api/ai-config", aiConfigRoutes);
 //home page counter
 app.use("/api/home", homeCounterRoutes);
 
