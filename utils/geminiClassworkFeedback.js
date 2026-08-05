@@ -304,6 +304,7 @@ async function buildGeminiRequest({
   questionImageText,
   answer,
   correctAnswer,
+  derivedCorrectAnswer,
   questionImage,
   format,
   studentName,
@@ -369,6 +370,13 @@ async function buildGeminiRequest({
     : referenceAnswer
       ? 1
       : 0;
+  // When the teacher didn't attach a correctAnswer, fall back to the answer
+  // the precompute step distilled from the canonical solution — otherwise
+  // the model has nothing concrete to compare the student's answer against
+  // and `correct` is essentially a guess.
+  const derivedReferenceAnswer = referenceAnswer
+    ? ""
+    : formatCorrectAnswerForPrompt(derivedCorrectAnswer);
   const answerImageSource = getAnswerImageSource(answer);
 
   // Fold the pre-OCR'd question image transcription into the question text
@@ -408,7 +416,9 @@ async function buildGeminiRequest({
       ? referenceCount > 1
         ? `Acceptable correct answers (any one counts as correct):\n${referenceAnswer}`
         : `Reference / Correct Answer: ${referenceAnswer}`
-      : null,
+      : derivedReferenceAnswer
+        ? `Reference / Correct Answer (AI-derived at question-create time from the canonical solution — use as ground truth unless the solution above contradicts it): ${derivedReferenceAnswer}`
+        : null,
     `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
     includeRawQuestionImage ? "A question image is attached." : null,
     answerImageSource
@@ -557,6 +567,7 @@ export async function getClassworkAiFeedback({
   questionImageText,
   answer,
   correctAnswer,
+  derivedCorrectAnswer,
   questionImage,
   format,
   studentName,
@@ -593,6 +604,7 @@ export async function getClassworkAiFeedback({
     questionImageText,
     answer,
     correctAnswer,
+    derivedCorrectAnswer,
     questionImage,
     format,
     studentName,
@@ -849,6 +861,7 @@ export async function getClassworkAiFeedbackStream({
   questionImageText,
   answer,
   correctAnswer,
+  derivedCorrectAnswer,
   questionImage,
   format,
   studentName,
@@ -886,6 +899,7 @@ export async function getClassworkAiFeedbackStream({
     questionImageText,
     answer,
     correctAnswer,
+    derivedCorrectAnswer,
     questionImage,
     format,
     studentName,

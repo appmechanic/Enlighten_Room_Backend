@@ -236,7 +236,17 @@ const PRECOMPUTE_IMAGE_TRANSCRIBE_DEFAULT =
   "Transcribe every visible element of this question image into plain text so it can stand in for the image in later prompts. Use LaTeX for all math expressions and formulas. Preserve numbered/lettered lists and multi-line layouts using newlines. Do not solve the question. Return the transcription only, no preamble.";
 
 const PRECOMPUTE_SOLUTION_DEFAULT =
-  'Produce the canonical step-by-step solution to the question below so it can be cached and reused for every student\'s submission. Use LaTeX for math expressions and formulas. For essay-writing questions, produce a sample response and rubric bullets rather than numeric steps. Use "\\n" between lines. Return the solution text only — no JSON wrapper, no preamble.';
+  'Produce the canonical step-by-step solution to the question below so it can be cached and reused for every student\'s submission. Use LaTeX for math expressions and formulas. For essay-writing questions, produce a sample response and rubric bullets rather than numeric steps. Use "\\n" between lines.';
+
+// The precompute call is invoked with responseMimeType=application/json +
+// responseSchema, so Gemini must return a two-field JSON object rather than
+// bare solution text. This directive tells the model what each field should
+// contain — especially how to distill the final answer from the solution so
+// it can be persisted as `derivedCorrectAnswer` and used as the fallback
+// reference in per-submission feedback prompts when the teacher didn't
+// attach a correctAnswer.
+const PRECOMPUTE_SOLUTION_JSON_ENVELOPE_DEFAULT =
+  'Return a single JSON object with exactly two fields: "solution" (the canonical step-by-step solution described above; keep the LaTeX and multi-line formatting) and "finalAnswer" (the single canonical answer to the question in its natural format — for MCQ the exact option text, for fill-in-the-blank a comma-separated list of blank values in order, for textbox/handwriting the final expression or value, for essay a 1-2 sentence rubric-style summary). Emit no text outside the JSON.';
 
 const REPORT_DIFFICULTIES_DIRECTIVE_DEFAULT =
   "For this call, produce ONLY the studentDifficulties section — a list of the specific difficulties students had and which students were affected. Do NOT include nextLessonStrategy or targetedHomework.";
@@ -350,6 +360,7 @@ export const DIRECTIVE_DEFAULTS = {
   "report.strategiesDirective": REPORT_STRATEGIES_DIRECTIVE_DEFAULT,
   "precompute.imageTranscribe": PRECOMPUTE_IMAGE_TRANSCRIBE_DEFAULT,
   "precompute.solution": PRECOMPUTE_SOLUTION_DEFAULT,
+  "precompute.solutionJsonEnvelope": PRECOMPUTE_SOLUTION_JSON_ENVELOPE_DEFAULT,
   "whiteboard.systemInstruction": WHITEBOARD_SYSTEM_INSTRUCTION_DEFAULT,
   "whiteboard.userPrompt": WHITEBOARD_USER_PROMPT_DEFAULT,
 };

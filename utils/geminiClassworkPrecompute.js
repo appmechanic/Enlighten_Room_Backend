@@ -1,9 +1,9 @@
 import crypto from "crypto";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import fetch from "node-fetch";
 import TeacherAIConfig from "../models/teacherAiConfigModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
-import { withGeminiRetry } from "./geminiCommon.js";
+import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 import { recordAiTokenUsage, logAiUsage } from "./aiTokenUsage.js";
 import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
 
@@ -161,13 +161,14 @@ export async function precomputeStandardSolution({
 }) {
   const reqId = newReqId();
   try {
-    const [standardText, teacherPrompt, MODEL, retryCfg, precomputeTuning, solutionHeader] = await Promise.all([
+    const [standardText, teacherPrompt, MODEL, retryCfg, precomputeTuning, solutionHeader, jsonEnvelopeInstruction] = await Promise.all([
       loadStandardPromptText(),
       loadTeacherPrompt(teacherId),
       getAiModel(),
       getAiRetry("classworkPrecompute"),
       getAiTuning("precompute"),
       getAiDirective("precompute.solution"),
+      getAiDirective("precompute.solutionJsonEnvelope"),
     ]);
     const systemInstruction = [standardText, teacherPrompt]
       .filter(Boolean)
@@ -178,6 +179,11 @@ export async function precomputeStandardSolution({
       ? `${questionText || ""}\n\n[Question image transcription:]\n${questionImageText.trim()}`
       : questionText || "";
 
+    // The envelope directive (precompute.solutionJsonEnvelope) is what makes
+    // the call return {solution, finalAnswer} instead of bare text — that
+    // finalAnswer is persisted as `derivedCorrectAnswer` and used as the
+    // fallback reference in per-submission feedback prompts when the teacher
+    // didn't attach a correctAnswer. Admin-editable via AdminAiPrompts.
     const instruction = [
       solutionHeader,
       `Question format: ${format || "unspecified"}`,
@@ -185,6 +191,7 @@ export async function precomputeStandardSolution({
       referenceAnswer
         ? `Teacher's reference answer / rubric (treat as authoritative):\n${referenceAnswer}`
         : "Teacher did not attach a reference answer; derive the canonical solution from the question alone.",
+      jsonEnvelopeInstruction,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -220,6 +227,15 @@ export async function precomputeStandardSolution({
             thinkingConfig: {
               thinkingBudget: Math.round(resolvedMax * precomputeTuning.solutionThinkingRatio),
             },
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                solution: { type: Type.STRING },
+                finalAnswer: { type: Type.STRING },
+              },
+              required: ["solution", "finalAnswer"],
+            },
           },
         }),
       {
@@ -236,16 +252,21 @@ export async function precomputeStandardSolution({
       tag: `ClassworkPrecompute:sol:${reqId}`,
     });
 
-    const solution = (result?.text || "").trim();
+    const rawText = (result?.text || "").trim();
+    const parsed = parseFirstJsonObject(rawText, {
+      tag: `ClassworkPrecompute:sol:${reqId}`,
+    });
+    const solution = String(parsed?.solution ?? "").trim();
+    const finalAnswer = String(parsed?.finalAnswer ?? "").trim();
     console.log(
-      `[ClassworkPrecompute][req=${reqId}] solution (${solution.length} chars):\n${solution}`,
+      `[ClassworkPrecompute][req=${reqId}] solution (${solution.length} chars) · finalAnswer: ${finalAnswer || "(empty)"}\n${solution}`,
     );
-    return solution;
+    return { solution, finalAnswer };
   } catch (err) {
     console.error(
       `[ClassworkPrecompute][req=${reqId}] solution generation failed:`,
       err?.message || err,
     );
-    return "";
+    return { solution: "", finalAnswer: "" };
   }
 }

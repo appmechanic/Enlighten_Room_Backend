@@ -655,7 +655,7 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
       }
 
       if (!newQuestion.standardSolution) {
-        const solution = await precomputeStandardSolution({
+        const { solution, finalAnswer } = await precomputeStandardSolution({
           questionText: newQuestion.question,
           questionImageText,
           imageSource: newQuestion.image,
@@ -666,14 +666,14 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
           maxOutputTokens: newQuestion.maxOutputTokens,
         });
         if (solution) {
+          const update = {
+            standardSolution: solution,
+            solutionCapturedAt: new Date(),
+          };
+          if (finalAnswer) update.derivedCorrectAnswer = finalAnswer;
           await ClassworkModel.updateOne(
             { _id: newQuestion._id },
-            {
-              $set: {
-                standardSolution: solution,
-                solutionCapturedAt: new Date(),
-              },
-            },
+            { $set: update },
           );
         }
       }
@@ -1853,6 +1853,7 @@ export const submitAnswer = async (req, res) => {
             questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
             answer: ctx.normalizedAnswer,
             correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+            derivedCorrectAnswer: ctx.isFollowUp ? '' : (ctx.question.derivedCorrectAnswer || ''),
             questionImage: ctx.isFollowUp || ctx.question.questionImageText
               ? null
               : ctx.question.image,
@@ -1996,6 +1997,7 @@ export const submitAnswerStream = async (req, res) => {
             questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
             answer: ctx.normalizedAnswer,
             correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+            derivedCorrectAnswer: ctx.isFollowUp ? '' : (ctx.question.derivedCorrectAnswer || ''),
             questionImage: ctx.isFollowUp || ctx.question.questionImageText
               ? null
               : ctx.question.image,
