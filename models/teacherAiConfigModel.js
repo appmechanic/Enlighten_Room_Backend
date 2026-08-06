@@ -9,11 +9,13 @@ const TeacherAIConfigSchema = new mongoose.Schema(
       index: true, // teacher / tutor
     },
 
-    // Classwork and Assignment AI Feedback Prompt
+    // Classwork and Assignment AI Feedback Prompt.
+    // Optional: an empty string means "use the admin's standard prompt only";
+    // per-teacher customisation is layered on top of it when non-empty.
     prompt: {
       type: String,
-      required: true,
       trim: true,
+      default: "",
     },
 
     // Generating Assignment Prompt

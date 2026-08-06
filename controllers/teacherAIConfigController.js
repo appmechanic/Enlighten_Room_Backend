@@ -60,16 +60,10 @@ export const upsertMyAIConfig = asyncHandler(async (req, res) => {
     });
   }
 
-  if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
-    return res
-      .status(400)
-      .json({ ok: false, message: "prompt is required (non-empty string)" });
-  }
-
   const doc = await TeacherAIConfig.findOneAndUpdate(
     { user: userId },
     {
-      prompt: prompt.trim(),
+      prompt: (typeof prompt === "string" ? prompt : "").trim(),
       assignmentPrompt: (assignmentPrompt || "").trim(),
       generatingTestPrompt: (generatingTestPrompt || "").trim(),
       reportPrompt: (reportPrompt || "").trim(),
