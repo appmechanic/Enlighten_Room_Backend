@@ -216,7 +216,48 @@ For science questions, judge by the SUBSTANTIVE scientific content, not by prese
 - Biology / naming: accept genus abbreviation once the full name has been given (Escherichia coli = E. coli); accept common names when the question uses common names, scientific names when it uses scientific names.
 
 FINAL-ANSWER EXTRACTION — CRITICAL:
-When the student's submission is a multi-line derivation, shows working, or contains scratchwork, judge correctness by the FINAL result the student arrives at — not by intermediate steps. If the last line / boxed answer / concluding expression matches the reference (under the equivalence rules above), set \`correct\` = true even if earlier lines contain crossed-out attempts, dimensional slips, or notation the student later fixed. Only mark incorrect when the final result itself is wrong or is missing entirely.`;
+When the student's submission is a multi-line derivation, shows working, or contains scratchwork, judge correctness by the FINAL result the student arrives at — not by intermediate steps. If the last line / boxed answer / concluding expression matches the reference (under the equivalence rules above), set \`correct\` = true even if earlier lines contain crossed-out attempts, dimensional slips, or notation the student later fixed. Only mark incorrect when the final result itself is wrong or is missing entirely.
+
+FINAL CORRECTNESS CHECK (MANDATORY):
+Before deciding whether \`correct\` is true or false, ALWAYS normalize and simplify BOTH the reference answer and the student's answer.
+
+Normalization MUST include:
+- Remove unnecessary whitespace and parentheses.
+- Treat implicit and explicit multiplication as identical.
+- Reorder multiplication factors (commutative property).
+- Move numerical coefficients to any position.
+- Distribute or factor out unary negatives.
+- Simplify algebraically before comparison.
+
+The following expressions MUST be considered mathematically identical:
+
+-5sin(5x)
+-5*sin(5x)
+-(5sin(5x))
+-(5*sin(5x))
+(-5)sin(5x)
+(-5)*sin(5x)
+-sin(5x)*5
+(-sin(5x))*5
+-(sin(5x))*5
+5(-sin(5x))
+5*(-sin(5x))
+-1*5*sin(5x)
+-(5*(sin(5x)))
+-(sin(5x)*5)
+
+Do NOT mark an answer incorrect solely because:
+- the coefficient appears before or after the function,
+- multiplication is implicit or explicit,
+- extra parentheses are present,
+- the negative sign is written in a different but equivalent location,
+- factors appear in a different order.
+
+If the student's expression simplifies to exactly the same mathematical expression as the reference answer, you MUST return:
+
+{ "correct": true }
+
+Only return \`"correct": false\` if the simplified mathematical expressions are genuinely different.`;
 
 const CLASSWORK_ASK_MODE_DEFAULT = `PEDAGOGY MODE = ASK (this is an odd-numbered attempt).
 Do NOT state the correct formula, operation, rule, or final answer. Instead, guide the student to recall it themselves:
