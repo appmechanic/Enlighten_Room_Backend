@@ -30,25 +30,33 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // utils/aiConfig.js so a missing DB field never breaks the flow.
 
 // Derive the Gemini thinking budget from the resolved output-token budget.
-// No cached solution -> full share (the model must derive the answer).
+// No cached solution -> ratio-share for derivation, floored by
+// tuning.uncachedMinThinkingBudget so the model has room to run the
+// equivalence check on top. (Historically the raw share alone — 160 tokens
+// at ratio 0.2 × 800 — collapsed equivalence to surface string matching
+// and trivially-equivalent forms like -5sin5x vs -5sin(5x) got flagged
+// wrong.)
 // Cached solution present -> the model isn't deriving anything, but it STILL
 // has to judge whether the student's answer is mathematically equivalent to
 // the canonical final answer (e.g. -(5sin(5x)) vs -5\sin(5x)). With 0
-// thinking that collapses to surface string matching and trivially-
-// equivalent forms get flagged wrong even when the equivalence rules cover
-// them explicitly. So we keep a small floor (tuning.equivalenceCheckBudget,
-// default 256) dedicated to that comparison. imageStudy formats need
-// enough on top to also read the handwriting.
+// thinking that collapses to surface string matching. So we keep a small
+// floor (tuning.equivalenceCheckBudget) dedicated to that comparison.
+// imageStudy formats need enough on top to also read the handwriting.
 // The result is capped by tuning.maxThinkingBudget so a huge output budget
 // can't translate into a long pre-stream thinking delay before the hint
 // appears.
 function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format, tuning) {
   const share = Math.round(resolvedMaxOutputTokens * tuning.thinkingBudgetRatio);
   const imageStudy = new Set(tuning.imageStudyFormats || []);
-  if (!hasCachedSolution) return Math.min(share, tuning.maxThinkingBudget);
   const equivFloor = Number(tuning.equivalenceCheckBudget) > 0
     ? Number(tuning.equivalenceCheckBudget)
     : 256;
+  if (!hasCachedSolution) {
+    const uncachedFloor = Number(tuning.uncachedMinThinkingBudget) > 0
+      ? Number(tuning.uncachedMinThinkingBudget)
+      : equivFloor;
+    return Math.min(Math.max(share, uncachedFloor), tuning.maxThinkingBudget);
+  }
   if (imageStudy.has(format)) {
     return Math.min(Math.max(Math.round(share / 2), equivFloor), tuning.maxThinkingBudget);
   }
@@ -160,6 +168,79 @@ function cleanTextForAi(text) {
     .replace(/ *\n */g, "\n")             // strip padding around newlines
     .replace(/\n{3,}/g, "\n\n")           // collapse excess vertical whitespace
     .trim();
+}
+
+// Conservative deterministic normalization used ONLY by the server-side
+// equivalence pre-check. Deliberately narrow: it collapses formatting
+// differences (whitespace, LaTeX backslashes on function names, implicit
+// vs explicit multiplication, implicit vs explicit function-argument
+// parens) but does NOT do algebraic simplification, coefficient
+// re-ordering, or negative-sign redistribution. Those richer equivalences
+// still route to the AI equivalence rules where they belong.
+// Rationale: the AI has been flipping trivial cases like `-5sin5x` vs
+// `-5sin(5x)` to correct=false, sending students into 40+ attempt loops.
+// A narrow deterministic normalizer that only catches formatting-only
+// divergences gives us a low-false-positive fast lane. Anything richer
+// stays with the AI.
+function normalizeForEquivalencePreCheck(text) {
+  if (typeof text !== "string" || !text.trim()) return "";
+  return text
+    .toLowerCase()
+    .replace(
+      /\\(sin|cos|tan|cot|sec|csc|log|ln|sqrt|exp|pi|theta|alpha|beta|gamma|cdot|times|frac|left|right)/g,
+      "$1",
+    )
+    .replace(/\bcdot\b|\btimes\b/g, "*")
+    .replace(/[{}]/g, "")
+    .replace(/\s+/g, "")
+    .replace(/\*/g, "")
+    .replace(/·/g, "")
+    .replace(
+      /(sin|cos|tan|cot|sec|csc|log|ln|sqrt|exp)\(([-+]?[0-9]*[a-z]+(?:\^[-+]?[0-9]+)?)\)/g,
+      "$1$2",
+    );
+}
+
+// Returns true when the student's answer is deterministically equivalent
+// to the reference under normalizeForEquivalencePreCheck. Deliberately
+// scoped narrow — only fires for plain string answers with a single-string
+// or single-element-array reference. Images, arrays (fill-in-blanks), and
+// missing references fall through to the AI.
+function serverSideEquivalenceMatches(answer, correctAnswer, format) {
+  if (format === "handwriting") return false;
+  if (answer && typeof answer === "object" && !Array.isArray(answer)) {
+    if (answer.type === "image" || answer.imageUrl) return false;
+  }
+  if (Array.isArray(answer)) return false;
+
+  const studentText =
+    typeof answer === "string"
+      ? answer
+      : typeof answer?.text === "string"
+        ? answer.text
+        : typeof answer?.value === "string"
+          ? answer.value
+          : "";
+  if (!studentText.trim()) return false;
+
+  let referenceText = "";
+  if (typeof correctAnswer === "string") {
+    referenceText = correctAnswer;
+  } else if (Array.isArray(correctAnswer)) {
+    const nonEmpty = correctAnswer
+      .map((v) => (typeof v === "string" ? v : ""))
+      .filter((v) => v.trim());
+    if (nonEmpty.length !== 1) return false;
+    referenceText = nonEmpty[0];
+  } else {
+    return false;
+  }
+  if (!referenceText.trim()) return false;
+
+  const normStudent = normalizeForEquivalencePreCheck(studentText);
+  const normReference = normalizeForEquivalencePreCheck(referenceText);
+  if (!normStudent || !normReference) return false;
+  return normStudent === normReference;
 }
 
 function formatCorrectAnswerForPrompt(value) {
@@ -418,20 +499,51 @@ async function buildGeminiRequest({
 
   // Ask/Tell pedagogy directive, derived from the runtime attempt number.
   // Odd -> ASK (coach recall), even -> TELL (explain). Skipped entirely when
-  // no valid number was supplied so older callers behave as before. The
-  // "if correct" caveat keeps a correct answer on the normal congratulate +
-  // advancedChallenge path regardless of which mode this attempt is.
-  const attemptNo = Number(submissionNumber);
-  const askTellInstruction =
-    Number.isInteger(attemptNo) && attemptNo > 0
-      ? [
-          `Submission attempt #${attemptNo} for this student on this question.`,
-          attemptNo % 2 === 1 ? ASK_MODE_INSTRUCTION : TELL_MODE_INSTRUCTION,
-          "If the student's answer is fully correct, IGNORE the pedagogy mode above — congratulate them and fill advancedChallenge as usual.",
-        ].join("\n")
-      : null;
+  // no valid number was supplied so older callers behave as before.
+  //
+  // Wrapped in an explicit STEP 1 / 2 / 3 gate so the correctness judgment
+  // happens BEFORE the pedagogy directive frames the response as a hint.
+  // Previously the "if correct, ignore" caveat was a single line stapled at
+  // the END of the block; the model would read the ASK/TELL directive
+  // first, commit to a hint framing, then rationalise correct=false to
+  // justify the hint it was already writing. Putting the correctness gate
+  // at the top forces evaluation before framing.
+  //
+  // The displayed attempt number is capped: very high counts (a student
+  // stuck in a loop, often because the AI kept mis-judging correctness)
+  // telegraphed "this student can't get it" and biased the correctness
+  // judgment toward false. Parity for ASK/TELL still comes from the raw
+  // number so the mode still alternates.
+  const rawAttemptNo = Number(submissionNumber);
+  const isValidAttempt = Number.isInteger(rawAttemptNo) && rawAttemptNo > 0;
+  const displayedAttempt = isValidAttempt ? Math.min(rawAttemptNo, 5) : rawAttemptNo;
+  const askTellInstruction = isValidAttempt
+    ? [
+        "STEP 1 — JUDGE CORRECTNESS FIRST: Compare the student answer to the reference using the MATHEMATICAL EQUIVALENCE rules below. Judge by mathematical value, not string form.",
+        "STEP 2 — IF EQUIVALENT: Set correct=true, write a warm congratulation in hintStream, and fill advancedChallenge. SKIP the pedagogy mode entirely — do NOT generate 🛑/✅/🔨 hints.",
+        "STEP 3 — IF NOT EQUIVALENT: Apply the pedagogy mode below.",
+        `Submission attempt #${displayedAttempt} for this student on this question.`,
+        rawAttemptNo % 2 === 1 ? ASK_MODE_INSTRUCTION : TELL_MODE_INSTRUCTION,
+      ].join("\n")
+    : null;
+
+  // Deterministic server-side equivalence pre-check. When it fires we KNOW
+  // the student is correct (the normalizer is narrow enough that a match
+  // is authoritative). Injected at the TOP of the user prompt as an
+  // override so the model can't rationalise it away — everything else in
+  // the prompt is subordinate.
+  const serverSideMatch = serverSideEquivalenceMatches(answer, correctAnswer, format);
+  const serverEquivalenceOverride = serverSideMatch
+    ? [
+        "SERVER-SIDE EQUIVALENCE PRE-CHECK: PASSED.",
+        "The student's answer has been normalized by the backend (whitespace stripped, LaTeX backslashes on function names removed, implicit-vs-explicit function-argument parentheses collapsed) and is IDENTICAL to the reference answer.",
+        "This match is AUTHORITATIVE. You MUST set correct=true. Do NOT generate 🛑/✅/🔨 hints. Write a warm hintStream congratulating the student by first name, put a brief acknowledgment in part1, leave part2 as an empty array, and fill advancedChallenge with a harder question in the language of the original question.",
+        "Ignore any pedagogy mode directive below.",
+      ].join("\n")
+    : null;
 
   const promptLines = [
+    serverEquivalenceOverride,
     interactionId ? `interaction_id: ${interactionId}` : null,
     previousInteractionId
       ? `previous_interaction_id: ${previousInteractionId}`
@@ -533,6 +645,8 @@ async function buildGeminiRequest({
     Boolean(cachedSolution),
     "· Attached mistakes:",
     cachedMistakes.length,
+    "· Server pre-check equivalence:",
+    serverSideMatch ? "PASSED (correctness override injected)" : "no match",
   );
   console.log(
     `[ClassworkFeedback][req=${reqId}] Final systemInstruction (${systemInstruction.length} chars):\n${systemInstruction}`,

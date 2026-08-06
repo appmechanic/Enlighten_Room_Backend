@@ -135,7 +135,13 @@ export const TUNING_DEFAULTS = {
     // Floor for cached-solution calls so the model can execute the
     // normalization/equivalence check (e.g. -(5sin(5x)) vs -5\sin(5x)).
     // Pure prompt rules at thinking=0 collapse to surface string matching.
-    equivalenceCheckBudget: 256,
+    equivalenceCheckBudget: 384,
+    // Floor for uncached calls: model must derive the answer AND run
+    // equivalence. At the previous 160-token share (ratio 0.2 × 800) it
+    // collapsed to string matching for cases like -5sin5x vs -5sin(5x)
+    // and the model rationalised correct=false to satisfy the ASK-mode
+    // hint it had already committed to writing.
+    uncachedMinThinkingBudget: 512,
   },
   precompute: {
     solutionMaxTokens: 2000,
@@ -263,14 +269,16 @@ If the student's expression simplifies to exactly the same mathematical expressi
 
 Only return \`"correct": false\` if the simplified mathematical expressions are genuinely different.`;
 
-const CLASSWORK_ASK_MODE_DEFAULT = `PEDAGOGY MODE = ASK (this is an odd-numbered attempt).
-Do NOT state the correct formula, operation, rule, or final answer. Instead, guide the student to recall it themselves:
+const CLASSWORK_ASK_MODE_DEFAULT = `PEDAGOGY MODE = ASK (odd-numbered attempt).
+PRECONDITION — READ BEFORE ANYTHING ELSE: Apply this mode ONLY after you have judged the student's answer INCORRECT using the MATHEMATICAL EQUIVALENCE rules. If the student's answer is mathematically equivalent to the reference (even with different notation, spacing, parentheses, or LaTeX/plain-text form), SKIP this mode entirely — set correct=true, congratulate, and fill advancedChallenge as usual.
+When the answer is genuinely incorrect, guide the student to recall the method themselves rather than stating it:
 - hintStream: acknowledge what they did right, then ask 1-2 leading questions that point at the method (e.g. "Which operation undoes multiplication?", "What could you do to BOTH sides to isolate the variable?"). Encourage them to try again.
 - part2: keep the 🛑/✅/🔨 structure, but phrase ✅ and 🔨 as QUESTIONS or nudges that make the student think — do not name the formula outright.
 Stay warm and encouraging so they feel safe trying again.`;
 
-const CLASSWORK_TELL_MODE_DEFAULT = `PEDAGOGY MODE = TELL (this is an even-numbered attempt).
-The student already had a turn to think, so now teach directly:
+const CLASSWORK_TELL_MODE_DEFAULT = `PEDAGOGY MODE = TELL (even-numbered attempt).
+PRECONDITION — READ BEFORE ANYTHING ELSE: Apply this mode ONLY after you have judged the student's answer INCORRECT using the MATHEMATICAL EQUIVALENCE rules. If the student's answer is mathematically equivalent to the reference (even with different notation, spacing, parentheses, or LaTeX/plain-text form), SKIP this mode entirely — set correct=true, congratulate, and fill advancedChallenge as usual.
+When the answer is genuinely incorrect, the student already had a turn to think, so now teach directly:
 - part2: in ✅ state the correct formula/operation/rule plainly, and in 🔨 show step-by-step HOW to apply it to this problem. Be clear and instructive.
 - hintStream: give the key explanation in plain language so it reads well live.
 You may fully explain the method; still let the student carry out the final calculation themselves rather than only printing the final number.`;
