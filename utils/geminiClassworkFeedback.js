@@ -31,18 +31,28 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Derive the Gemini thinking budget from the resolved output-token budget.
 // No cached solution -> full share (the model must derive the answer).
-// Cached solution -> 0 for everything except handwriting/imageStudy formats,
-// which keep a small capped budget to read the answer image. The result is
-// capped by tuning.maxThinkingBudget so a huge output budget can't translate
-// into a long pre-stream thinking delay before the hint appears.
+// Cached solution present -> the model isn't deriving anything, but it STILL
+// has to judge whether the student's answer is mathematically equivalent to
+// the canonical final answer (e.g. -(5sin(5x)) vs -5\sin(5x)). With 0
+// thinking that collapses to surface string matching and trivially-
+// equivalent forms get flagged wrong even when the equivalence rules cover
+// them explicitly. So we keep a small floor (tuning.equivalenceCheckBudget,
+// default 256) dedicated to that comparison. imageStudy formats need
+// enough on top to also read the handwriting.
+// The result is capped by tuning.maxThinkingBudget so a huge output budget
+// can't translate into a long pre-stream thinking delay before the hint
+// appears.
 function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, format, tuning) {
   const share = Math.round(resolvedMaxOutputTokens * tuning.thinkingBudgetRatio);
   const imageStudy = new Set(tuning.imageStudyFormats || []);
   if (!hasCachedSolution) return Math.min(share, tuning.maxThinkingBudget);
+  const equivFloor = Number(tuning.equivalenceCheckBudget) > 0
+    ? Number(tuning.equivalenceCheckBudget)
+    : 256;
   if (imageStudy.has(format)) {
-    return Math.min(Math.round(share / 2), tuning.maxThinkingBudget);
+    return Math.min(Math.max(Math.round(share / 2), equivFloor), tuning.maxThinkingBudget);
   }
-  return 0;
+  return Math.min(equivFloor, tuning.maxThinkingBudget);
 }
 
 // Every prompt directive attached below is resolved per call via
@@ -132,32 +142,52 @@ function buildClassworkResponseSchema({ includeStandardSolution }) {
   };
 }
 
+// Purely mechanical cleanup applied to both the student answer and the
+// reference answer before they hit Gemini. Removes invisible chars,
+// canonicalises unicode, and collapses whitespace so trivially-equivalent
+// strings look identical byte-for-byte at pattern-match time. NO semantic
+// transforms — LaTeX commands, case, and math operators are preserved
+// exactly as written. Anything the AI is supposed to decide (\\sin vs sin,
+// -5 vs -(5)) stays for the equivalence rules.
+function cleanTextForAi(text) {
+  if (typeof text !== "string") return text;
+  return text
+    .normalize("NFC")                     // é+combining-mark → é
+    .replace(/[​-‍﻿]/g, "")// zero-width space/joiner/non-joiner/BOM
+    .replace(/[   ]/g, " ")// NBSP, line/paragraph separators → space
+    .replace(/\r\n|\r/g, "\n")            // normalise line endings
+    .replace(/[ \t]+/g, " ")              // collapse horizontal whitespace runs
+    .replace(/ *\n */g, "\n")             // strip padding around newlines
+    .replace(/\n{3,}/g, "\n\n")           // collapse excess vertical whitespace
+    .trim();
+}
+
 function formatCorrectAnswerForPrompt(value) {
   if (Array.isArray(value)) {
     const items = value
-      .map((entry) => String(entry ?? "").trim())
+      .map((entry) => cleanTextForAi(String(entry ?? "")))
       .filter(Boolean);
     if (items.length === 0) return "";
     if (items.length === 1) return items[0];
     return items.map((a, i) => `${i + 1}. ${a}`).join("\n");
   }
   if (value == null) return "";
-  return String(value).trim();
+  return cleanTextForAi(String(value));
 }
 
 function normalizeAnswerText(value) {
   if (Array.isArray(value)) {
     return value
-      .map((entry, index) => `Blank ${index + 1}: ${String(entry ?? "")}`)
+      .map((entry, index) => `Blank ${index + 1}: ${cleanTextForAi(String(entry ?? ""))}`)
       .join("\n");
   }
 
   if (value && typeof value === "object") {
     if (typeof value.text === "string" && value.text.trim()) {
-      return value.text.trim();
+      return cleanTextForAi(value.text);
     }
     if (typeof value.value === "string" && value.value.trim()) {
-      return value.value.trim();
+      return cleanTextForAi(value.value);
     }
     if (value.type === "image") {
       return "Student submitted the answer as an image/handwriting sample.";
@@ -172,7 +202,7 @@ function normalizeAnswerText(value) {
   if (typeof value === "string") {
     return /^data:image\//i.test(value)
       ? "Student submitted the answer as an image/handwriting sample."
-      : value;
+      : cleanTextForAi(value);
   }
 
   return value == null ? "" : String(value);

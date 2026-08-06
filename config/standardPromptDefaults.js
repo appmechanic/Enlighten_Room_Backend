@@ -132,6 +132,10 @@ export const TUNING_DEFAULTS = {
     thinkingBudgetRatio: 0.2,
     maxThinkingBudget: 2048,
     imageStudyFormats: ["handwriting"],
+    // Floor for cached-solution calls so the model can execute the
+    // normalization/equivalence check (e.g. -(5sin(5x)) vs -5\sin(5x)).
+    // Pure prompt rules at thinking=0 collapse to surface string matching.
+    equivalenceCheckBudget: 256,
   },
   precompute: {
     solutionMaxTokens: 2000,
