@@ -7,18 +7,18 @@ import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 import { recordAiTokenUsage, logAiUsage } from "./aiTokenUsage.js";
 import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
 
-// Two one-off Gemini calls made at question CREATION time so every subsequent
-// per-student submission can skip the heavy work:
-//   1. precomputeQuestionImageText — OCR/transcribe the question image once
-//      into text so per-submission calls don't have to re-attach the image.
-//   2. precomputeStandardSolution — generate the canonical step-by-step
-//      solution once, using teacher rubrics/correct answers as reference, so
-//      per-submission calls can cache it as a stable prefix and stop asking
-//      Gemini to re-derive the solution for every submission.
+// One Gemini call made at question CREATION time so every subsequent
+// per-student submission can skip re-deriving the canonical solution:
+// precomputeStandardSolution generates the step-by-step solution once, using
+// teacher rubrics/correct answers as reference, so per-submission calls fold
+// it into the systemInstruction prefix and get an implicit cache hit.
+//
+// The question image (if present) is attached directly here AND on every
+// per-submission call — no OCR-to-text detour, because the OCR was lossy on
+// math notation (e.g. rendering "d/dx(cos 5x)" as "d cos5x/dx") and hurt
+// correctness downstream. Latency, not tokens, is the priority.
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-// Model ID and retry policy resolved per call via getAiModel() / getAiRetry
-// (StandardPrompt.models / StandardPrompt.retry, 60s in-memory cache).
 
 function newReqId() {
   return crypto.randomBytes(3).toString("hex");
@@ -74,84 +74,13 @@ async function loadStandardPromptText() {
   }
 }
 
-// Runs one Gemini call to transcribe a question image into plain text (with
-// LaTeX for math). Return "" on any failure so the caller can degrade to
-// attaching the image at submission time.
-export async function precomputeQuestionImageText({ imageSource, sessionId }) {
-  if (!imageSource) return "";
-  const reqId = newReqId();
-  try {
-    const inline = await sourceToInlineData(imageSource);
-    if (!inline) return "";
-
-    const [MODEL, retryCfg, precomputeTuning, instruction] = await Promise.all([
-      getAiModel(),
-      getAiRetry("classworkPrecompute"),
-      getAiTuning("precompute"),
-      getAiDirective("precompute.imageTranscribe"),
-    ]);
-
-    console.log(`[ClassworkPrecompute][req=${reqId}] === IMAGE-TO-TEXT ===`);
-
-    const result = await withGeminiRetry(
-      () =>
-        ai.models.generateContent({
-          model: MODEL,
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { text: instruction },
-                {
-                  inlineData: { data: inline.base64, mimeType: inline.mimeType },
-                },
-              ],
-            },
-          ],
-          config: {
-            // Text output; no JSON schema — we want the raw transcription.
-            // Budgets tunable via StandardPrompt.tuning.precompute
-            // (imageMaxTokens / imageThinkingBudget).
-            maxOutputTokens: precomputeTuning.imageMaxTokens,
-            thinkingConfig: { thinkingBudget: precomputeTuning.imageThinkingBudget },
-          },
-        }),
-      {
-        maxAttempts: retryCfg.max,
-        baseDelayMs: retryCfg.baseMs,
-        maxDelayMs: retryCfg.capMs,
-        tag: `ClassworkPrecompute:img:${reqId}`,
-      },
-    );
-
-    logAiUsage(reqId, result?.usageMetadata, "ClassworkPrecompute:img");
-    await recordAiTokenUsage(result?.usageMetadata, {
-      sessionId,
-      tag: `ClassworkPrecompute:img:${reqId}`,
-    });
-
-    const text = (result?.text || "").trim();
-    console.log(
-      `[ClassworkPrecompute][req=${reqId}] image-to-text (${text.length} chars):\n${text}`,
-    );
-    return text;
-  } catch (err) {
-    console.error(
-      `[ClassworkPrecompute][req=${reqId}] image-to-text failed:`,
-      err?.message || err,
-    );
-    return "";
-  }
-}
-
 // Runs one Gemini call to produce the canonical step-by-step solution for a
 // question. The teacher's rubrics/correct answers are attached as reference
-// material so Gemini stays faithful to the intended answer key. Uses the
-// pre-transcribed question text when the image OCR has already run — avoids
-// paying for the image tokens a second time.
+// material so Gemini stays faithful to the intended answer key. When a
+// question image exists, it's attached inline so the model reads the actual
+// notation instead of a lossy transcription.
 export async function precomputeStandardSolution({
   questionText,
-  questionImageText,
   imageSource,
   correctAnswer,
   format,
@@ -175,9 +104,6 @@ export async function precomputeStandardSolution({
       .join("\n\n");
 
     const referenceAnswer = formatCorrectAnswerForPrompt(correctAnswer);
-    const questionForPrompt = (questionImageText && questionImageText.trim())
-      ? `${questionText || ""}\n\n[Question image transcription:]\n${questionImageText.trim()}`
-      : questionText || "";
 
     // The envelope directive (precompute.solutionJsonEnvelope) is what makes
     // the call return {solution, finalAnswer} instead of bare text — that
@@ -187,7 +113,8 @@ export async function precomputeStandardSolution({
     const instruction = [
       solutionHeader,
       `Question format: ${format || "unspecified"}`,
-      `Question: ${questionForPrompt}`,
+      `Question: ${questionText || ""}`,
+      imageSource ? "A question image is attached below — inspect it carefully; it is the authoritative source of the question notation." : null,
       referenceAnswer
         ? `Teacher's reference answer / rubric (treat as authoritative):\n${referenceAnswer}`
         : "Teacher did not attach a reference answer; derive the canonical solution from the question alone.",
@@ -197,8 +124,7 @@ export async function precomputeStandardSolution({
       .join("\n\n");
 
     const parts = [{ text: instruction }];
-    // Fall back to attaching the raw image only when OCR wasn't already run.
-    if ((!questionImageText || !questionImageText.trim()) && imageSource) {
+    if (imageSource) {
       const inline = await sourceToInlineData(imageSource).catch(() => null);
       if (inline) {
         parts.push({

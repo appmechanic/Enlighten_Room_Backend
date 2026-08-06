@@ -301,7 +301,6 @@ function logGeminiResponse(reqId, rawText, parsed) {
 async function buildGeminiRequest({
   reqId,
   questionText,
-  questionImageText,
   answer,
   correctAnswer,
   derivedCorrectAnswer,
@@ -379,15 +378,13 @@ async function buildGeminiRequest({
     : formatCorrectAnswerForPrompt(derivedCorrectAnswer);
   const answerImageSource = getAnswerImageSource(answer);
 
-  // Fold the pre-OCR'd question image transcription into the question text
-  // so per-submission calls don't have to re-attach the raw image. The image
-  // itself is only sent as inlineData when OCR wasn't available.
-  const effectiveQuestionText = questionImageText && questionImageText.trim()
-    ? `${questionText || ""}\n\n[Question image transcription:]\n${questionImageText.trim()}`
-    : questionText || "";
-  const includeRawQuestionImage = Boolean(
-    questionImage && !(questionImageText && questionImageText.trim()),
-  );
+  // Attach the raw question image whenever one exists. We deliberately do NOT
+  // OCR-transcribe it up front — the transcription lost fidelity on math
+  // notation (e.g. "d/dx(cos 5x)" flattened to "d cos5x/dx"), which broke the
+  // correct/incorrect judgement. Sending the image lets Gemini read the real
+  // notation on every submission. Latency > tokens here.
+  const effectiveQuestionText = questionText || "";
+  const includeRawQuestionImage = Boolean(questionImage);
 
   // Ask/Tell pedagogy directive, derived from the runtime attempt number.
   // Odd -> ASK (coach recall), even -> TELL (explain). Skipped entirely when
@@ -500,8 +497,6 @@ async function buildGeminiRequest({
   console.log(
     `[ClassworkFeedback][req=${reqId}] Question image attached:`,
     includeRawQuestionImage,
-    "· OCR text available:",
-    Boolean(questionImageText && questionImageText.trim()),
     "· Answer image attached:",
     Boolean(answerImageSource),
     "· Cached solution in systemInstruction:",
@@ -564,7 +559,6 @@ function shapeFeedback(parsed, responseText) {
 
 export async function getClassworkAiFeedback({
   questionText,
-  questionImageText,
   answer,
   correctAnswer,
   derivedCorrectAnswer,
@@ -601,7 +595,6 @@ export async function getClassworkAiFeedback({
   } = await buildGeminiRequest({
     reqId,
     questionText,
-    questionImageText,
     answer,
     correctAnswer,
     derivedCorrectAnswer,
@@ -858,7 +851,6 @@ export function createHintStreamScanner({ onDelta }) {
 // path does, so persistence + return shape stay identical.
 export async function getClassworkAiFeedbackStream({
   questionText,
-  questionImageText,
   answer,
   correctAnswer,
   derivedCorrectAnswer,
@@ -896,7 +888,6 @@ export async function getClassworkAiFeedbackStream({
   } = await buildGeminiRequest({
     reqId,
     questionText,
-    questionImageText,
     answer,
     correctAnswer,
     derivedCorrectAnswer,

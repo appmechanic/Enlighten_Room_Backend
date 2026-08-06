@@ -60,9 +60,6 @@ const ClassworkSchema = new mongoose.Schema({
   // ground truth to judge correctness against.
   derivedCorrectAnswer: { type: mongoose.Schema.Types.Mixed, default: null },
   image: { type: String }, // URL of the question image (optional)
-  // Pre-OCR'd transcription of `image`, produced once at question-create
-  // time so per-submission calls don't have to re-attach the raw image.
-  questionImageText: { type: String, default: "" },
   expiryTime: { type: Number, default: 30 },
   aiAllowed: { type: Boolean, default: true },
   aiExpiryTime: { type: Number, default: 30 },

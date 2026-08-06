@@ -134,8 +134,6 @@ export const TUNING_DEFAULTS = {
     imageStudyFormats: ["handwriting"],
   },
   precompute: {
-    imageMaxTokens: 2000,
-    imageThinkingBudget: 512,
     solutionMaxTokens: 2000,
     solutionThinkingRatio: 0.6,
   },
@@ -231,9 +229,6 @@ The student already had a turn to think, so now teach directly:
 - part2: in ✅ state the correct formula/operation/rule plainly, and in 🔨 show step-by-step HOW to apply it to this problem. Be clear and instructive.
 - hintStream: give the key explanation in plain language so it reads well live.
 You may fully explain the method; still let the student carry out the final calculation themselves rather than only printing the final number.`;
-
-const PRECOMPUTE_IMAGE_TRANSCRIBE_DEFAULT =
-  "Transcribe every visible element of this question image into plain text so it can stand in for the image in later prompts. Use LaTeX for all math expressions and formulas. Preserve numbered/lettered lists and multi-line layouts using newlines. Do not solve the question. Return the transcription only, no preamble.";
 
 const PRECOMPUTE_SOLUTION_DEFAULT =
   'Produce the canonical step-by-step solution to the question below so it can be cached and reused for every student\'s submission. Use LaTeX for math expressions and formulas. For essay-writing questions, produce a sample response and rubric bullets rather than numeric steps. Use "\\n" between lines.';
@@ -358,7 +353,6 @@ export const DIRECTIVE_DEFAULTS = {
   "assignment.imagePrompt": ASSIGNMENT_IMAGE_PROMPT_DEFAULT,
   "report.difficultiesDirective": REPORT_DIFFICULTIES_DIRECTIVE_DEFAULT,
   "report.strategiesDirective": REPORT_STRATEGIES_DIRECTIVE_DEFAULT,
-  "precompute.imageTranscribe": PRECOMPUTE_IMAGE_TRANSCRIBE_DEFAULT,
   "precompute.solution": PRECOMPUTE_SOLUTION_DEFAULT,
   "precompute.solutionJsonEnvelope": PRECOMPUTE_SOLUTION_JSON_ENVELOPE_DEFAULT,
   "whiteboard.systemInstruction": WHITEBOARD_SYSTEM_INSTRUCTION_DEFAULT,

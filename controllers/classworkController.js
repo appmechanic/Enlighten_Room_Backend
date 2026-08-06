@@ -16,10 +16,7 @@ import {
   getCachedFeedback,
   setCachedFeedback,
 } from '../utils/classworkFeedbackCache.js';
-import {
-  precomputeQuestionImageText,
-  precomputeStandardSolution,
-} from '../utils/geminiClassworkPrecompute.js';
+import { precomputeStandardSolution } from '../utils/geminiClassworkPrecompute.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
@@ -594,11 +591,12 @@ function scheduleFeedbackWarmup(question) {
           : 'warm-up';
       await getClassworkAiFeedback({
         questionText: question.question || '',
-        questionImageText: question.questionImageText || '',
         answer: referenceAnswer,
         correctAnswer: question.correctAnswer,
-        // OCR already covers the image — don't re-upload it on the warm-up.
-        questionImage: null,
+        // Warm-up primes the systemInstruction prefix cache — attach the
+        // question image so the primed prefix matches what real submissions
+        // will send. (Small extra tokens; buys a per-student latency win.)
+        questionImage: question.image || null,
         format: question.format,
         studentName: 'warm-up',
         studentId: null,
@@ -628,9 +626,9 @@ function scheduleFeedbackWarmup(question) {
   });
 }
 
-// Fires the OCR + standard-solution precomputes in the background so the
-// question-create HTTP response returns immediately. Persists both results
-// on the ClassworkModel doc when they succeed; silent no-op on failure so
+// Fires the standard-solution precompute in the background so the
+// question-create HTTP response returns immediately. Persists the result on
+// the ClassworkModel doc when it succeeds; silent no-op on failure so
 // per-submission feedback stays on its slower fallback path.
 function schedulePrecomputes(newQuestion, { correctAnswer }) {
   setImmediate(async () => {
@@ -640,24 +638,9 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
         resolveTeacherIdForRoom(newQuestion.roomId),
       ]);
 
-      let questionImageText = "";
-      if (newQuestion.image) {
-        questionImageText = await precomputeQuestionImageText({
-          imageSource: newQuestion.image,
-          sessionId,
-        });
-        if (questionImageText) {
-          await ClassworkModel.updateOne(
-            { _id: newQuestion._id },
-            { $set: { questionImageText } },
-          );
-        }
-      }
-
       if (!newQuestion.standardSolution) {
         const { solution, finalAnswer } = await precomputeStandardSolution({
           questionText: newQuestion.question,
-          questionImageText,
           imageSource: newQuestion.image,
           correctAnswer,
           format: newQuestion.format,
@@ -1322,9 +1305,9 @@ export const addQuestion = async (req, res) => {
     }
     await newQuestion.save();
 
-    // Fire the OCR + standard-solution precomputes off the response path.
-    // Both write back to this doc when they succeed; per-submission feedback
-    // will read them via aiFeedbackCache/questionImageText.
+    // Fire the standard-solution precompute off the response path. Writes back
+    // to this doc when it succeeds; per-submission feedback reads it via
+    // buildCachedContext() and folds it into the systemInstruction prefix.
     schedulePrecomputes(newQuestion, { correctAnswer: question?.correctAnswer });
 
     const createdAtTime = new Date(newQuestion.createdAt).getTime();
@@ -1850,13 +1833,10 @@ export const submitAnswer = async (req, res) => {
           const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
           aiResult = await getClassworkAiFeedback({
             questionText: ctx.questionTextForAi,
-            questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
             answer: ctx.normalizedAnswer,
             correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
             derivedCorrectAnswer: ctx.isFollowUp ? '' : (ctx.question.derivedCorrectAnswer || ''),
-            questionImage: ctx.isFollowUp || ctx.question.questionImageText
-              ? null
-              : ctx.question.image,
+            questionImage: ctx.isFollowUp ? null : (ctx.question.image || null),
             format: ctx.question.format,
             studentName: ctx.studentName,
             studentId: ctx.studentId,
@@ -1994,13 +1974,10 @@ export const submitAnswerStream = async (req, res) => {
           const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
           aiResult = await getClassworkAiFeedbackStream({
             questionText: ctx.questionTextForAi,
-            questionImageText: ctx.isFollowUp ? '' : (ctx.question.questionImageText || ''),
             answer: ctx.normalizedAnswer,
             correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
             derivedCorrectAnswer: ctx.isFollowUp ? '' : (ctx.question.derivedCorrectAnswer || ''),
-            questionImage: ctx.isFollowUp || ctx.question.questionImageText
-              ? null
-              : ctx.question.image,
+            questionImage: ctx.isFollowUp ? null : (ctx.question.image || null),
             format: ctx.question.format,
             studentName: ctx.studentName,
             studentId: ctx.studentId,
