@@ -161,8 +161,8 @@ function cleanTextForAi(text) {
   if (typeof text !== "string") return text;
   return text
     .normalize("NFC")                     // é+combining-mark → é
-    .replace(/[​-‍﻿]/g, "")// zero-width space/joiner/non-joiner/BOM
-    .replace(/[   ]/g, " ")// NBSP, line/paragraph separators → space
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")// zero-width space/joiner/non-joiner/BOM
+    .replace(/[\u00A0\u2028\u2029]/g, " ")// NBSP, line/paragraph separators → space
     .replace(/\r\n|\r/g, "\n")            // normalise line endings
     .replace(/[ \t]+/g, " ")              // collapse horizontal whitespace runs
     .replace(/ *\n */g, "\n")             // strip padding around newlines
