@@ -294,7 +294,36 @@ async function uploadAnswerImageToSpaces({ roomId, questionId, studentId, imageD
   return getSpacesPublicUrl(key);
 }
 
-async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
+// Fires the S3 upload of the handwriting bytes without blocking. Returns a
+// promise that resolves to the CDN URL (or "" on failure) — callers await it
+// AFTER the Gemini call so the upload runs in parallel with generation.
+// Previously the upload was awaited BEFORE the Gemini call, adding 0.5-2s to
+// every handwriting submission for bytes we already had in memory.
+function startAnswerImageUpload({ roomId, questionId, studentId, imageData }) {
+  if (!imageData || !/^data:image\//i.test(String(imageData))) {
+    return Promise.resolve('');
+  }
+  return uploadAnswerImageToSpaces({ roomId, questionId, studentId, imageData })
+    .then((url) => {
+      console.log('[normalizeSubmittedAnswer] Background upload finished.', {
+        questionId,
+        studentId,
+        imageUrl: url || '(null)',
+      });
+      return url || '';
+    })
+    .catch((err) => {
+      console.error('[normalizeSubmittedAnswer] Background upload failed:', err);
+      return '';
+    });
+}
+
+// Returns { answer, uploadPromise } — the answer is safe to hand to the AI
+// path immediately; the uploadPromise must be awaited before persisting so the
+// Mongo doc gets the CDN URL for later teacher-side rendering. For any format
+// other than handwriting there's nothing to upload and uploadPromise resolves
+// synchronously to "".
+function normalizeSubmittedAnswer(answer, format, metadata = {}) {
   console.log('[normalizeSubmittedAnswer] Received answer payload:', {
     format,
     roomId: metadata.roomId,
@@ -312,67 +341,67 @@ async function normalizeSubmittedAnswer(answer, format, metadata = {}) {
 
   if (format !== 'handwriting') {
     console.log('[normalizeSubmittedAnswer] Non-handwriting answer kept as-is.');
-    return answer;
+    return { answer, uploadPromise: Promise.resolve('') };
   }
 
   if (typeof answer === 'string') {
     if (!/^data:image\//i.test(answer)) {
       console.log('[normalizeSubmittedAnswer] Handwriting answer received as plain text.');
-      return answer;
+      return { answer, uploadPromise: Promise.resolve('') };
     }
 
-    const imageUrl = await uploadAnswerImageToSpaces({
+    // Kick off the upload but do NOT await. Hand the base64 straight to the
+    // AI path via imageData so Gemini reads it inline without a CDN round trip.
+    const uploadPromise = startAnswerImageUpload({
       roomId: metadata.roomId,
       questionId: metadata.questionId,
       studentId: metadata.studentId,
       imageData: answer,
     });
 
-    console.log('[normalizeSubmittedAnswer] Uploaded handwriting base64 image to Spaces.', {
-      questionId: metadata.questionId,
-      studentId: metadata.studentId,
-      imageUrl,
-    });
-
     return {
-      type: 'image',
-      imageUrl,
-      text: 'Handwritten answer submitted as image.',
+      answer: {
+        type: 'image',
+        imageData: answer,
+        imageUrl: '',
+        text: 'Handwritten answer submitted as image.',
+      },
+      uploadPromise,
     };
   }
 
   if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
     console.log('[normalizeSubmittedAnswer] Unsupported handwriting payload returned unchanged.');
-    return answer;
+    return { answer, uploadPromise: Promise.resolve('') };
   }
 
   const rawImageData = typeof answer.imageData === 'string' ? answer.imageData : '';
-  const uploadedImageUrl = rawImageData
-    ? await uploadAnswerImageToSpaces({
+  const uploadPromise = rawImageData
+    ? startAnswerImageUpload({
         roomId: metadata.roomId,
         questionId: metadata.questionId,
         studentId: metadata.studentId,
         imageData: rawImageData,
       })
-    : null;
+    : Promise.resolve('');
 
   const normalizedAnswer = {
     ...answer,
-    type: uploadedImageUrl || answer.imageUrl ? 'image' : answer.type || 'text',
-    imageUrl: uploadedImageUrl || answer.imageUrl || '',
-    text: answer.text || (uploadedImageUrl || answer.imageUrl ? 'Handwritten answer submitted as image.' : ''),
+    type: rawImageData || answer.imageUrl ? 'image' : answer.type || 'text',
+    imageUrl: answer.imageUrl || '',
+    imageData: rawImageData,
+    text: answer.text || (rawImageData || answer.imageUrl ? 'Handwritten answer submitted as image.' : ''),
   };
 
-  console.log('[normalizeSubmittedAnswer] Normalized handwriting payload.', {
+  console.log('[normalizeSubmittedAnswer] Normalized handwriting payload (upload backgrounded).', {
     questionId: metadata.questionId,
     studentId: metadata.studentId,
-    usedUploadedImage: Boolean(uploadedImageUrl),
+    hasRawImageData: Boolean(rawImageData),
     usedExistingImageUrl: Boolean(answer.imageUrl),
-    retainedText: Boolean(normalizedAnswer.text),
     finalType: normalizedAnswer.type,
   });
 
-  return normalizedAnswer;
+  return { answer: normalizedAnswer, uploadPromise };
 }
 
 function getSubmittedAnswerImage(answer) {
@@ -1493,11 +1522,12 @@ async function prepareClassworkSubmission(req) {
   const aiAllowed = question.aiAllowed !== false;
   const aiExpired = !aiAllowed;
 
-  const normalizedAnswer = await normalizeSubmittedAnswer(answer, question.format, {
-    roomId: question.roomId || roomId,
-    questionId: question.id || questionId,
-    studentId,
-  });
+  const { answer: normalizedAnswer, uploadPromise: answerImageUploadPromise } =
+    normalizeSubmittedAnswer(answer, question.format, {
+      roomId: question.roomId || roomId,
+      questionId: question.id || questionId,
+      studentId,
+    });
 
   // When the student is iterating on an AI-generated follow-up question,
   // the frontend sends `overrideQuestionText` so AI sees the new question.
@@ -1546,6 +1576,7 @@ async function prepareClassworkSubmission(req) {
     resolvedClassSize,
     requestedGradeLevel,
     normalizedAnswer,
+    answerImageUploadPromise,
     questionTextForAi,
     isFollowUp,
     previousInteractionId,
@@ -1573,10 +1604,24 @@ async function persistClassworkFeedback({ ctx, aiResult }) {
     resolvedClassSize,
     requestedGradeLevel,
     normalizedAnswer,
+    answerImageUploadPromise,
     questionTextForAi,
     previousInteractionId,
     interactionId,
   } = ctx;
+
+  // Strip the fat base64 the AI path used inline. Mongo only stores the CDN
+  // URL, which the background upload patches in later (see below). Never
+  // await the upload here — Gemini is on the critical path, S3 is not.
+  if (
+    normalizedAnswer &&
+    typeof normalizedAnswer === 'object' &&
+    !Array.isArray(normalizedAnswer)
+  ) {
+    if (normalizedAnswer.imageData) {
+      delete normalizedAnswer.imageData;
+    }
+  }
 
   if (!question.standardSolution && aiResult.standardSolution) {
     question.standardSolution = String(aiResult.standardSolution).trim();
@@ -1741,6 +1786,48 @@ async function persistClassworkFeedback({ ctx, aiResult }) {
     );
   } catch (reportErr) {
     console.error('[Classwork] Failed to upsert AI report:', reportErr);
+  }
+
+  // Fire-and-forget: when the handwriting upload eventually resolves, patch
+  // both docs' answer.imageUrl in place. This runs completely off the request
+  // path — the SSE `done` event has already fired by the time this executes,
+  // and the doc initially has imageUrl='' until this catches up. Teacher-side
+  // views may briefly see no image; typically only a few seconds.
+  if (answerImageUploadPromise && typeof answerImageUploadPromise.then === 'function') {
+    const questionMongoId = question._id;
+    const questionRoomId = question.roomId;
+    const questionPublicId = question.id;
+    answerImageUploadPromise
+      .then((uploadedUrl) => {
+        if (!uploadedUrl) return;
+        return Promise.all([
+          ClassworkModel.updateOne(
+            { _id: questionMongoId, 'submitted.studentId': studentId },
+            { $set: { 'submitted.$.answer.imageUrl': uploadedUrl } },
+          ).catch((err) =>
+            console.error('[Classwork] deferred imageUrl patch on ClassworkModel failed:', err),
+          ),
+          ClassworkAiReport.updateOne(
+            {
+              roomId: questionRoomId,
+              questionId: questionPublicId,
+              studentId,
+              'interactions._id': interactionId,
+            },
+            {
+              $set: {
+                'interactions.$.studentAnswer.imageUrl': uploadedUrl,
+                'lastAnswer.imageUrl': uploadedUrl,
+              },
+            },
+          ).catch((err) =>
+            console.error('[Classwork] deferred imageUrl patch on ClassworkAiReport failed:', err),
+          ),
+        ]);
+      })
+      .catch((err) => {
+        console.error('[Classwork] deferred handwriting upload rejected:', err);
+      });
   }
 
   return {

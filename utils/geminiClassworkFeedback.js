@@ -325,12 +325,19 @@ function getAnswerImageSource(answer) {
   if (typeof answer === "string") {
     return /^data:image\//i.test(answer) ? answer : null;
   }
-  if (
-    typeof answer === "object" &&
-    typeof answer.imageUrl === "string" &&
-    answer.imageUrl.trim()
-  ) {
-    return answer.imageUrl;
+  if (typeof answer === "object") {
+    // Prefer the in-memory base64 the client already sent. sourceToInlineData
+    // recognises data: URLs and skips the fetch entirely, which saves the
+    // Spaces CDN round trip on every handwriting submission.
+    if (
+      typeof answer.imageData === "string" &&
+      /^data:image\//i.test(answer.imageData)
+    ) {
+      return answer.imageData;
+    }
+    if (typeof answer.imageUrl === "string" && answer.imageUrl.trim()) {
+      return answer.imageUrl;
+    }
   }
   return null;
 }

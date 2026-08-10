@@ -140,8 +140,11 @@ export const TUNING_DEFAULTS = {
     // equivalence. At the previous 160-token share (ratio 0.2 × 800) it
     // collapsed to string matching for cases like -5sin5x vs -5sin(5x)
     // and the model rationalised correct=false to satisfy the ASK-mode
-    // hint it had already committed to writing.
-    uncachedMinThinkingBudget: 512,
+    // hint it had already committed to writing. Trimmed from 512 to 256:
+    // the equivalence rules only need a few dozen tokens of reasoning per
+    // check, and 512 was adding ~1s of pre-stream thinking on every first
+    // submission of a question. Bump back up if false-negatives recur.
+    uncachedMinThinkingBudget: 256,
   },
   precompute: {
     solutionMaxTokens: 2000,
