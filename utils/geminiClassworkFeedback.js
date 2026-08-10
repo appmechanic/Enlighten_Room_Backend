@@ -70,12 +70,24 @@ function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, forma
 // See utils/aiConfig.js for the DB-read + 60s cache.
 
 // Property order matters: Gemini emits structured-JSON fields in the
-// order they appear in the schema, so the student-facing text
-// (`hintStream`, `part1`, `part2`) is placed first to unlock incremental
-// streaming — the client can render the hint before the trailing
-// metadata (`commonMistake`, `standardSolution`) has finished.
+// order they appear in the schema.
+// `correct` goes first (before the streamable text) so the client sees the
+// verdict within a token or two of the first chunk and can render
+// "✅ Correct" / "keep going" before the hint has finished streaming. This
+// costs hintStream ~5-10 tokens of delay to its first character (one bool
+// value + JSON syntax) but wins several seconds of perceived latency on
+// handwriting/image submissions where the full JSON otherwise finishes only
+// after image + hint reasoning.
+// Everything after `correct` still follows the original ordering
+// (hintStream, part1, part2 first for progressive rendering; heavier
+// metadata like commonMistake/standardSolution last).
 function buildClassworkResponseSchema({ includeStandardSolution }) {
   const properties = {
+    correct: {
+      type: Type.BOOLEAN,
+      description:
+        "true only when the student's answer is complete and correct; otherwise false. This field MUST be emitted first so the client can show the verdict without waiting for the hint.",
+    },
     // Field descriptions are honored by Gemini structured output and are the
     // strongest signal for what goes where. Without them the model conflated
     // hintStream with part1 (both became a bare greeting). Keep these in sync
@@ -96,11 +108,6 @@ function buildClassworkResponseSchema({ includeStandardSolution }) {
       items: { type: Type.STRING },
       description:
         "Immediate Next Step Guidance. One string per subtitle in order: '🛑: ' (what NOT to do), '✅: ' (the correct formula/strategy), '🔨: ' (how to apply it), and optionally '🔍: ' (short explanation of the underlying theorem/reason).",
-    },
-    correct: {
-      type: Type.BOOLEAN,
-      description:
-        "true only when the student's answer is complete and correct; otherwise false.",
     },
     part3: {
       type: Type.ARRAY,
@@ -595,22 +602,31 @@ async function buildGeminiRequest({
 
   const parts = [];
 
-  if (includeRawQuestionImage) {
-    const imageData = await sourceToInlineData(questionImage).catch(() => null);
-    if (imageData) {
-      parts.push({ text: "Question image:" });
-      parts.push({ inlineData: { data: imageData.base64, mimeType: imageData.mimeType } });
-    }
+  // Fetch both images in parallel — for handwriting submissions both are
+  // present, so serializing the two round trips added the slower image's
+  // full latency on top of the faster one before the Gemini call could
+  // start.
+  const [questionImageData, answerImageData] = await Promise.all([
+    includeRawQuestionImage
+      ? sourceToInlineData(questionImage).catch(() => null)
+      : null,
+    answerImageSource
+      ? sourceToInlineData(answerImageSource).catch(() => null)
+      : null,
+  ]);
+
+  if (questionImageData) {
+    parts.push({ text: "Question image:" });
+    parts.push({
+      inlineData: { data: questionImageData.base64, mimeType: questionImageData.mimeType },
+    });
   }
 
-  if (answerImageSource) {
-    const answerImageData = await sourceToInlineData(answerImageSource).catch(() => null);
-    if (answerImageData) {
-      parts.push({ text: "Student answer image:" });
-      parts.push({
-        inlineData: { data: answerImageData.base64, mimeType: answerImageData.mimeType },
-      });
-    }
+  if (answerImageData) {
+    parts.push({ text: "Student answer image:" });
+    parts.push({
+      inlineData: { data: answerImageData.base64, mimeType: answerImageData.mimeType },
+    });
   }
 
   parts.push({ text: promptLines.join("\n") });
@@ -872,6 +888,102 @@ export async function getClassworkAiFeedback({
 // still supersedes whatever we streamed — the client is told to prefer
 // it — so this scanner is best-effort: it exists to hide 3-15s of
 // perceived latency, not to be the authoritative source of the string.
+// Sibling of createHintStreamScanner that watches for the first
+// `"correct":true|false` in the growing JSON buffer and fires `onVerdict`
+// exactly once with the boolean value. Because the response schema now
+// declares `correct` as the very first property, Gemini emits it within
+// the first handful of tokens — the client can render "correct"/"keep
+// going" seconds before the full hint has finished streaming.
+// Deliberately narrow: doesn't try to be a JSON parser. Looks for the
+// literal key `"correct"`, then the next non-whitespace char after `:`
+// starting with `t` (true) or `f` (false). Fires once and stays quiet
+// for the rest of the stream.
+export function createVerdictScanner({ onVerdict }) {
+  const KEY = '"correct"';
+  let buffer = "";
+  let state = "SEARCH_KEY"; // SEARCH_KEY -> AWAIT_COLON -> AWAIT_VALUE -> DONE
+  let cursor = 0;
+  let fired = false;
+
+  function fire(value) {
+    if (fired) return;
+    fired = true;
+    state = "DONE";
+    try {
+      onVerdict(value);
+    } catch (err) {
+      console.error("[VerdictScanner] onVerdict threw:", err);
+    }
+  }
+
+  function scan() {
+    while (cursor < buffer.length && state !== "DONE") {
+      if (state === "SEARCH_KEY") {
+        const keyIdx = buffer.indexOf(KEY, cursor);
+        if (keyIdx === -1) {
+          // Keep the tail so a KEY split across two chunks still matches.
+          cursor = Math.max(buffer.length - KEY.length, cursor);
+          return;
+        }
+        cursor = keyIdx + KEY.length;
+        state = "AWAIT_COLON";
+        continue;
+      }
+      if (state === "AWAIT_COLON") {
+        const ch = buffer[cursor];
+        if (ch === ":") {
+          cursor += 1;
+          state = "AWAIT_VALUE";
+          continue;
+        }
+        if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+          cursor += 1;
+          continue;
+        }
+        // Unexpected — bail out silently rather than mis-report a verdict.
+        state = "DONE";
+        return;
+      }
+      if (state === "AWAIT_VALUE") {
+        const ch = buffer[cursor];
+        if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+          cursor += 1;
+          continue;
+        }
+        // We need enough tail to disambiguate "true" from "false" — wait
+        // for the next chunk if the literal is split across the boundary.
+        if (ch === "t") {
+          if (buffer.length - cursor < 4) return;
+          if (buffer.slice(cursor, cursor + 4) === "true") {
+            fire(true);
+            return;
+          }
+        } else if (ch === "f") {
+          if (buffer.length - cursor < 5) return;
+          if (buffer.slice(cursor, cursor + 5) === "false") {
+            fire(false);
+            return;
+          }
+        }
+        // Not a boolean literal — bail out silently.
+        state = "DONE";
+        return;
+      }
+    }
+  }
+
+  return {
+    push(chunk) {
+      if (fired || typeof chunk !== "string" || chunk.length === 0) return;
+      buffer += chunk;
+      scan();
+    },
+    isDone() {
+      return state === "DONE";
+    },
+  };
+}
+
 export function createHintStreamScanner({ onDelta }) {
   const KEY = '"hintStream"';
   let buffer = "";
@@ -1013,6 +1125,7 @@ export async function getClassworkAiFeedbackStream({
   computeStandardSolution = false,
   computeCommonMistake = false,
   onHintDelta,
+  onVerdict,
 }) {
   const reqId = newReqId();
   const [MODEL, FALLBACK_MODEL, retryCfg, feedbackTuning] = await Promise.all([
@@ -1080,6 +1193,26 @@ export async function getClassworkAiFeedbackStream({
   const scanner = createHintStreamScanner({
     onDelta: typeof onHintDelta === "function" ? onHintDelta : () => {},
   });
+  // Fires once, as soon as `"correct":true|false` shows up in the stream —
+  // usually within the first Gemini chunk since the schema puts `correct`
+  // first. Lets the SSE layer surface a verdict before the hint finishes.
+  let verdictFired = false;
+  const verdictScanner = createVerdictScanner({
+    onVerdict: (value) => {
+      if (verdictFired) return;
+      verdictFired = true;
+      if (typeof onVerdict === "function") {
+        try {
+          onVerdict(value);
+        } catch (err) {
+          console.error(
+            `[ClassworkFeedback][req=${reqId}][stream] onVerdict threw:`,
+            err,
+          );
+        }
+      }
+    },
+  });
 
   // The SDK's streaming call doesn't return a status code the retry
   // wrapper knows how to inspect until we start iterating — so we retry
@@ -1100,6 +1233,7 @@ export async function getClassworkAiFeedbackStream({
       const piece = chunk?.text ?? "";
       if (piece) {
         responseText += piece;
+        verdictScanner.push(piece);
         scanner.push(piece);
       }
       if (chunk?.usageMetadata) finalResponse = chunk;
@@ -1127,6 +1261,21 @@ export async function getClassworkAiFeedbackStream({
   feedback.standardPromptHash = standardPromptHash;
   feedback.standardPromptText = standardPromptText;
   feedback.teacherPromptText = teacherPromptText;
+
+  // Fallback: if the scanner never saw a boolean literal (schema quirk, JSON
+  // wrapped in ```fences, etc.) still deliver the verdict once from the
+  // fully-parsed result so the SSE layer's contract holds.
+  if (!verdictFired && typeof onVerdict === "function") {
+    verdictFired = true;
+    try {
+      onVerdict(Boolean(feedback.correct));
+    } catch (err) {
+      console.error(
+        `[ClassworkFeedback][req=${reqId}][stream] fallback onVerdict threw:`,
+        err,
+      );
+    }
+  }
 
   setImmediate(() => {
     recordAiTokenUsage(usageMetadata, {

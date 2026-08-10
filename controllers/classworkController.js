@@ -1966,8 +1966,14 @@ export const submitAnswerStream = async (req, res) => {
           cacheKey,
         });
         aiResult = cachedAiResult;
-        if (!clientGone && aiResult.hintStream) {
-          writeSseEvent(res, 'hint', { chunk: aiResult.hintStream });
+        if (!clientGone) {
+          // Same verdict + hint contract as the live Gemini branch, just
+          // replayed instantly from the answer-hash cache so the client
+          // doesn't need to branch on cache-hit vs miss.
+          writeSseEvent(res, 'verdict', { correct: Boolean(aiResult.correct) });
+          if (aiResult.hintStream) {
+            writeSseEvent(res, 'hint', { chunk: aiResult.hintStream });
+          }
         }
       } else {
         try {
@@ -1993,6 +1999,15 @@ export const submitAnswerStream = async (req, res) => {
             onHintDelta: (chunk) => {
               if (clientGone) return;
               writeSseEvent(res, 'hint', { chunk });
+            },
+            // Fires once, as soon as Gemini emits the first `"correct":…`
+            // token (schema puts `correct` first). The client can render
+            // "✅ Correct" / "keep going" without waiting for the full
+            // hint stream to complete — this is the perceived-latency win
+            // for handwriting/image submissions.
+            onVerdict: (isCorrect) => {
+              if (clientGone) return;
+              writeSseEvent(res, 'verdict', { correct: Boolean(isCorrect) });
             },
           });
           if (cacheKey) setCachedFeedback(cacheKey, aiResult);
