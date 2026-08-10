@@ -830,7 +830,12 @@ export async function getClassworkAiFeedback({
     },
   );
 
-  logAiUsage(reqId, result?.usageMetadata, "ClassworkFeedback");
+  logAiUsage(
+    reqId,
+    result?.usageMetadata,
+    "ClassworkFeedback",
+    result?.candidates?.[0]?.finishReason,
+  );
 
   const responseText = result.text || "";
   const parsed = parseFirstJsonObject(responseText, {
@@ -1243,7 +1248,12 @@ export async function getClassworkAiFeedbackStream({
         verdictScanner.push(piece);
         scanner.push(piece);
       }
-      if (chunk?.usageMetadata) finalResponse = chunk;
+      // Keep the LAST chunk that carries either usage or a finishReason —
+      // Gemini emits finishReason on the final chunk (usually the same chunk
+      // that carries usageMetadata, but not always).
+      if (chunk?.usageMetadata || chunk?.candidates?.[0]?.finishReason) {
+        finalResponse = chunk;
+      }
     }
     return finalResponse;
   };
@@ -1257,7 +1267,8 @@ export async function getClassworkAiFeedbackStream({
   });
 
   const usageMetadata = usageBearingChunk?.usageMetadata;
-  logAiUsage(reqId, usageMetadata, "ClassworkFeedback:stream");
+  const finishReason = usageBearingChunk?.candidates?.[0]?.finishReason;
+  logAiUsage(reqId, usageMetadata, "ClassworkFeedback:stream", finishReason);
 
   const parsed = parseFirstJsonObject(responseText, {
     tag: `ClassworkFeedback:${reqId}:stream`,

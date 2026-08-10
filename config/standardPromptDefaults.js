@@ -194,97 +194,26 @@ const CLASSWORK_MISTAKE_COMPUTE_DEFAULT = `commonMistake: {
 const CLASSWORK_MISTAKE_SKIP_DEFAULT = "commonMistake: Leave it empty";
 
 const CLASSWORK_HINT_STREAM_DEFAULT =
-  "hintStream: This is the ONLY text the student watches stream live, so it must stand alone as a genuinely useful hint. Write 2-4 complete sentences in the language of the original question that (1) greet the student by first name, (2) briefly acknowledge what they did right, and (3) give the single most important next-step nudge toward the correct method — WITHOUT revealing the final answer. Do NOT put only a greeting here, and do NOT just repeat part1.";
+  "hintStream: 2-4 sentences in the question's language. Greet by first name, acknowledge what they got right, then give the key next-step nudge — WITHOUT revealing the answer. Do not just repeat part1.";
 
-// Canonical equivalence rules — the superset that covers math, science, and
-// final-answer extraction. Backend used to ship a math-only subset; this
-// unified version is now the single default.
-const CLASSWORK_MATH_EQUIVALENCE_DEFAULT = `MATHEMATICAL EQUIVALENCE — CRITICAL:
-When deciding if the student's answer matches the reference answer, judge by MATHEMATICAL VALUE, not string form. Two expressions that simplify to the same thing are the SAME answer, regardless of notation. Do NOT mark an answer wrong for a notation/format difference alone.
-Treat ALL of the following as equivalent:
-- Implicit parentheses around single-term function arguments: sin4x = sin(4x) = \\sin(4x) = \\sin 4x; cos2x = cos(2x); tan(x/2) = tan x/2; log5x = log(5x); ln2x = ln(2x); sqrt2x = sqrt(2x) = \\sqrt{2x}.
-- Implicit multiplication: 2x = 2*x = 2·x = 2 \\cdot x; 3cos(x) = 3*cos(x) = 3 cos(x); (2)(3) = 2·3 = 6.
-- LaTeX vs plain text: \\sin, \\cos, \\tan, \\log, \\ln, \\sqrt, \\pi, \\theta, \\alpha, \\infty are the same as sin, cos, tan, log, ln, sqrt, pi, theta, alpha, infinity/∞.
-- Fractions: \\frac{a}{b} = a/b = (a)/(b) = a÷b; \\dfrac and \\tfrac behave the same as \\frac.
-- Exponents & roots: x^-3 = x^{-3} = 1/x^3 = 1/(x^3) = \\frac{1}{x^3}; x^(1/2) = x^{1/2} = sqrt(x) = \\sqrt{x}; x^2 = x*x = x·x.
-- Negative / reciprocal forms: -2x^-3 = -2/x^3 = -\\frac{2}{x^3}.
-- Coefficient placement: (3/2)cos(x) = 3/2 · cos(x) = 1.5cos(x) = \\frac{3}{2}\\cos(x) = \\frac{3\\cos(x)}{2}.
-- Order of commutative terms: a+b = b+a; a·b = b·a; sums/products can be reordered.
-- Equivalent constants: 0.5 = 1/2 = \\frac{1}{2}; π ≈ 3.14159 (any exact symbolic form counts).
-- Whitespace, capitalization of function names (SIN vs sin), and stray surrounding parentheses do not change the answer.
-- Trigonometric / algebraic identities that produce the SAME simplified form (e.g. 2sin(x)cos(x) = sin(2x)).
-ONLY mark the answer incorrect when the expressions evaluate to different mathematical values. If you are unsure whether two forms are equivalent, mentally substitute a sample value (e.g. x=1, x=2) into both — if they agree for every value in the domain, they are equivalent.
+// Compact equivalence rules — judge by mathematical/scientific value, not
+// string form. Trimmed from a ~5700-char superset (math + science +
+// final-answer + normalization examples) to ~700 chars because every extra
+// token here rides on every submission in the user prompt (never cached).
+// Bump back up if the model regresses on notation-variant answers.
+const CLASSWORK_MATH_EQUIVALENCE_DEFAULT = `EQUIVALENCE — CRITICAL: Judge answers by MATHEMATICAL / SCIENTIFIC VALUE, not string form. Simplify both sides before comparing. Treat as equivalent: whitespace and case differences; LaTeX vs plain text (\\sin=sin, \\frac{a}{b}=a/b, \\pi=pi); implicit parens on single-term function args (sin4x=sin(4x)); implicit multiplication (2x=2*x=2·x); commutative reorder (a+b=b+a, coefficient before or after); factored/distributed negatives (-5sin(5x) = -(5sin(5x)) = (-5)sin(5x) = 5(-sin(5x))); decimal/fraction (0.5=1/2=\\frac{1}{2}); chemical subscripts (H2O=H₂O=\\text{H}_2\\text{O}); reaction arrows (→ = -> = \\rightarrow); unit synonyms (m/s = m·s⁻¹). State symbols (aq)/(l)/(s)/(g) are OPTIONAL unless the question explicitly requires them. For multi-line derivations, judge by the final result. Only mark \`correct: false\` when the simplified expressions genuinely differ.`;
 
-SCIENCE EQUIVALENCE (chemistry / physics / biology) — CRITICAL:
-For science questions, judge by the SUBSTANTIVE scientific content, not by presentation metadata. Treat ALL of the following as equivalent to the reference:
-- Chemical formulas: H2O = H₂O = H_2O = \\text{H}_2\\text{O}; NaCl = \\text{NaCl}; CO2 = CO₂ = CO_2; H2SO4 = H₂SO₄. Subscripts/superscripts may be written inline or formatted — both are correct.
-- Ion notation: Na+ = Na^+ = \\text{Na}^+; Cl- = Cl^- = \\text{Cl}^-; SO4^2- = SO₄²⁻.
-- Reaction arrows: →, ->, ⟶, =>, \\rightarrow, \\longrightarrow, and → are all equivalent for a forward reaction; ⇌, <=>, \\rightleftharpoons for equilibrium.
-- State symbols (aq), (l), (s), (g) are OPTIONAL. A balanced equation without state symbols is still correct UNLESS the question explicitly asks for state symbols or physical states. Example: \`HCl + NaOH → NaCl + H2O\` is a CORRECT balanced neutralization equation even though it omits (aq)/(l). Missing state symbols may be mentioned as an improvement in the hint, but MUST NOT flip \`correct\` to false on their own.
-- Balanced equations: judge by (a) same reactants and products, (b) same coefficients (or scalar multiples that still balance both sides). Do NOT require the reference's exact formatting.
-- Ionic vs molecular vs net-ionic equations: accept whichever form matches what the question asks. If the question does not specify, accept any correct form that captures the reactants/products.
-- Physical units: m/s = m·s⁻¹ = ms⁻¹ = meters per second; N·m = J (for work/energy); kg·m/s² = N; standard SI prefixes are interchangeable with their expansions (kJ = 1000 J, mL = cm³, μm = 10⁻⁶ m).
-- Significant figures / decimal precision: accept the student's numerical answer if it rounds to the reference within the precision implied by the input data. Do NOT mark wrong for a trailing zero or one extra decimal place unless the question explicitly requires N significant figures.
-- Vector / physics notation: \\vec{F} = **F** = F⃗ = F (with arrow overhead) = boldface F; |F| denotes magnitude; angle brackets ⟨a,b⟩ and column form are the same vector.
-- Biology / naming: accept genus abbreviation once the full name has been given (Escherichia coli = E. coli); accept common names when the question uses common names, scientific names when it uses scientific names.
+const CLASSWORK_ASK_MODE_DEFAULT = `ASK MODE (odd attempt). Apply ONLY if the answer is genuinely incorrect under the EQUIVALENCE rules — otherwise set correct=true and fill advancedChallenge instead.
+When incorrect: guide the student to recall the method themselves.
+- hintStream: ask 1-2 leading questions pointing at the method (e.g. "Which operation undoes multiplication?").
+- part2: keep 🛑/✅/🔨 but phrase ✅ and 🔨 as questions/nudges — do not state the formula outright.
+Warm, encouraging tone.`;
 
-FINAL-ANSWER EXTRACTION — CRITICAL:
-When the student's submission is a multi-line derivation, shows working, or contains scratchwork, judge correctness by the FINAL result the student arrives at — not by intermediate steps. If the last line / boxed answer / concluding expression matches the reference (under the equivalence rules above), set \`correct\` = true even if earlier lines contain crossed-out attempts, dimensional slips, or notation the student later fixed. Only mark incorrect when the final result itself is wrong or is missing entirely.
-
-FINAL CORRECTNESS CHECK (MANDATORY):
-Before deciding whether \`correct\` is true or false, ALWAYS normalize and simplify BOTH the reference answer and the student's answer.
-
-Normalization MUST include:
-- Remove unnecessary whitespace and parentheses.
-- Treat implicit and explicit multiplication as identical.
-- Reorder multiplication factors (commutative property).
-- Move numerical coefficients to any position.
-- Distribute or factor out unary negatives.
-- Simplify algebraically before comparison.
-
-The following expressions MUST be considered mathematically identical:
-
--5sin(5x)
--5*sin(5x)
--(5sin(5x))
--(5*sin(5x))
-(-5)sin(5x)
-(-5)*sin(5x)
--sin(5x)*5
-(-sin(5x))*5
--(sin(5x))*5
-5(-sin(5x))
-5*(-sin(5x))
--1*5*sin(5x)
--(5*(sin(5x)))
--(sin(5x)*5)
-
-Do NOT mark an answer incorrect solely because:
-- the coefficient appears before or after the function,
-- multiplication is implicit or explicit,
-- extra parentheses are present,
-- the negative sign is written in a different but equivalent location,
-- factors appear in a different order.
-
-If the student's expression simplifies to exactly the same mathematical expression as the reference answer, you MUST return:
-
-{ "correct": true }
-
-Only return \`"correct": false\` if the simplified mathematical expressions are genuinely different.`;
-
-const CLASSWORK_ASK_MODE_DEFAULT = `PEDAGOGY MODE = ASK (odd-numbered attempt).
-PRECONDITION — READ BEFORE ANYTHING ELSE: Apply this mode ONLY after you have judged the student's answer INCORRECT using the MATHEMATICAL EQUIVALENCE rules. If the student's answer is mathematically equivalent to the reference (even with different notation, spacing, parentheses, or LaTeX/plain-text form), SKIP this mode entirely — set correct=true, congratulate, and fill advancedChallenge as usual.
-When the answer is genuinely incorrect, guide the student to recall the method themselves rather than stating it:
-- hintStream: acknowledge what they did right, then ask 1-2 leading questions that point at the method (e.g. "Which operation undoes multiplication?", "What could you do to BOTH sides to isolate the variable?"). Encourage them to try again.
-- part2: keep the 🛑/✅/🔨 structure, but phrase ✅ and 🔨 as QUESTIONS or nudges that make the student think — do not name the formula outright.
-Stay warm and encouraging so they feel safe trying again.`;
-
-const CLASSWORK_TELL_MODE_DEFAULT = `PEDAGOGY MODE = TELL (even-numbered attempt).
-PRECONDITION — READ BEFORE ANYTHING ELSE: Apply this mode ONLY after you have judged the student's answer INCORRECT using the MATHEMATICAL EQUIVALENCE rules. If the student's answer is mathematically equivalent to the reference (even with different notation, spacing, parentheses, or LaTeX/plain-text form), SKIP this mode entirely — set correct=true, congratulate, and fill advancedChallenge as usual.
-When the answer is genuinely incorrect, the student already had a turn to think, so now teach directly:
-- part2: in ✅ state the correct formula/operation/rule plainly, and in 🔨 show step-by-step HOW to apply it to this problem. Be clear and instructive.
-- hintStream: give the key explanation in plain language so it reads well live.
-You may fully explain the method; still let the student carry out the final calculation themselves rather than only printing the final number.`;
+const CLASSWORK_TELL_MODE_DEFAULT = `TELL MODE (even attempt). Apply ONLY if the answer is genuinely incorrect under the EQUIVALENCE rules — otherwise set correct=true and fill advancedChallenge instead.
+When incorrect: teach directly.
+- part2: in ✅ state the correct formula/rule plainly; in 🔨 show how to apply it step-by-step to this problem.
+- hintStream: give the key explanation in plain language.
+Let the student do the final calculation themselves; don't just print the answer.`;
 
 const PRECOMPUTE_SOLUTION_DEFAULT =
   'Produce the canonical step-by-step solution to the question below so it can be cached and reused for every student\'s submission. Use LaTeX for math expressions and formulas. For essay-writing questions, produce a sample response and rubric bullets rather than numeric steps. Use "\\n" between lines.';

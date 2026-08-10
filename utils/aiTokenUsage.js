@@ -45,9 +45,11 @@ function toObjectId(value) {
 // per call so devs can `grep '\[AI '` the logs and see input/output/cached
 // counts without dumping the full usageMetadata blob. Call site passes a
 // reqId (may be null) plus a short tag identifying which util made the call.
-export function logAiUsage(reqId, usageMetadata, tag) {
+export function logAiUsage(reqId, usageMetadata, tag, finishReason) {
   if (!usageMetadata) {
-    console.log(`[AI req=${reqId || "-"}][${tag || "AI"}] (no usageMetadata)`);
+    console.log(
+      `[AI req=${reqId || "-"}][${tag || "AI"}] (no usageMetadata)${finishReason ? ` finish=${finishReason}` : ""}`,
+    );
     return;
   }
   const input = Number(usageMetadata.promptTokenCount) || 0;
@@ -62,8 +64,13 @@ export function logAiUsage(reqId, usageMetadata, tag) {
     ) || 0;
   const total =
     Number(usageMetadata.totalTokenCount) || input + output + thoughts;
+  // finishReason is one of STOP (natural end), MAX_TOKENS (truncated), SAFETY,
+  // RECITATION, OTHER. Log it so we can diagnose truncations without guessing:
+  // e.g. a MAX_TOKENS log line for a small output means the model spent all its
+  // budget in thinking and left no room to finish the JSON.
+  const finish = finishReason ? ` finish=${finishReason}` : "";
   console.log(
-    `[AI req=${reqId || "-"}][${tag || "AI"}] input=${input} output=${output} cached=${cached} thoughts=${thoughts} total=${total}`,
+    `[AI req=${reqId || "-"}][${tag || "AI"}] input=${input} output=${output} cached=${cached} thoughts=${thoughts} total=${total}${finish}`,
   );
 }
 
