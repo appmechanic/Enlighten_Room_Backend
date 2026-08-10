@@ -106,10 +106,15 @@ export async function precomputeStandardSolution({
     const referenceAnswer = formatCorrectAnswerForPrompt(correctAnswer);
 
     // The envelope directive (precompute.solutionJsonEnvelope) is what makes
-    // the call return {solution, finalAnswer} instead of bare text — that
-    // finalAnswer is persisted as `derivedCorrectAnswer` and used as the
-    // fallback reference in per-submission feedback prompts when the teacher
-    // didn't attach a correctAnswer. Admin-editable via AdminAiPrompts.
+    // the call return {solution, finalAnswer, opener} instead of bare text.
+    // - finalAnswer is persisted as `derivedCorrectAnswer` and used as the
+    //   fallback reference in per-submission feedback prompts when the teacher
+    //   didn't attach a correctAnswer.
+    // - opener is a warm 1-2 sentence question-specific preamble that the
+    //   student sees streamed instantly on submit (via SSE `opener` event)
+    //   while the real Gemini feedback call is still running. Fills the
+    //   10-15s wait with something meaningful and question-aware.
+    // Both are admin-editable via AdminAiPrompts.
     const instruction = [
       solutionHeader,
       `Question format: ${format || "unspecified"}`,
@@ -159,8 +164,13 @@ export async function precomputeStandardSolution({
               properties: {
                 solution: { type: Type.STRING },
                 finalAnswer: { type: Type.STRING },
+                opener: {
+                  type: Type.STRING,
+                  description:
+                    "A warm 1-2 sentence preamble in the SAME language as the question. Should acknowledge what the question is about and prime the student for feedback WITHOUT solving or revealing the answer. Example: 'Great, let's look at how you handled this derivative — I'll walk through your work with you.' Do not greet by name (the student's name isn't known here). Do not use markdown. Keep under 250 characters.",
+                },
               },
-              required: ["solution", "finalAnswer"],
+              required: ["solution", "finalAnswer", "opener"],
             },
           },
         }),
@@ -184,15 +194,18 @@ export async function precomputeStandardSolution({
     });
     const solution = String(parsed?.solution ?? "").trim();
     const finalAnswer = String(parsed?.finalAnswer ?? "").trim();
+    // Cap the opener at 250 chars so a runaway model can't push a
+    // paragraph into the student-facing preamble.
+    const opener = String(parsed?.opener ?? "").trim().slice(0, 250);
     console.log(
-      `[ClassworkPrecompute][req=${reqId}] solution (${solution.length} chars) · finalAnswer: ${finalAnswer || "(empty)"}\n${solution}`,
+      `[ClassworkPrecompute][req=${reqId}] solution (${solution.length} chars) · finalAnswer: ${finalAnswer || "(empty)"} · opener: ${opener || "(empty)"}\n${solution}`,
     );
-    return { solution, finalAnswer };
+    return { solution, finalAnswer, opener };
   } catch (err) {
     console.error(
       `[ClassworkPrecompute][req=${reqId}] solution generation failed:`,
       err?.message || err,
     );
-    return { solution: "", finalAnswer: "" };
+    return { solution: "", finalAnswer: "", opener: "" };
   }
 }

@@ -294,7 +294,7 @@ const PRECOMPUTE_SOLUTION_DEFAULT =
 // reference in per-submission feedback prompts when the teacher didn't
 // attach a correctAnswer.
 const PRECOMPUTE_SOLUTION_JSON_ENVELOPE_DEFAULT =
-  'Return a single JSON object with exactly two fields: "solution" (the canonical step-by-step solution described above; keep the LaTeX and multi-line formatting) and "finalAnswer" (the single canonical answer to the question in its natural format — for MCQ the exact option text, for fill-in-the-blank a comma-separated list of blank values in order, for textbox/handwriting the final expression or value, for essay a 1-2 sentence rubric-style summary). Emit no text outside the JSON.';
+  'Return a single JSON object with exactly three fields: "solution" (the canonical step-by-step solution described above; keep the LaTeX and multi-line formatting), "finalAnswer" (the single canonical answer to the question in its natural format — for MCQ the exact option text, for fill-in-the-blank a comma-separated list of blank values in order, for textbox/handwriting the final expression or value, for essay a 1-2 sentence rubric-style summary), and "opener" (a warm 1-2 sentence preamble in the SAME language as the question that acknowledges what the question is about and primes the student for feedback WITHOUT solving or revealing the answer; do NOT greet by name; keep it under 250 characters; no markdown). Emit no text outside the JSON.';
 
 const REPORT_DIFFICULTIES_DIRECTIVE_DEFAULT =
   "For this call, produce ONLY the studentDifficulties section — a list of the specific difficulties students had and which students were affected. Do NOT include nextLessonStrategy or targetedHomework.";

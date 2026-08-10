@@ -639,7 +639,7 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
       ]);
 
       if (!newQuestion.standardSolution) {
-        const { solution, finalAnswer } = await precomputeStandardSolution({
+        const { solution, finalAnswer, opener } = await precomputeStandardSolution({
           questionText: newQuestion.question,
           imageSource: newQuestion.image,
           correctAnswer,
@@ -648,12 +648,17 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
           sessionId,
           maxOutputTokens: newQuestion.maxOutputTokens,
         });
+        // solution may be empty (e.g. Gemini returned only opener + finalAnswer
+        // on a tricky question) — still persist whatever we got so the
+        // instant-opener path lights up even without a solution to cache.
+        const update = {};
         if (solution) {
-          const update = {
-            standardSolution: solution,
-            solutionCapturedAt: new Date(),
-          };
-          if (finalAnswer) update.derivedCorrectAnswer = finalAnswer;
+          update.standardSolution = solution;
+          update.solutionCapturedAt = new Date();
+        }
+        if (finalAnswer) update.derivedCorrectAnswer = finalAnswer;
+        if (opener) update.aiOpener = opener;
+        if (Object.keys(update).length > 0) {
           await ClassworkModel.updateOne(
             { _id: newQuestion._id },
             { $set: update },
@@ -1935,6 +1940,16 @@ export const submitAnswerStream = async (req, res) => {
       return res.end();
     }
     const ctx = prepared;
+
+    // Fire the precomputed opener the moment we have ctx — before any
+    // Gemini call, cache lookup, or DB work. The client types it out
+    // instantly so the student sees warm question-specific content from
+    // t=0 instead of a blank spinner during the 10-15s Gemini wait.
+    // Skipped for follow-ups (opener was generated against the original
+    // question, not the AI-generated follow-up).
+    if (!clientGone && !ctx.isFollowUp && ctx.question.aiOpener) {
+      writeSseEvent(res, 'opener', { text: String(ctx.question.aiOpener) });
+    }
 
     let aiResult = emptyAiFeedback();
     let aiFailed = false;

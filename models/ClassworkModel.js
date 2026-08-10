@@ -69,6 +69,12 @@ const ClassworkSchema = new mongoose.Schema({
   releasedAt: { type: Date, default: null },
   submitted: { type: [SubmittedSchema], default: [] },
   standardSolution: { type: String, default: "" },
+  // Warm, 1-2 sentence question-specific opener generated alongside
+  // standardSolution at question-create time. Streamed to the student
+  // instantly on submit (before the real Gemini feedback call returns)
+  // so the modal shows something meaningful and question-aware from
+  // t=0 instead of a blank spinner during the 10-15s Gemini wait.
+  aiOpener: { type: String, default: "" },
   solutionCapturedAt: { type: Date, default: null },
   commonMistakeBank: { type: [CachedCommonMistakeSchema], default: [] },
   aiFeedbackCache: { type: AiFeedbackCacheSchema, default: () => ({}) },
