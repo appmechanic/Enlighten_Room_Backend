@@ -96,7 +96,7 @@ function buildClassworkResponseSchema({ includeStandardSolution }) {
     hintStream: {
       type: Type.STRING,
       description:
-        "The concise live hint the student sees typing in real time. 2-4 complete sentences in the question's language: greet by first name, acknowledge what they did right, and give the single most important next-step nudge toward the correct method WITHOUT revealing the final answer. Must stand alone as a useful hint; never just a greeting and never a copy of part1.",
+        "The concise live hint the student sees typing in real time. STRICT: 1-2 short sentences MAX in the question's language. Greet by first name and give the single most important next-step nudge toward the correct method WITHOUT revealing the final answer. Be terse — no acknowledgment paragraphs, no restatement of what they did, no filler. Must stand alone as a useful hint; never just a greeting and never a copy of part1.",
     },
     part1: {
       type: Type.ARRAY,
