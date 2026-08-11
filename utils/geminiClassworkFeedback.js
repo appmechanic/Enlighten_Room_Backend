@@ -102,24 +102,24 @@ function buildClassworkResponseSchema({ includeStandardSolution }) {
       type: Type.ARRAY,
       items: { type: Type.STRING },
       description:
-        "Acknowledgment section. The first string greets the student by first name and names the last correct step/milestone they reached before the error.",
+        "Acknowledgment. EXACTLY ONE short string: greet by first name and name the last correct step. Do NOT add more entries.",
     },
     part2: {
       type: Type.ARRAY,
       items: { type: Type.STRING },
       description:
-        "Immediate Next Step Guidance. One string per subtitle in order: '🛑: ' (what NOT to do), '✅: ' (the correct formula/strategy), '🔨: ' (how to apply it), and optionally '🔍: ' (short explanation of the underlying theorem/reason).",
+        "Immediate Next Step Guidance. Each string ≤ 12 words. One per subtitle in order: '🛑: ' (what NOT to do), '✅: ' (correct formula/strategy), '🔨: ' (how to apply it). Skip '🔍: ' unless truly needed. No prose paragraphs.",
     },
     part3: {
       type: Type.ARRAY,
       items: { type: Type.STRING },
       description:
-        "Diagnostic training suggestions that strengthen the underlying skill the student is missing, phrased encouragingly.",
+        "Diagnostic training suggestions. MAX 2 short bullet strings (≤ 10 words each). Skip filler encouragement.",
     },
     advancedChallenge: {
       type: Type.OBJECT,
       description:
-        "Only filled when correct is true: a warm congratulation plus a brand-new question one level more advanced. Leave both fields empty strings when the answer is not yet correct.",
+        "Only filled when correct is true: 1 short congratulation + 1 new question one level harder. Leave both fields empty strings when the answer is not yet correct.",
       properties: {
         congratulations: { type: Type.STRING },
         question: { type: Type.STRING },
