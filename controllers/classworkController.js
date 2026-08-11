@@ -2028,14 +2028,35 @@ export const submitAnswerStream = async (req, res) => {
     }
     const ctx = prepared;
 
-    // Fire the precomputed opener the moment we have ctx — before any
-    // Gemini call, cache lookup, or DB work. The client types it out
-    // instantly so the student sees warm question-specific content from
-    // t=0 instead of a blank spinner during the 10-15s Gemini wait.
-    // Skipped for follow-ups (opener was generated against the original
-    // question, not the AI-generated follow-up).
-    if (!clientGone && !ctx.isFollowUp && ctx.question.aiOpener) {
-      writeSseEvent(res, 'opener', { text: String(ctx.question.aiOpener) });
+    // Fire an instant opener the moment we have ctx — before any Gemini
+    // call, cache lookup, or DB work. The client types it out instantly so
+    // the student sees warm, personalised content from t=0 instead of a
+    // blank spinner during the ~10s Gemini wait. Real hint tokens stream
+    // in below over subsequent `hint` events.
+    //
+    // Composition:
+    //   1. Precomputed question-warmup preamble (question.aiOpener) — set at
+    //      question-create time; question-specific but student-agnostic.
+    //   2. Live answer restate — synthesised here so it can include what
+    //      THIS student actually wrote. Zero tokens, zero latency, pure JS.
+    //
+    // Skipped for follow-ups (the precomputed opener was generated against
+    // the original question, and a restate of an AI-generated follow-up
+    // adds no value).
+    if (!clientGone && !ctx.isFollowUp) {
+      const parts = [];
+      if (ctx.question.aiOpener) parts.push(String(ctx.question.aiOpener).trim());
+      const answerPreview = formatSubmittedAnswerText(ctx.normalizedAnswer).trim();
+      if (answerPreview && answerPreview !== '[Image answer submitted]') {
+        const clipped = answerPreview.length > 140
+          ? `${answerPreview.slice(0, 140)}…`
+          : answerPreview;
+        parts.push(`You wrote: "${clipped}" — let me take a look.`);
+      } else if (answerPreview === '[Image answer submitted]') {
+        parts.push('Let me take a look at your handwritten answer.');
+      }
+      const text = parts.filter(Boolean).join(' ');
+      if (text) writeSseEvent(res, 'opener', { text });
     }
 
     let aiResult = emptyAiFeedback();

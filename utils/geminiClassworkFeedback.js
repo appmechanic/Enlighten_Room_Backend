@@ -819,7 +819,7 @@ export async function getClassworkAiFeedback({
       baseDelayMs: retryCfg.baseMs,
       maxDelayMs: retryCfg.capMs,
       tag: `ClassworkFeedback:${reqId}`,
-      fallbackCallFn: FALLBACK_MODEL
+      fallbackCallFn: FALLBACK_MODEL && FALLBACK_MODEL !== MODEL
         ? () =>
             ai.models.generateContent({
               model: FALLBACK_MODEL,
@@ -1263,7 +1263,7 @@ export async function getClassworkAiFeedbackStream({
     baseDelayMs: retryCfg.baseMs,
     maxDelayMs: retryCfg.capMs,
     tag: `ClassworkFeedback:${reqId}:stream`,
-    fallbackCallFn: FALLBACK_MODEL ? openAndDrainWith(FALLBACK_MODEL) : undefined,
+    fallbackCallFn: FALLBACK_MODEL && FALLBACK_MODEL !== MODEL ? openAndDrainWith(FALLBACK_MODEL) : undefined,
   });
 
   const usageMetadata = usageBearingChunk?.usageMetadata;
