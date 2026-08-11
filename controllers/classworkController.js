@@ -2184,6 +2184,7 @@ export const submitAnswerStream = async (req, res) => {
           // streaming the structured hintStream (avoids a silent gap).
           let fastHintStreamed = false;
           let fastHintText = '';
+          let fastHintChunkCount = 0;
           const fastHintPromise = getClassworkAiFastHint({
             questionText: ctx.questionTextForAi,
             answer: ctx.normalizedAnswer,
@@ -2195,6 +2196,10 @@ export const submitAnswerStream = async (req, res) => {
             onHintDelta: (chunk) => {
               if (clientGone) return;
               fastHintStreamed = true;
+              fastHintChunkCount += 1;
+              console.log(
+                `[Classwork][stream] fast hint chunk #${fastHintChunkCount} (${chunk.length} chars, clientGone=${clientGone}, resEnded=${res.writableEnded})`,
+              );
               writeSseEvent(res, 'hint', { chunk });
             },
           })
