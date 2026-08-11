@@ -363,67 +363,6 @@ function newReqId() {
   return crypto.randomBytes(3).toString("hex");
 }
 
-function summarizeContentsForLog(contents) {
-  try {
-    return JSON.parse(
-      JSON.stringify(contents, (key, value) => {
-        if (key === "data" && typeof value === "string" && value.length > 120) {
-          return `<base64 ${value.length} chars>`;
-        }
-        return value;
-      }),
-    );
-  } catch {
-    return contents;
-  }
-}
-
-const PERSISTED_INTERACTION_KEYS = new Set([
-  "hintStream",
-  "part1",
-  "part2",
-  "part3",
-  "advancedChallenge",
-  "correct",
-  "standardSolution",
-  "commonMistake",
-]);
-
-function logGeminiResponse(reqId, rawText, parsed) {
-  console.log(`[ClassworkFeedback][req=${reqId}] === RESPONSE ===`);
-  console.log(
-    `[ClassworkFeedback][req=${reqId}] Raw text (${rawText.length} chars):\n${rawText}`,
-  );
-  if (parsed && typeof parsed === "object") {
-    const keys = Object.keys(parsed);
-    console.log(`[ClassworkFeedback][req=${reqId}] Parsed top-level keys:`, keys);
-    console.log(
-      `[ClassworkFeedback][req=${reqId}] Parsed object:`,
-      JSON.stringify(parsed, null, 2),
-    );
-    const droppedByMongo = keys.filter((k) => !PERSISTED_INTERACTION_KEYS.has(k));
-    if (droppedByMongo.length > 0) {
-      console.warn(
-        `[ClassworkFeedback][req=${reqId}] ⚠ Schema mismatch — these keys will be DROPPED on save:`,
-        droppedByMongo,
-        `(persisted keys: ${[...PERSISTED_INTERACTION_KEYS].join(", ")})`,
-      );
-    }
-    const missingPersisted = [...PERSISTED_INTERACTION_KEYS].filter((k) => !(k in parsed));
-    if (missingPersisted.length > 0) {
-      console.warn(
-        `[ClassworkFeedback][req=${reqId}] ⚠ Missing keys that the DB schema expects:`,
-        missingPersisted,
-      );
-    }
-  } else {
-    console.warn(
-      `[ClassworkFeedback][req=${reqId}] Parsed response is not an object — Gemini output did not contain a valid JSON object.`,
-    );
-  }
-  console.log(`[ClassworkFeedback][req=${reqId}] === END RESPONSE ===`);
-}
-
 async function buildGeminiRequest({
   reqId,
   questionText,
@@ -441,9 +380,6 @@ async function buildGeminiRequest({
   computeStandardSolution,
   computeCommonMistake,
 }) {
-  console.log(`[ClassworkFeedback][req=${reqId}] === PROMPT ===`);
-  console.log(`[ClassworkFeedback][req=${reqId}] teacherId:`, teacherId || "(missing)");
-
   const [
     { text: standardText, hash: standardPromptHash },
     teacherPrompt,
@@ -652,31 +588,6 @@ async function buildGeminiRequest({
     .filter(Boolean)
     .join("\n\n");
 
-  console.log(
-    `[ClassworkFeedback][req=${reqId}] Standard prompt (${standardText.length} chars):\n${standardText || "(none configured)"}`,
-  );
-  console.log(`[ClassworkFeedback][req=${reqId}] Teacher prompt:\n${teacherPrompt || "(none)"}`);
-  console.log(`[ClassworkFeedback][req=${reqId}] standardPromptHash:`, standardPromptHash);
-  console.log(
-    `[ClassworkFeedback][req=${reqId}] User prompt (${promptLines.join("\n").length} chars):\n${promptLines.join("\n")}`,
-  );
-  console.log(
-    `[ClassworkFeedback][req=${reqId}] Question image attached:`,
-    includeRawQuestionImage,
-    "· Answer image attached:",
-    Boolean(answerImageSource),
-    "· Cached solution in systemInstruction:",
-    Boolean(cachedSolution),
-    "· Attached mistakes:",
-    cachedMistakes.length,
-    "· Server pre-check equivalence:",
-    serverSideMatch ? "PASSED (correctness override injected)" : "no match",
-  );
-  console.log(
-    `[ClassworkFeedback][req=${reqId}] Final systemInstruction (${systemInstruction.length} chars):\n${systemInstruction}`,
-  );
-  console.log(`[ClassworkFeedback][req=${reqId}] === END PROMPT ===`);
-
   return {
     systemInstruction,
     contents: [{ role: "user", parts }],
@@ -830,17 +741,6 @@ export async function getClassworkAiFeedback({
         maxOutputTokens: resolvedMaxOutputTokens,
       };
 
-  console.log(`[ClassworkFeedback][req=${reqId}] Gemini request:`, {
-    model: MODEL,
-    contents: summarizeContentsForLog(contents),
-    config: {
-      ...config,
-      systemInstruction: cacheResult.ok
-        ? `<served from cachedContent=${cacheResult.name} (reused=${cacheResult.reused})>`
-        : `<${systemInstruction.length} chars — see PROMPT block above>`,
-    },
-  });
-
   // Fallback callable used both by the retry wrapper's regular-fallback slot
   // AND locally on a `cachedContent`-specific error (deleted/expired cache
   // in the window between our TTL bookkeeping and Gemini's own expiry).
@@ -854,6 +754,10 @@ export async function getClassworkAiFeedback({
     maxOutputTokens: resolvedMaxOutputTokens,
   };
 
+  const apiStartMs = Date.now();
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] AI hint API start: ${new Date(apiStartMs).toISOString()}`,
+  );
   const result = await withGeminiRetry(
     () => ai.models.generateContent({ model: MODEL, contents, config }),
     {
@@ -871,6 +775,10 @@ export async function getClassworkAiFeedback({
         : undefined,
     },
   );
+  const apiEndMs = Date.now();
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] AI hint API end: ${new Date(apiEndMs).toISOString()} (duration ${apiEndMs - apiStartMs}ms)`,
+  );
 
   logAiUsage(
     reqId,
@@ -883,7 +791,6 @@ export async function getClassworkAiFeedback({
   const parsed = parseFirstJsonObject(responseText, {
     tag: `ClassworkFeedback:${reqId}`,
   });
-  logGeminiResponse(reqId, responseText, parsed);
 
   const feedback = shapeFeedback(parsed, responseText);
   feedback.standardPromptHash = standardPromptHash;
@@ -1272,17 +1179,6 @@ export async function getClassworkAiFeedbackStream({
     maxOutputTokens: resolvedMaxOutputTokens,
   };
 
-  console.log(`[ClassworkFeedback][req=${reqId}][stream] Gemini request:`, {
-    model: MODEL,
-    contents: summarizeContentsForLog(contents),
-    config: {
-      ...config,
-      systemInstruction: cacheResult.ok
-        ? `<served from cachedContent=${cacheResult.name} (reused=${cacheResult.reused})>`
-        : `<${systemInstruction.length} chars — see PROMPT block above>`,
-    },
-  });
-
   const scanner = createHintStreamScanner({
     onDelta: typeof onHintDelta === "function" ? onHintDelta : () => {},
   });
@@ -1339,6 +1235,10 @@ export async function getClassworkAiFeedbackStream({
     return finalResponse;
   };
 
+  const apiStartMs = Date.now();
+  console.log(
+    `[ClassworkFeedback][req=${reqId}][stream] AI hint API start: ${new Date(apiStartMs).toISOString()}`,
+  );
   const usageBearingChunk = await withGeminiRetry(openAndDrainWith(MODEL, config), {
     maxAttempts: retryCfg.max,
     baseDelayMs: retryCfg.baseMs,
@@ -1348,6 +1248,10 @@ export async function getClassworkAiFeedbackStream({
       ? openAndDrainWith(FALLBACK_MODEL, inlineConfig)
       : undefined,
   });
+  const apiEndMs = Date.now();
+  console.log(
+    `[ClassworkFeedback][req=${reqId}][stream] AI hint API end: ${new Date(apiEndMs).toISOString()} (duration ${apiEndMs - apiStartMs}ms)`,
+  );
 
   const usageMetadata = usageBearingChunk?.usageMetadata;
   const finishReason = usageBearingChunk?.candidates?.[0]?.finishReason;
@@ -1356,7 +1260,6 @@ export async function getClassworkAiFeedbackStream({
   const parsed = parseFirstJsonObject(responseText, {
     tag: `ClassworkFeedback:${reqId}:stream`,
   });
-  logGeminiResponse(reqId, responseText, parsed);
 
   const feedback = shapeFeedback(parsed, responseText);
   feedback.standardPromptHash = standardPromptHash;
