@@ -412,6 +412,21 @@ function getSubmittedAnswerImage(answer) {
   return answer.imageUrl || answer.imageData || null;
 }
 
+// Build the "You wrote: '…'" preamble shown to the student the instant a
+// submission arrives — no DB, no AI, no wait. Fired as the first `opener`
+// SSE before any Mongo lookup so the student sees typewriter content within
+// a frame of hitting Submit. For handwriting the echoed text would just be
+// "[Image answer submitted]", so we swap in a friendlier line.
+function buildAnswerEchoOpener(rawAnswer) {
+  const preview = formatSubmittedAnswerText(rawAnswer).trim();
+  if (!preview) return '';
+  if (preview === '[Image answer submitted]') {
+    return 'Let me take a look at your handwritten answer.';
+  }
+  const clipped = preview.length > 140 ? `${preview.slice(0, 140)}…` : preview;
+  return `You wrote: "${clipped}" — let me take a look.`;
+}
+
 function formatSubmittedAnswerText(answer) {
   if (Array.isArray(answer)) {
     return answer.map((entry) => String(entry ?? '')).join(' | ');
@@ -1475,15 +1490,20 @@ async function prepareClassworkSubmission(req) {
   } = req.body;
 
   const requestedGradeLevel = normalizeGradeLevel(gradeLevel);
-  const { resolvedTeacherId, resolvedClassSize } = await resolveTeacherAndClassSize({
-    roomId,
-    teacherId,
-  });
 
+  // Wave 1: fire the two independent lookups at the same time. The
+  // teacher/class-size lookup is on the AI critical path (teacherId feeds
+  // getTeacherPromptCached at the very start of the Gemini call) but only
+  // depends on req.body, so we start it in parallel with the question fetch
+  // instead of blocking on it first as before.
   const lookup = roomId ? { _id: id, id: questionId, roomId } : { id: questionId };
+  const teacherClassSizePromise = resolveTeacherAndClassSize({ roomId, teacherId });
   const question = await ClassworkModel.findOne(lookup).sort({ createdAt: -1 });
 
   if (!question) {
+    // Drain the in-flight teacher/class lookup so it doesn't become an
+    // unhandled rejection on the error path.
+    teacherClassSizePromise.catch(() => {});
     return {
       error: {
         status: 404,
@@ -1494,6 +1514,7 @@ async function prepareClassworkSubmission(req) {
   if (!question.roomId && roomId) question.roomId = roomId;
 
   if (!question.released) {
+    teacherClassSizePromise.catch(() => {});
     return {
       error: {
         status: 403,
@@ -1506,6 +1527,7 @@ async function prepareClassworkSubmission(req) {
     const textboxLimit = Number(question.maxLength) > 0 ? Number(question.maxLength) : 2000;
     const answerText = typeof answer === 'string' ? answer : '';
     if (answerText.length > textboxLimit) {
+      teacherClassSizePromise.catch(() => {});
       return {
         error: {
           status: 400,
@@ -1536,13 +1558,32 @@ async function prepareClassworkSubmission(req) {
     : question.question;
   const isFollowUp = questionTextForAi !== question.question;
 
-  const existingReport = await ClassworkAiReport.findOne({
+  // Wave 2: everything that depends on the question doc runs concurrently
+  // (aiReport for Ask/Tell submissionNumber, session-id for the usage
+  // bucket) alongside the wave-1 teacher/class-size promise. Total prep
+  // latency becomes ~ max(question, max(aiReport, sessionId, teacherClass))
+  // instead of the previous sum of all four sequential awaits.
+  const existingReportPromise = ClassworkAiReport.findOne({
     roomId: question.roomId,
     questionId: question.id,
     studentId,
   })
     .select('interactions._id')
     .lean();
+  const sessionIdPromise = resolveSessionIdForRoom(
+    question.roomId || roomId,
+    question.lessonName,
+  );
+
+  const interactionId = new mongoose.Types.ObjectId();
+  const cachedContext = buildCachedContext(question);
+
+  const [{ resolvedTeacherId, resolvedClassSize }, existingReport, sessionIdForUsage] =
+    await Promise.all([
+      teacherClassSizePromise,
+      existingReportPromise,
+      sessionIdPromise,
+    ]);
   const priorInteractionCount = Array.isArray(existingReport?.interactions)
     ? existingReport.interactions.length
     : 0;
@@ -1554,16 +1595,6 @@ async function prepareClassworkSubmission(req) {
   // recall the method themselves; even attempts (2,4,6…) explain it. Resets
   // naturally per question because the report is keyed per (room,question,student).
   const submissionNumber = priorInteractionCount + 1;
-  const interactionId = new mongoose.Types.ObjectId();
-  const cachedContext = buildCachedContext(question);
-
-  // Resolve the session that owns this room so the AI usage row lands in
-  // the right (month, session) bucket. If no active lesson is found we
-  // fall back to the sessionless monthly bucket.
-  const sessionIdForUsage = await resolveSessionIdForRoom(
-    question.roomId || roomId,
-    question.lessonName,
-  );
 
   return {
     question,
@@ -2017,6 +2048,17 @@ export const submitAnswerStream = async (req, res) => {
     clientGone = true;
   });
 
+  // t=0 opener — synthesised from req.body alone, no Mongo touch. Fires
+  // BEFORE prepareClassworkSubmission so the client typewriter has warm
+  // content from the moment the request is accepted, not after the prep
+  // lookups finish (which can be several seconds on a cold connection).
+  // Applies to follow-ups too — the echo describes what the student wrote,
+  // which is always valid.
+  if (!clientGone) {
+    const echoText = buildAnswerEchoOpener(req.body?.answer);
+    if (echoText) writeSseEvent(res, 'opener', { text: echoText });
+  }
+
   try {
     const prepared = await prepareClassworkSubmission(req);
     if (prepared.error) {
@@ -2028,35 +2070,14 @@ export const submitAnswerStream = async (req, res) => {
     }
     const ctx = prepared;
 
-    // Fire an instant opener the moment we have ctx — before any Gemini
-    // call, cache lookup, or DB work. The client types it out instantly so
-    // the student sees warm, personalised content from t=0 instead of a
-    // blank spinner during the ~10s Gemini wait. Real hint tokens stream
-    // in below over subsequent `hint` events.
-    //
-    // Composition:
-    //   1. Precomputed question-warmup preamble (question.aiOpener) — set at
-    //      question-create time; question-specific but student-agnostic.
-    //   2. Live answer restate — synthesised here so it can include what
-    //      THIS student actually wrote. Zero tokens, zero latency, pure JS.
-    //
-    // Skipped for follow-ups (the precomputed opener was generated against
-    // the original question, and a restate of an AI-generated follow-up
-    // adds no value).
-    if (!clientGone && !ctx.isFollowUp) {
-      const parts = [];
-      if (ctx.question.aiOpener) parts.push(String(ctx.question.aiOpener).trim());
-      const answerPreview = formatSubmittedAnswerText(ctx.normalizedAnswer).trim();
-      if (answerPreview && answerPreview !== '[Image answer submitted]') {
-        const clipped = answerPreview.length > 140
-          ? `${answerPreview.slice(0, 140)}…`
-          : answerPreview;
-        parts.push(`You wrote: "${clipped}" — let me take a look.`);
-      } else if (answerPreview === '[Image answer submitted]') {
-        parts.push('Let me take a look at your handwritten answer.');
-      }
-      const text = parts.filter(Boolean).join(' ');
-      if (text) writeSseEvent(res, 'opener', { text });
+    // Second opener event — the precomputed question-warmup preamble set at
+    // question-create time. Fired here because it needs the question doc.
+    // The FE typewriter APPENDS this to whatever it's already typing so the
+    // student sees one continuous flow: "You wrote: … — let me take a look.
+    // <aiOpener>". Skipped for follow-ups because the preamble was written
+    // against the original question, not the AI-generated follow-up.
+    if (!clientGone && !ctx.isFollowUp && ctx.question.aiOpener) {
+      writeSseEvent(res, 'opener', { text: String(ctx.question.aiOpener).trim() });
     }
 
     let aiResult = emptyAiFeedback();
