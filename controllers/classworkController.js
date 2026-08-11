@@ -2173,18 +2173,12 @@ export const submitAnswerStream = async (req, res) => {
           const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
 
           // Two-call pattern: fire a fast plain-text hint AND the full
-          // structured call in parallel. The fast hint (flash-lite, no
-          // schema, no thinking) streams to the student in ~1-2s so the
-          // typewriter fills immediately. The structured call still
-          // produces the authoritative verdict + panels for persistence
-          // and the `done` event.
-          // Track whether the fast hint has already begun streaming so the
-          // structured call's hintStream chunks don't collide with it. If
-          // the fast hint fails BEFORE emitting anything, we fall back to
-          // streaming the structured hintStream (avoids a silent gap).
-          let fastHintStreamed = false;
+          // structured call in parallel. The fast hint (no schema, no
+          // thinking) completes in ~1-2s and is delivered as ONE `opener`
+          // SSE event — the FE typewriter appends it after the static echo
+          // opener so the student sees a Gemini-authored greeting within
+          // ~1s. The structured call still produces panels/verdict/persistence.
           let fastHintText = '';
-          let fastHintChunkCount = 0;
           const fastHintPromise = getClassworkAiFastHint({
             questionText: ctx.questionTextForAi,
             answer: ctx.normalizedAnswer,
@@ -2193,23 +2187,20 @@ export const submitAnswerStream = async (req, res) => {
             format: ctx.question.format,
             studentName: ctx.studentName,
             teacherId: ctx.resolvedTeacherId,
-            onHintDelta: (chunk) => {
-              if (clientGone) return;
-              fastHintStreamed = true;
-              fastHintChunkCount += 1;
-              console.log(
-                `[Classwork][stream] fast hint chunk #${fastHintChunkCount} (${chunk.length} chars, clientGone=${clientGone}, resEnded=${res.writableEnded})`,
-              );
-              writeSseEvent(res, 'hint', { chunk });
-            },
           })
             .then((text) => {
-              fastHintText = text || '';
+              fastHintText = (text || '').trim();
+              if (fastHintText && !clientGone) {
+                console.log(
+                  `[Classwork][stream] fast hint opener sent (${fastHintText.length} chars)`,
+                );
+                writeSseEvent(res, 'opener', { text: fastHintText });
+              }
             })
             .catch((err) => {
               // Fast hint is best-effort — if it fails the structured call's
-              // hintStream still gets streamed (see onHintDelta below) and the
-              // student sees the hint from the slower path.
+              // hintStream still streams (see onHintDelta below) so the
+              // student still sees a hint via the slower path.
               console.error('[Classwork][stream] fast hint failed:', err?.message || err);
             });
 
@@ -2233,10 +2224,7 @@ export const submitAnswerStream = async (req, res) => {
             cachedContext: ctx.cachedContext,
             computeStandardSolution: !hasPrecomputedSolution,
             onHintDelta: (chunk) => {
-              // Only forward structured hint chunks if the fast hint never
-              // streamed anything (its failure case). Otherwise the client
-              // would see two overlapping hints.
-              if (clientGone || fastHintStreamed) return;
+              if (clientGone) return;
               writeSseEvent(res, 'hint', { chunk });
             },
             onVerdict: (isCorrect) => {
