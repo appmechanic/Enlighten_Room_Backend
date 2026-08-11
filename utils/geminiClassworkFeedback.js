@@ -1313,3 +1313,113 @@ export async function getClassworkAiFeedbackStream({
 
   return feedback;
 }
+
+// Fast-hint call: plain-text, no responseSchema, no thinkingConfig, tight
+// output cap. Runs in parallel with the full structured call so the student
+// sees a 1-2 sentence live hint in ~1-2s instead of waiting the full 4-9s
+// for the structured JSON to complete. Uses the fallback (smaller) model
+// so it's both faster and cheaper than the primary reasoning model.
+// The authoritative structured hintStream still overwrites this on the
+// server side before persistence — this exists purely to hide latency.
+export async function getClassworkAiFastHint({
+  questionText,
+  answer,
+  correctAnswer,
+  questionImage,
+  format,
+  studentName,
+  teacherId,
+  onHintDelta,
+}) {
+  const reqId = newReqId();
+  const [MODEL, FALLBACK_MODEL, standardText, teacherPrompt] = await Promise.all([
+    getAiModel(),
+    getAiModel("fallback"),
+    getStandardPromptCached().then((r) => r.text),
+    getTeacherPromptCached(teacherId),
+  ]);
+  // Prefer fallback (flash-lite) — it's a 1-sentence hint, no reasoning needed.
+  const fastModel = FALLBACK_MODEL || MODEL;
+
+  const systemInstruction = [standardText, teacherPrompt].filter(Boolean).join("\n\n");
+
+  const answerImageSource = getAnswerImageSource(answer);
+  const includeRawQuestionImage = Boolean(questionImage);
+  const [questionImageData, answerImageData] = await Promise.all([
+    includeRawQuestionImage ? sourceToInlineData(questionImage).catch(() => null) : null,
+    answerImageSource ? sourceToInlineData(answerImageSource).catch(() => null) : null,
+  ]);
+
+  const promptText = [
+    studentName ? `Student name: ${studentName}` : null,
+    `Question: ${questionText || ""}`,
+    format ? `Answer Format: ${format}` : null,
+    correctAnswer
+      ? `Reference / Correct Answer: ${formatCorrectAnswerForPrompt(correctAnswer)}`
+      : null,
+    `Student Answer: ${normalizeAnswerText(answer) || "[No text provided]"}`,
+    includeRawQuestionImage ? "A question image is attached." : null,
+    answerImageSource ? "A student answer image is attached." : null,
+    "OUTPUT: 1-2 short sentences in the question's language. Plain text only — NO JSON, NO markdown, NO bullets, NO emojis. If the student's answer is correct, warmly congratulate by first name. Otherwise, greet by first name and give the single most important next-step nudge WITHOUT revealing the final answer. Be terse; no acknowledgment paragraphs.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const parts = [];
+  if (questionImageData) {
+    parts.push({ text: "Question image:" });
+    parts.push({
+      inlineData: { data: questionImageData.base64, mimeType: questionImageData.mimeType },
+    });
+  }
+  if (answerImageData) {
+    parts.push({ text: "Student answer image:" });
+    parts.push({
+      inlineData: { data: answerImageData.base64, mimeType: answerImageData.mimeType },
+    });
+  }
+  parts.push({ text: promptText });
+
+  const config = {
+    systemInstruction,
+    thinkingConfig: { thinkingBudget: 0 },
+    maxOutputTokens: 180,
+  };
+
+  const apiStartMs = Date.now();
+  console.log(
+    `[FastHint][req=${reqId}] AI fast hint API start (model=${fastModel}): ${new Date(apiStartMs).toISOString()}`,
+  );
+
+  let hintText = "";
+  try {
+    const stream = await ai.models.generateContentStream({
+      model: fastModel,
+      contents: [{ role: "user", parts }],
+      config,
+    });
+    for await (const chunk of stream) {
+      const piece = chunk?.text ?? "";
+      if (piece) {
+        hintText += piece;
+        if (typeof onHintDelta === "function") {
+          try {
+            onHintDelta(piece);
+          } catch (err) {
+            console.error(`[FastHint][req=${reqId}] onHintDelta threw:`, err);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[FastHint][req=${reqId}] stream failed:`, err?.message || err);
+    throw err;
+  }
+
+  const apiEndMs = Date.now();
+  console.log(
+    `[FastHint][req=${reqId}] AI fast hint API end: ${new Date(apiEndMs).toISOString()} (duration ${apiEndMs - apiStartMs}ms, chars=${hintText.length})`,
+  );
+
+  return hintText.trim();
+}

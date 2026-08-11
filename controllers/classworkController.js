@@ -9,6 +9,7 @@ import Lesson from '../models/LessonModel.js';
 import {
   getClassworkAiFeedback,
   getClassworkAiFeedbackStream,
+  getClassworkAiFastHint,
 } from '../utils/geminiClassworkFeedback.js';
 import {
   fingerprintAnswer,
@@ -2170,7 +2171,44 @@ export const submitAnswerStream = async (req, res) => {
       } else {
         try {
           const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
-          aiResult = await getClassworkAiFeedbackStream({
+
+          // Two-call pattern: fire a fast plain-text hint AND the full
+          // structured call in parallel. The fast hint (flash-lite, no
+          // schema, no thinking) streams to the student in ~1-2s so the
+          // typewriter fills immediately. The structured call still
+          // produces the authoritative verdict + panels for persistence
+          // and the `done` event.
+          // Track whether the fast hint has already begun streaming so the
+          // structured call's hintStream chunks don't collide with it. If
+          // the fast hint fails BEFORE emitting anything, we fall back to
+          // streaming the structured hintStream (avoids a silent gap).
+          let fastHintStreamed = false;
+          let fastHintText = '';
+          const fastHintPromise = getClassworkAiFastHint({
+            questionText: ctx.questionTextForAi,
+            answer: ctx.normalizedAnswer,
+            correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+            questionImage: ctx.isFollowUp ? null : (ctx.question.image || null),
+            format: ctx.question.format,
+            studentName: ctx.studentName,
+            teacherId: ctx.resolvedTeacherId,
+            onHintDelta: (chunk) => {
+              if (clientGone) return;
+              fastHintStreamed = true;
+              writeSseEvent(res, 'hint', { chunk });
+            },
+          })
+            .then((text) => {
+              fastHintText = text || '';
+            })
+            .catch((err) => {
+              // Fast hint is best-effort — if it fails the structured call's
+              // hintStream still gets streamed (see onHintDelta below) and the
+              // student sees the hint from the slower path.
+              console.error('[Classwork][stream] fast hint failed:', err?.message || err);
+            });
+
+          const structuredPromise = getClassworkAiFeedbackStream({
             questionText: ctx.questionTextForAi,
             answer: ctx.normalizedAnswer,
             correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
@@ -2190,19 +2228,27 @@ export const submitAnswerStream = async (req, res) => {
             cachedContext: ctx.cachedContext,
             computeStandardSolution: !hasPrecomputedSolution,
             onHintDelta: (chunk) => {
-              if (clientGone) return;
+              // Only forward structured hint chunks if the fast hint never
+              // streamed anything (its failure case). Otherwise the client
+              // would see two overlapping hints.
+              if (clientGone || fastHintStreamed) return;
               writeSseEvent(res, 'hint', { chunk });
             },
-            // Fires once, as soon as Gemini emits the first `"correct":…`
-            // token (schema puts `correct` first). The client can render
-            // "✅ Correct" / "keep going" without waiting for the full
-            // hint stream to complete — this is the perceived-latency win
-            // for handwriting/image submissions.
             onVerdict: (isCorrect) => {
               if (clientGone) return;
               writeSseEvent(res, 'verdict', { correct: Boolean(isCorrect) });
             },
           });
+
+          aiResult = await structuredPromise;
+          // Ensure the fast hint has fully drained before we consider the
+          // response complete (usually finishes long before structured).
+          await fastHintPromise;
+
+          // Persist the fast hint text as the authoritative hintStream when
+          // it succeeded — that's what the student actually saw typing.
+          if (fastHintText) aiResult.hintStream = fastHintText;
+
           if (cacheKey) setCachedFeedback(cacheKey, aiResult);
         } catch (aiErr) {
           console.error('[Classwork][stream] AI feedback failed:', aiErr);
