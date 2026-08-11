@@ -2068,17 +2068,6 @@ export const submitAnswerStream = async (req, res) => {
     clientGone = true;
   });
 
-  // t=0 opener — synthesised from req.body alone, no Mongo touch. Fires
-  // BEFORE prepareClassworkSubmission so the client typewriter has warm
-  // content from the moment the request is accepted, not after the prep
-  // lookups finish (which can be several seconds on a cold connection).
-  // Applies to follow-ups too — the echo describes what the student wrote,
-  // which is always valid.
-  if (!clientGone) {
-    const echoText = buildAnswerEchoOpener(req.body?.answer);
-    if (echoText) writeSseEvent(res, 'opener', { text: echoText });
-  }
-
   try {
     const prepared = await prepareClassworkSubmission(req);
     if (prepared.error) {
@@ -2089,16 +2078,6 @@ export const submitAnswerStream = async (req, res) => {
       return res.end();
     }
     const ctx = prepared;
-
-    // Second opener event — the precomputed question-warmup preamble set at
-    // question-create time. Fired here because it needs the question doc.
-    // The FE typewriter APPENDS this to whatever it's already typing so the
-    // student sees one continuous flow: "You wrote: … — let me take a look.
-    // <aiOpener>". Skipped for follow-ups because the preamble was written
-    // against the original question, not the AI-generated follow-up.
-    if (!clientGone && !ctx.isFollowUp && ctx.question.aiOpener) {
-      writeSseEvent(res, 'opener', { text: String(ctx.question.aiOpener).trim() });
-    }
 
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
