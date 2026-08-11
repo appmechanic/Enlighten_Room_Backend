@@ -135,16 +135,19 @@ export const TUNING_DEFAULTS = {
     // Floor for cached-solution calls so the model can execute the
     // normalization/equivalence check (e.g. -(5sin(5x)) vs -5\sin(5x)).
     // Pure prompt rules at thinking=0 collapse to surface string matching.
-    equivalenceCheckBudget: 384,
+    // Trimmed 384 → 256 alongside lever C (fast-path): exact-match cases
+    // no longer reach the AI at all, so the surviving cached-solution
+    // calls are ambiguous-answer cases where the model already has the
+    // canonical solution in the cached systemInstruction. 256 tokens is
+    // enough for equivalence reasoning; ~250ms shaved from every submission
+    // vs the previous 384. Bump back up if false-negatives recur.
+    equivalenceCheckBudget: 256,
     // Floor for uncached calls: model must derive the answer AND run
-    // equivalence. At the previous 160-token share (ratio 0.2 × 800) it
-    // collapsed to string matching for cases like -5sin5x vs -5sin(5x)
-    // and the model rationalised correct=false to satisfy the ASK-mode
-    // hint it had already committed to writing. Trimmed from 512 to 256:
-    // the equivalence rules only need a few dozen tokens of reasoning per
-    // check, and 512 was adding ~1s of pre-stream thinking on every first
-    // submission of a question. Bump back up if false-negatives recur.
-    uncachedMinThinkingBudget: 256,
+    // equivalence. Trimmed 256 → 192: raw share (160) is very close, and
+    // the small difference historically produced ~1-3 flip-flops per class.
+    // With serverSideEquivalenceMatches + lever C the flip-flop-prone cases
+    // no longer reach here. Saves ~150ms; bump back up if regressions.
+    uncachedMinThinkingBudget: 192,
   },
   precompute: {
     solutionMaxTokens: 2000,

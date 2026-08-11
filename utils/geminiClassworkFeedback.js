@@ -13,6 +13,7 @@ import {
   recordAiCallLog,
 } from "./aiTokenUsage.js";
 import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
+import { getOrCreateClassworkFeedbackCache } from "./classworkGeminiCache.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // Model IDs come from StandardPrompt.models via getAiModel() (60s in-memory
@@ -213,7 +214,7 @@ function normalizeForEquivalencePreCheck(text) {
 // scoped narrow — only fires for plain string answers with a single-string
 // or single-element-array reference. Images, arrays (fill-in-blanks), and
 // missing references fall through to the AI.
-function serverSideEquivalenceMatches(answer, correctAnswer, format) {
+export function serverSideEquivalenceMatches(answer, correctAnswer, format) {
   if (format === "handwriting") return false;
   if (answer && typeof answer === "object" && !Array.isArray(answer)) {
     if (answer.type === "image" || answer.imageUrl) return false;
@@ -735,6 +736,7 @@ export async function getClassworkAiFeedback({
   studentId,
   classroomId,
   teacherId,
+  questionId,
   maxOutputTokens,
   sessionId,
   interactionId,
@@ -793,7 +795,56 @@ export async function getClassworkAiFeedback({
     feedbackTuning
   );
 
-  const config = {
+  // Explicit prompt cache: the systemInstruction (standard + teacher + solution
+  // block) is stable across every submission for this (teacher, question) so
+  // we let Gemini keep it server-side. Cutting thousands of prefill tokens off
+  // every call is the biggest single win for time-to-first-token on the
+  // student's screen; see waiting_time_plans.txt lever A. Falls through to
+  // inline systemInstruction if the cache create fails or the payload is under
+  // the model's min-cache-token threshold.
+  const cacheResult = await getOrCreateClassworkFeedbackCache({
+    model: MODEL,
+    teacherId,
+    questionId,
+    systemInstruction,
+    tag: `ClassworkFeedback:${reqId}`,
+  });
+
+  const config = cacheResult.ok
+    ? {
+        cachedContent: cacheResult.name,
+        responseMimeType: "application/json",
+        responseSchema: buildClassworkResponseSchema({
+          includeStandardSolution: Boolean(computeStandardSolution),
+        }),
+        thinkingConfig: { thinkingBudget },
+        maxOutputTokens: resolvedMaxOutputTokens,
+      }
+    : {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: buildClassworkResponseSchema({
+          includeStandardSolution: Boolean(computeStandardSolution),
+        }),
+        thinkingConfig: { thinkingBudget },
+        maxOutputTokens: resolvedMaxOutputTokens,
+      };
+
+  console.log(`[ClassworkFeedback][req=${reqId}] Gemini request:`, {
+    model: MODEL,
+    contents: summarizeContentsForLog(contents),
+    config: {
+      ...config,
+      systemInstruction: cacheResult.ok
+        ? `<served from cachedContent=${cacheResult.name} (reused=${cacheResult.reused})>`
+        : `<${systemInstruction.length} chars — see PROMPT block above>`,
+    },
+  });
+
+  // Fallback callable used both by the retry wrapper's regular-fallback slot
+  // AND locally on a `cachedContent`-specific error (deleted/expired cache
+  // in the window between our TTL bookkeeping and Gemini's own expiry).
+  const inlineConfig = {
     systemInstruction,
     responseMimeType: "application/json",
     responseSchema: buildClassworkResponseSchema({
@@ -802,15 +853,6 @@ export async function getClassworkAiFeedback({
     thinkingConfig: { thinkingBudget },
     maxOutputTokens: resolvedMaxOutputTokens,
   };
-
-  console.log(`[ClassworkFeedback][req=${reqId}] Gemini request:`, {
-    model: MODEL,
-    contents: summarizeContentsForLog(contents),
-    config: {
-      ...config,
-      systemInstruction: `<${systemInstruction.length} chars — see PROMPT block above>`,
-    },
-  });
 
   const result = await withGeminiRetry(
     () => ai.models.generateContent({ model: MODEL, contents, config }),
@@ -824,7 +866,7 @@ export async function getClassworkAiFeedback({
             ai.models.generateContent({
               model: FALLBACK_MODEL,
               contents,
-              config,
+              config: inlineConfig,
             })
         : undefined,
     },
@@ -1128,6 +1170,7 @@ export async function getClassworkAiFeedbackStream({
   studentId,
   classroomId,
   teacherId,
+  questionId,
   maxOutputTokens,
   sessionId,
   interactionId,
@@ -1183,7 +1226,43 @@ export async function getClassworkAiFeedbackStream({
     feedbackTuning
   );
 
-  const config = {
+  // Explicit prompt cache: same rationale as the non-stream path — the
+  // systemInstruction is stable per (teacher, question), so caching it on
+  // Gemini's side removes thousands of prefill tokens from every submission
+  // and is the largest single lever for time-to-first-hint-chunk. Falls back
+  // to inline systemInstruction if cache create fails or the payload is under
+  // the min-cache-token threshold.
+  const cacheResult = await getOrCreateClassworkFeedbackCache({
+    model: MODEL,
+    teacherId,
+    questionId,
+    systemInstruction,
+    tag: `ClassworkFeedback:${reqId}:stream`,
+  });
+
+  const config = cacheResult.ok
+    ? {
+        cachedContent: cacheResult.name,
+        responseMimeType: "application/json",
+        responseSchema: buildClassworkResponseSchema({
+          includeStandardSolution: Boolean(computeStandardSolution),
+        }),
+        thinkingConfig: { thinkingBudget },
+        maxOutputTokens: resolvedMaxOutputTokens,
+      }
+    : {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: buildClassworkResponseSchema({
+          includeStandardSolution: Boolean(computeStandardSolution),
+        }),
+        thinkingConfig: { thinkingBudget },
+        maxOutputTokens: resolvedMaxOutputTokens,
+      };
+
+  // Kept in scope for the FALLBACK_MODEL retry slot below — the fallback
+  // model doesn't share the primary's cache so we hand it inline context.
+  const inlineConfig = {
     systemInstruction,
     responseMimeType: "application/json",
     responseSchema: buildClassworkResponseSchema({
@@ -1198,7 +1277,9 @@ export async function getClassworkAiFeedbackStream({
     contents: summarizeContentsForLog(contents),
     config: {
       ...config,
-      systemInstruction: `<${systemInstruction.length} chars — see PROMPT block above>`,
+      systemInstruction: cacheResult.ok
+        ? `<served from cachedContent=${cacheResult.name} (reused=${cacheResult.reused})>`
+        : `<${systemInstruction.length} chars — see PROMPT block above>`,
     },
   });
 
@@ -1233,13 +1314,13 @@ export async function getClassworkAiFeedbackStream({
   let responseText = "";
   let finalResponse = null;
 
-  const openAndDrainWith = (modelId) => async () => {
+  const openAndDrainWith = (modelId, cfg) => async () => {
     responseText = "";
     finalResponse = null;
     const stream = await ai.models.generateContentStream({
       model: modelId,
       contents,
-      config,
+      config: cfg,
     });
     for await (const chunk of stream) {
       const piece = chunk?.text ?? "";
@@ -1258,12 +1339,14 @@ export async function getClassworkAiFeedbackStream({
     return finalResponse;
   };
 
-  const usageBearingChunk = await withGeminiRetry(openAndDrainWith(MODEL), {
+  const usageBearingChunk = await withGeminiRetry(openAndDrainWith(MODEL, config), {
     maxAttempts: retryCfg.max,
     baseDelayMs: retryCfg.baseMs,
     maxDelayMs: retryCfg.capMs,
     tag: `ClassworkFeedback:${reqId}:stream`,
-    fallbackCallFn: FALLBACK_MODEL && FALLBACK_MODEL !== MODEL ? openAndDrainWith(FALLBACK_MODEL) : undefined,
+    fallbackCallFn: FALLBACK_MODEL && FALLBACK_MODEL !== MODEL
+      ? openAndDrainWith(FALLBACK_MODEL, inlineConfig)
+      : undefined,
   });
 
   const usageMetadata = usageBearingChunk?.usageMetadata;

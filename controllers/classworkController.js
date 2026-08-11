@@ -16,6 +16,7 @@ import {
   getCachedFeedback,
   setCachedFeedback,
 } from '../utils/classworkFeedbackCache.js';
+import { tryFastPathAiResult } from '../utils/classworkFastPath.js';
 import { precomputeStandardSolution } from '../utils/geminiClassworkPrecompute.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
@@ -646,6 +647,7 @@ function scheduleFeedbackWarmup(question) {
         studentId: null,
         classroomId: question.classroomId || null,
         teacherId: resolvedTeacherId,
+        questionId: question.id,
         maxOutputTokens: question.maxOutputTokens,
         sessionId: sessionIdForUsage,
         interactionId: String(new mongoose.Types.ObjectId()),
@@ -1924,6 +1926,16 @@ export const submitAnswer = async (req, res) => {
     let aiFailed = false;
 
     if (!ctx.aiExpired) {
+      // Exact-match fast path — see the streaming path for the rationale.
+      // Applies here too so the non-stream fallback stays symmetrical.
+      const fastPathResult = tryFastPathAiResult({
+        answer: ctx.normalizedAnswer,
+        correctAnswer: ctx.question.correctAnswer,
+        format: ctx.question.format,
+        studentName: ctx.studentName,
+        isFollowUp: ctx.isFollowUp,
+      });
+
       // Answer-hash dedup: if another student already got Gemini feedback
       // for this same (question, normalized answer, ASK/TELL parity) within
       // the cache TTL, reuse it instead of paying for a fresh call.
@@ -1940,9 +1952,15 @@ export const submitAnswer = async (req, res) => {
         answerHash,
         submissionNumber: ctx.submissionNumber,
       });
-      const cachedAiResult = cacheKey ? getCachedFeedback(cacheKey) : null;
+      const cachedAiResult = !fastPathResult && cacheKey ? getCachedFeedback(cacheKey) : null;
 
-      if (cachedAiResult) {
+      if (fastPathResult) {
+        console.log('[Classwork] Fast-path exact-match HIT — skipping Gemini call', {
+          questionId: ctx.question.id,
+          format: ctx.question.format,
+        });
+        aiResult = fastPathResult;
+      } else if (cachedAiResult) {
         console.log('[Classwork] Answer-hash cache HIT — skipping Gemini call', {
           questionId: ctx.question.id,
           cacheKey,
@@ -1965,6 +1983,7 @@ export const submitAnswer = async (req, res) => {
             studentId: ctx.studentId,
             classroomId: ctx.question.classroomId || null,
             teacherId: ctx.resolvedTeacherId,
+            questionId: ctx.question.id,
             maxOutputTokens: ctx.question.maxOutputTokens,
             sessionId: ctx.sessionIdForUsage,
             interactionId: String(ctx.interactionId),
@@ -2084,6 +2103,33 @@ export const submitAnswerStream = async (req, res) => {
     let aiFailed = false;
 
     if (!ctx.aiExpired) {
+      // Exact-match fast path: for mcq / fill-blanks / textbox, when the
+      // student's answer deterministically matches the teacher's reference,
+      // skip Gemini entirely and reply with a canned "correct" message.
+      // Handwriting and follow-ups always fall through. See lever C in
+      // waiting_time_plans.txt — this is what makes right-first-try
+      // submissions land in <500ms.
+      const fastPathResult = tryFastPathAiResult({
+        answer: ctx.normalizedAnswer,
+        correctAnswer: ctx.question.correctAnswer,
+        format: ctx.question.format,
+        studentName: ctx.studentName,
+        isFollowUp: ctx.isFollowUp,
+      });
+      if (fastPathResult) {
+        console.log('[Classwork][stream] Fast-path exact-match HIT — skipping Gemini call', {
+          questionId: ctx.question.id,
+          format: ctx.question.format,
+        });
+        aiResult = fastPathResult;
+        if (!clientGone) {
+          writeSseEvent(res, 'verdict', { correct: true });
+          if (aiResult.hintStream) {
+            writeSseEvent(res, 'hint', { chunk: aiResult.hintStream });
+          }
+        }
+      }
+
       // Answer-hash dedup: if another student already got Gemini feedback
       // for this same (question, normalized answer, ASK/TELL parity) within
       // the cache TTL, replay the cached hintStream as a single SSE 'hint'
@@ -2102,9 +2148,11 @@ export const submitAnswerStream = async (req, res) => {
         answerHash,
         submissionNumber: ctx.submissionNumber,
       });
-      const cachedAiResult = cacheKey ? getCachedFeedback(cacheKey) : null;
+      const cachedAiResult = !fastPathResult && cacheKey ? getCachedFeedback(cacheKey) : null;
 
-      if (cachedAiResult) {
+      if (fastPathResult) {
+        // Already handled above — nothing more to do on the AI path.
+      } else if (cachedAiResult) {
         console.log('[Classwork][stream] Answer-hash cache HIT — skipping Gemini call', {
           questionId: ctx.question.id,
           cacheKey,
@@ -2133,6 +2181,7 @@ export const submitAnswerStream = async (req, res) => {
             studentId: ctx.studentId,
             classroomId: ctx.question.classroomId || null,
             teacherId: ctx.resolvedTeacherId,
+            questionId: ctx.question.id,
             maxOutputTokens: ctx.question.maxOutputTokens,
             sessionId: ctx.sessionIdForUsage,
             interactionId: String(ctx.interactionId),
