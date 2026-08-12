@@ -2256,9 +2256,14 @@ export const submitAnswerFastHint = async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
+  // Only treat the response as closed when it goes down BEFORE we finish
+  // writing. `req.on('close')` fires eagerly on some proxies (DigitalOcean
+  // ingress in particular) even while the client is still receiving events,
+  // which was silently dropping every `hint` event and leaving the opener
+  // typewriter blank.
   let clientGone = false;
-  req.on('close', () => {
-    clientGone = true;
+  res.on('close', () => {
+    if (!res.writableEnded) clientGone = true;
   });
 
   try {
@@ -2351,10 +2356,16 @@ export const submitAnswerFastHint = async (req, res) => {
         `[Classwork][fast-hint] Empty response — durationMs=${durationMs} teacherId=${ctx.resolvedTeacherId} questionId=${ctx.question.id} chunks=${chunkCount}`,
       );
     }
-    // Diagnostic payload on done so the client trace shows counts without
-    // needing server-log access. `chunks` = number of SSE hint events
-    // emitted, `chars` = total characters returned by Gemini.
-    writeSseEvent(res, 'done', { chunks: chunkCount, chars: finalChars, durationMs });
+    // `hint` field is a resilience fallback — if a proxy buffered or dropped
+    // intermediate `hint` events, the client can still render the opener
+    // from the full text delivered on `done`. Diagnostic `chunks`/`chars`
+    // let the client trace what actually made it across the wire.
+    writeSseEvent(res, 'done', {
+      chunks: chunkCount,
+      chars: finalChars,
+      durationMs,
+      hint: hintText || '',
+    });
     res.end();
   } catch (err) {
     console.error('[Classwork][fast-hint] error:', err);
