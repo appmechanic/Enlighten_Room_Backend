@@ -1,5 +1,5 @@
 import express from "express";
-import { clearAllClasswork, addQuestion, submitAnswer, submitAnswerStream, viewAnswers, viewAllAnswers, getQuestions, getStagedQuestions, releaseQuestion, sendClassworkReportToStudentsAndParents, downloadAllAnswersCsvReport, startLessonForRoom, renameLessonForRoom, endLessonForRoom, getActiveLessonForRoom, getClassReportForRoom, regenerateClassReportForRoom, updateStagedQuestion, getStudentLessonReport } from "../controllers/classworkController.js";
+import { clearAllClasswork, addQuestion, submitAnswer, submitAnswerStream, submitAnswerFastHint, viewAnswers, viewAllAnswers, getQuestions, getStagedQuestions, releaseQuestion, sendClassworkReportToStudentsAndParents, downloadAllAnswersCsvReport, startLessonForRoom, renameLessonForRoom, endLessonForRoom, getActiveLessonForRoom, getClassReportForRoom, regenerateClassReportForRoom, updateStagedQuestion, getStudentLessonReport } from "../controllers/classworkController.js";
 import { uploadClasswork } from "../utils/multer.js";
 
 // Download all answers as a detailed CSV report
@@ -15,6 +15,7 @@ router.get("/class-report/:roomId", getClassReportForRoom);
 router.post("/class-report/:roomId/regenerate", regenerateClassReportForRoom);
 router.post("/submit", submitAnswer);
 router.post("/submit/stream", submitAnswerStream);
+router.post("/submit/fast-hint", submitAnswerFastHint);
 router.get("/questions/:roomId", getQuestions);
 router.get("/staged/:roomId", getStagedQuestions);
 router.patch("/:questionId/release", releaseQuestion);

@@ -1380,15 +1380,35 @@ export async function getClassworkAiFastHint({
   }
   parts.push({ text: promptText });
 
-  const config = {
+  // Explicit prompt cache: systemInstruction here is standard + teacher
+  // prompt only (no question/solution), so the natural scope is per
+  // (teacher, model) and a single cache entry serves every submission from
+  // every student in every class that teacher runs. Use a sentinel
+  // questionId so the shared cache module keeps fast-hint entries in their
+  // own namespace and question-level invalidation can't sweep them.
+  const cacheResult = await getOrCreateClassworkFeedbackCache({
+    model: fastModel,
+    teacherId,
+    questionId: "__fast_hint__",
     systemInstruction,
-    thinkingConfig: { thinkingBudget: 0 },
-    maxOutputTokens: 180,
-  };
+    tag: `FastHint:${reqId}`,
+  });
+
+  const config = cacheResult.ok
+    ? {
+        cachedContent: cacheResult.name,
+        thinkingConfig: { thinkingBudget: 0 },
+        maxOutputTokens: 180,
+      }
+    : {
+        systemInstruction,
+        thinkingConfig: { thinkingBudget: 0 },
+        maxOutputTokens: 180,
+      };
 
   const apiStartMs = Date.now();
   console.log(
-    `[FastHint][req=${reqId}] AI fast hint API start (model=${fastModel}): ${new Date(apiStartMs).toISOString()}`,
+    `[FastHint][req=${reqId}] AI fast hint API start (model=${fastModel}, cache=${cacheResult.ok ? (cacheResult.reused ? "hit" : "created") : `miss:${cacheResult.reason || "unknown"}`}): ${new Date(apiStartMs).toISOString()}`,
   );
 
   let hintText = "";

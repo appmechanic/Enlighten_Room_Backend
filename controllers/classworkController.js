@@ -2151,39 +2151,12 @@ export const submitAnswerStream = async (req, res) => {
         try {
           const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
 
-          // Two-call pattern: fire a fast plain-text hint AND the full
-          // structured call in parallel. The fast hint (no schema, no
-          // thinking) completes in ~1-2s and is delivered as ONE `opener`
-          // SSE event — the FE typewriter appends it after the static echo
-          // opener so the student sees a Gemini-authored greeting within
-          // ~1s. The structured call still produces panels/verdict/persistence.
-          let fastHintText = '';
-          const fastHintPromise = getClassworkAiFastHint({
-            questionText: ctx.questionTextForAi,
-            answer: ctx.normalizedAnswer,
-            correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
-            questionImage: ctx.isFollowUp ? null : (ctx.question.image || null),
-            format: ctx.question.format,
-            studentName: ctx.studentName,
-            teacherId: ctx.resolvedTeacherId,
-          })
-            .then((text) => {
-              fastHintText = (text || '').trim();
-              if (fastHintText && !clientGone) {
-                console.log(
-                  `[Classwork][stream] fast hint opener sent (${fastHintText.length} chars)`,
-                );
-                writeSseEvent(res, 'opener', { text: fastHintText });
-              }
-            })
-            .catch((err) => {
-              // Fast hint is best-effort — if it fails the structured call's
-              // hintStream still streams (see onHintDelta below) so the
-              // student still sees a hint via the slower path.
-              console.error('[Classwork][stream] fast hint failed:', err?.message || err);
-            });
-
-          const structuredPromise = getClassworkAiFeedbackStream({
+          // Structured-only path. The fast plain-text hint lives on its own
+          // endpoint (submitAnswerFastHint) and is fired by the client in
+          // parallel with this call so the opener no longer sits behind the
+          // structured HTTP response. Persistence uses the structured
+          // hintStream directly.
+          aiResult = await getClassworkAiFeedbackStream({
             questionText: ctx.questionTextForAi,
             answer: ctx.normalizedAnswer,
             correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
@@ -2211,15 +2184,6 @@ export const submitAnswerStream = async (req, res) => {
               writeSseEvent(res, 'verdict', { correct: Boolean(isCorrect) });
             },
           });
-
-          aiResult = await structuredPromise;
-          // Ensure the fast hint has fully drained before we consider the
-          // response complete (usually finishes long before structured).
-          await fastHintPromise;
-
-          // Persist the fast hint text as the authoritative hintStream when
-          // it succeeded — that's what the student actually saw typing.
-          if (fastHintText) aiResult.hintStream = fastHintText;
 
           if (cacheKey) setCachedFeedback(cacheKey, aiResult);
         } catch (aiErr) {
@@ -2268,6 +2232,114 @@ export const submitAnswerStream = async (req, res) => {
     writeSseEvent(res, 'error', {
       status: 500,
       message: 'Error submitting answer',
+      error: err.message,
+    });
+    if (!res.writableEnded) res.end();
+  }
+};
+
+// Standalone SSE endpoint for JUST the plain-text fast hint (the
+// "opener" the student sees within ~1s). Split out of submitAnswerStream so
+// the client can fire it in parallel with the structured stream and the
+// opener no longer sits behind the structured call's HTTP/2 stream.
+// Display-only: no persistence, no verdict, no report writes — the
+// structured endpoint remains the single source of truth for stored feedback.
+//
+// Skips the Gemini call entirely when the structured stream would already
+// return instantly (fast-path exact-match or answer-hash cache hit) so we
+// don't burn a call whose text would just double-render alongside the
+// structured hint the student is about to see.
+export const submitAnswerFastHint = async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  let clientGone = false;
+  req.on('close', () => {
+    clientGone = true;
+  });
+
+  try {
+    const prepared = await prepareClassworkSubmission(req);
+    if (prepared.error) {
+      writeSseEvent(res, 'error', {
+        status: prepared.error.status,
+        ...prepared.error.body,
+      });
+      return res.end();
+    }
+    const ctx = prepared;
+
+    if (ctx.aiExpired) {
+      writeSseEvent(res, 'done', { skipped: 'ai-expired' });
+      return res.end();
+    }
+
+    // Structured endpoint will return instantly for these — don't
+    // double-render the same text as an opener typewriter.
+    const fastPathResult = tryFastPathAiResult({
+      answer: ctx.normalizedAnswer,
+      correctAnswer: ctx.question.correctAnswer,
+      format: ctx.question.format,
+      studentName: ctx.studentName,
+      isFollowUp: ctx.isFollowUp,
+    });
+    if (fastPathResult) {
+      writeSseEvent(res, 'done', { skipped: 'fast-path' });
+      return res.end();
+    }
+
+    const answerHash = fingerprintAnswer({
+      answer: ctx.normalizedAnswer,
+      format: ctx.question.format,
+      normalizedAnswerText: typeof ctx.normalizedAnswer === 'string'
+        ? ctx.normalizedAnswer
+        : '',
+      isFollowUp: ctx.isFollowUp,
+    });
+    const cacheKey = buildFeedbackCacheKey({
+      questionId: ctx.question.id,
+      answerHash,
+      submissionNumber: ctx.submissionNumber,
+    });
+    if (cacheKey && getCachedFeedback(cacheKey)) {
+      writeSseEvent(res, 'done', { skipped: 'cache-hit' });
+      return res.end();
+    }
+
+    try {
+      await getClassworkAiFastHint({
+        questionText: ctx.questionTextForAi,
+        answer: ctx.normalizedAnswer,
+        correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
+        questionImage: ctx.isFollowUp ? null : (ctx.question.image || null),
+        format: ctx.question.format,
+        studentName: ctx.studentName,
+        teacherId: ctx.resolvedTeacherId,
+        onHintDelta: (chunk) => {
+          if (clientGone) return;
+          writeSseEvent(res, 'hint', { chunk });
+        },
+      });
+    } catch (aiErr) {
+      console.error('[Classwork][fast-hint] AI fast hint failed:', aiErr);
+      writeSseEvent(res, 'error', {
+        status: 503,
+        message: 'Fast hint unavailable.',
+        aiFailed: true,
+      });
+      return res.end();
+    }
+
+    writeSseEvent(res, 'done', {});
+    res.end();
+  } catch (err) {
+    console.error('[Classwork][fast-hint] error:', err);
+    writeSseEvent(res, 'error', {
+      status: 500,
+      message: 'Error generating fast hint',
       error: err.message,
     });
     if (!res.writableEnded) res.end();
