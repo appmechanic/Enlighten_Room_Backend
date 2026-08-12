@@ -2309,8 +2309,12 @@ export const submitAnswerFastHint = async (req, res) => {
       return res.end();
     }
 
+    const startMs = Date.now();
+    let chunkCount = 0;
+    let totalChars = 0;
+    let hintText = '';
     try {
-      await getClassworkAiFastHint({
+      hintText = await getClassworkAiFastHint({
         questionText: ctx.questionTextForAi,
         answer: ctx.normalizedAnswer,
         correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
@@ -2320,7 +2324,11 @@ export const submitAnswerFastHint = async (req, res) => {
         teacherId: ctx.resolvedTeacherId,
         onHintDelta: (chunk) => {
           if (clientGone) return;
-          writeSseEvent(res, 'hint', { chunk });
+          if (typeof chunk === 'string' && chunk.length) {
+            chunkCount += 1;
+            totalChars += chunk.length;
+            writeSseEvent(res, 'hint', { chunk });
+          }
         },
       });
     } catch (aiErr) {
@@ -2333,7 +2341,20 @@ export const submitAnswerFastHint = async (req, res) => {
       return res.end();
     }
 
-    writeSseEvent(res, 'done', {});
+    const durationMs = Date.now() - startMs;
+    const finalChars = hintText ? hintText.length : totalChars;
+    if (!finalChars) {
+      // Empty Gemini response is unusual — surface it in logs so we can
+      // investigate (safety filter? cache misconfig? flash-lite refused
+      // input?) instead of silently returning a bare `done`.
+      console.warn(
+        `[Classwork][fast-hint] Empty response — durationMs=${durationMs} teacherId=${ctx.resolvedTeacherId} questionId=${ctx.question.id} chunks=${chunkCount}`,
+      );
+    }
+    // Diagnostic payload on done so the client trace shows counts without
+    // needing server-log access. `chunks` = number of SSE hint events
+    // emitted, `chars` = total characters returned by Gemini.
+    writeSseEvent(res, 'done', { chunks: chunkCount, chars: finalChars, durationMs });
     res.end();
   } catch (err) {
     console.error('[Classwork][fast-hint] error:', err);
