@@ -54,6 +54,23 @@ const StandardPromptSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    // System-level prompt prepended to every Create Test AI call. Same
+    // append-teacher-prompt pattern as creatingAssignmentPrompt, but this
+    // one frames the request as a post-lesson assessment rather than
+    // homework.
+    creatingTestPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    // Per-question analysis prompt used by the Test AI check when a
+    // student submits an answer. Output is never shown to the student —
+    // it feeds the individual test report and the class general report.
+    testAiHintPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
     // Gemini model IDs used by every AI call site. `default` covers all text
     // generation (classwork feedback, precompute, class report, assignment
     // generation, whiteboard). `fallback` is used by classwork feedback when

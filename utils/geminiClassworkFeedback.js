@@ -3,17 +3,55 @@ import crypto from "crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import fetch from "node-fetch";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
-import {
-  getStandardPromptCached,
-  getTeacherPromptCached,
-} from "./promptCache.js";
+import { getTeacherPromptCached } from "./promptCache.js";
 import {
   recordAiTokenUsage,
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
-import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
+import { getAiModel, getAiRetry, getAiDirective } from "./aiConfig.js";
 import { getOrCreateClassworkFeedbackCache } from "./classworkGeminiCache.js";
+import {
+  AI_HINT_PROMPT_SECTION_DEFAULTS,
+  DIRECTIVE_DEFAULTS,
+} from "../config/standardPromptDefaults.js";
+
+// Classwork feedback runs on a fully hard-coded standard prompt + response
+// schema. The DB-backed StandardPrompt / directives are still edited via the
+// admin UI, but this call intentionally bypasses them so behaviour is
+// reproducible from the source tree alone. Text is imported from
+// standardPromptDefaults.js so there's a single canonical source; flip the
+// imports below to inline literals if the config module ever needs to diverge.
+const HARDCODED_STANDARD_PROMPT_TEXT = AI_HINT_PROMPT_SECTION_DEFAULTS
+  .filter((s) => typeof s === "string" && s.length > 0)
+  .join("\n\n");
+const HARDCODED_STANDARD_PROMPT_HASH = crypto
+  .createHash("sha1")
+  .update(HARDCODED_STANDARD_PROMPT_TEXT)
+  .digest("hex");
+const HARDCODED_SOLUTION_COMPUTE = DIRECTIVE_DEFAULTS["classwork.solutionCompute"];
+const HARDCODED_SOLUTION_SKIP = DIRECTIVE_DEFAULTS["classwork.solutionSkip"];
+const HARDCODED_MISTAKE_COMPUTE = DIRECTIVE_DEFAULTS["classwork.mistakeCompute"];
+const HARDCODED_MISTAKE_SKIP = DIRECTIVE_DEFAULTS["classwork.mistakeSkip"];
+const HARDCODED_HINT_STREAM = DIRECTIVE_DEFAULTS["classwork.hintStream"];
+const HARDCODED_MATH_EQUIVALENCE = DIRECTIVE_DEFAULTS["classwork.mathEquivalence"];
+const HARDCODED_ASK_MODE = DIRECTIVE_DEFAULTS["classwork.askMode"];
+const HARDCODED_TELL_MODE = DIRECTIVE_DEFAULTS["classwork.tellMode"];
+
+// Feedback-tuning knobs hard-coded so the waiting-time-oriented values
+// actually take effect regardless of what's seeded in Mongo. Same rationale
+// as the prompt/schema hardcoding above: reproducible from source, no DB
+// merge shadowing the values, iterate here to move student TTFT. Anything
+// still admin-tuneable per teacher (retry budget, model choice) continues
+// to come from getAiRetry / getAiModel.
+const HARDCODED_FEEDBACK_TUNING = {
+  defaultMaxOutputTokens: 500,
+  thinkingBudgetRatio: 0.2,
+  maxThinkingBudget: 2048,
+  imageStudyFormats: ["handwriting"],
+  equivalenceCheckBudget: 128,
+  uncachedMinThinkingBudget: 192,
+};
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // Model IDs come from StandardPrompt.models via getAiModel() (60s in-memory
@@ -82,80 +120,90 @@ function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, forma
 // Everything after `correct` still follows the original ordering
 // (hintStream, part1, part2 first for progressive rendering; heavier
 // metadata like commonMistake/standardSolution last).
-function buildClassworkResponseSchema({ includeStandardSolution }) {
-  const properties = {
-    correct: {
-      type: Type.BOOLEAN,
-      description:
-        "true only when the student's answer is complete and correct; otherwise false. This field MUST be emitted first so the client can show the verdict without waiting for the hint.",
-    },
-    // Field descriptions are honored by Gemini structured output and are the
-    // strongest signal for what goes where. Without them the model conflated
-    // hintStream with part1 (both became a bare greeting). Keep these in sync
-    // with the standard prompt's section descriptions.
-    hintStream: {
-      type: Type.STRING,
-      description:
-        "The concise live hint the student sees typing in real time. STRICT: 1-2 short sentences MAX in the question's language. Greet by first name and give the single most important next-step nudge toward the correct method WITHOUT revealing the final answer. Be terse — no acknowledgment paragraphs, no restatement of what they did, no filler. Must stand alone as a useful hint; never just a greeting and never a copy of part1.",
-    },
-    part1: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description:
-        "Acknowledgment. EXACTLY ONE short string: greet by first name and name the last correct step. Do NOT add more entries.",
-    },
-    part2: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description:
-        "Immediate Next Step Guidance. Each string ≤ 12 words. One per subtitle in order: '🛑: ' (what NOT to do), '✅: ' (correct formula/strategy), '🔨: ' (how to apply it). Skip '🔍: ' unless truly needed. No prose paragraphs.",
-    },
-    part3: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description:
-        "Diagnostic training suggestions. MAX 2 short bullet strings (≤ 10 words each). Skip filler encouragement.",
-    },
-    advancedChallenge: {
-      type: Type.OBJECT,
-      description:
-        "Only filled when correct is true: 1 short congratulation + 1 new question one level harder. Leave both fields empty strings when the answer is not yet correct.",
-      properties: {
-        congratulations: { type: Type.STRING },
-        question: { type: Type.STRING },
-      },
-      required: ["congratulations", "question"],
-    },
-    commonMistake: {
-      type: Type.OBJECT,
-      properties: {
-        isCommon: { type: Type.BOOLEAN },
-        title: { type: Type.STRING },
-        answerLatex: { type: Type.STRING },
-      },
-      required: ["isCommon", "title"],
-    },
-  };
-
-  // Only advertise `standardSolution` when the caller actually wants it
-  // computed — when a precompute already rode in on systemInstruction
-  // there's nothing to derive and the field wastes output tokens.
-  if (includeStandardSolution) {
-    properties.standardSolution = { type: Type.STRING };
-  }
-
-  return {
+// Frozen response schema for the classwork feedback call. Property order
+// matters: Gemini emits structured-JSON fields in the order they appear, so
+// `correct` goes first — the client shows "✅ Correct" / "keep going" within
+// a token or two of the first chunk, without waiting for the hint stream to
+// finish. Two variants: with/without `standardSolution`, so callers pick
+// instead of branching a schema factory at call time.
+const CLASSWORK_SCHEMA_PROPERTIES = {
+  correct: {
+    type: Type.BOOLEAN,
+    description:
+      "true only when the student's answer is complete and correct; otherwise false. This field MUST be emitted first so the client can show the verdict without waiting for the hint.",
+  },
+  hintStream: {
+    type: Type.STRING,
+    description:
+      "The concise live hint the student sees typing in real time. STRICT: 1-2 short sentences MAX in the question's language. Greet by first name and give the single most important next-step nudge toward the correct method WITHOUT revealing the final answer. Be terse — no acknowledgment paragraphs, no restatement of what they did, no filler. Must stand alone as a useful hint; never just a greeting and never a copy of part1.",
+  },
+  part1: {
+    type: Type.ARRAY,
+    items: { type: Type.STRING },
+    description:
+      "Acknowledgment. EXACTLY ONE short string: greet by first name and name the last correct step. Do NOT add more entries.",
+  },
+  part2: {
+    type: Type.ARRAY,
+    items: { type: Type.STRING },
+    description:
+      "Immediate Next Step Guidance. EXACTLY 4 strings in order: DON'T / WHAT / HOW / WHY. Each string starts with its subtitle in the question's language. WHY length scales with grade (≤1 sentence for grade ≤3, ≤50 words for grade 4–8, a paragraph for grade 8+). Use empty string for HOW or WHY if not needed.",
+  },
+  part3: {
+    type: Type.ARRAY,
+    items: { type: Type.STRING },
+    description:
+      "Diagnostic training suggestions. EXACTLY 2 short strings: [0] training for the previous-milestone gap, [1] training for the current-milestone difficulty.",
+  },
+  advancedChallenge: {
     type: Type.OBJECT,
-    properties,
-    required: [
-      "hintStream",
-      "part1",
-      "part2",
-      "correct",
-      "part3",
-      "advancedChallenge",
-    ],
-  };
+    description:
+      "Only filled when correct is true: 1 short congratulation + 1 new question one level harder. Leave both fields empty strings when the answer is not yet correct.",
+    properties: {
+      congratulations: { type: Type.STRING },
+      question: { type: Type.STRING },
+    },
+    required: ["congratulations", "question"],
+  },
+  commonMistake: {
+    type: Type.OBJECT,
+    properties: {
+      isCommon: { type: Type.BOOLEAN },
+      title: { type: Type.STRING },
+      answerLatex: { type: Type.STRING },
+    },
+    required: ["isCommon", "title"],
+  },
+};
+
+const CLASSWORK_SCHEMA_REQUIRED = [
+  "hintStream",
+  "part1",
+  "part2",
+  "correct",
+  "part3",
+  "advancedChallenge",
+];
+
+const CLASSWORK_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: CLASSWORK_SCHEMA_PROPERTIES,
+  required: CLASSWORK_SCHEMA_REQUIRED,
+};
+
+const CLASSWORK_RESPONSE_SCHEMA_WITH_SOLUTION = {
+  type: Type.OBJECT,
+  properties: {
+    ...CLASSWORK_SCHEMA_PROPERTIES,
+    standardSolution: { type: Type.STRING },
+  },
+  required: CLASSWORK_SCHEMA_REQUIRED,
+};
+
+function pickClassworkResponseSchema(computeStandardSolution) {
+  return computeStandardSolution
+    ? CLASSWORK_RESPONSE_SCHEMA_WITH_SOLUTION
+    : CLASSWORK_RESPONSE_SCHEMA;
 }
 
 // Purely mechanical cleanup applied to both the student answer and the
@@ -380,29 +428,19 @@ async function buildGeminiRequest({
   computeStandardSolution,
   computeCommonMistake,
 }) {
-  const [
-    { text: standardText, hash: standardPromptHash },
-    teacherPrompt,
-    STANDARD_SOLUTION_COMPUTE_INSTRUCTION,
-    STANDARD_SOLUTION_SKIP_INSTRUCTION,
-    COMMON_MISTAKE_COMPUTE_INSTRUCTION,
-    COMMON_MISTAKE_SKIP_INSTRUCTION,
-    HINT_STREAM_INSTRUCTION,
-    MATH_EQUIVALENCE_INSTRUCTION,
-    ASK_MODE_INSTRUCTION,
-    TELL_MODE_INSTRUCTION,
-  ] = await Promise.all([
-    getStandardPromptCached(),
-    getTeacherPromptCached(teacherId),
-    getAiDirective("classwork.solutionCompute"),
-    getAiDirective("classwork.solutionSkip"),
-    getAiDirective("classwork.mistakeCompute"),
-    getAiDirective("classwork.mistakeSkip"),
-    getAiDirective("classwork.hintStream"),
-    getAiDirective("classwork.mathEquivalence"),
-    getAiDirective("classwork.askMode"),
-    getAiDirective("classwork.tellMode"),
-  ]);
+  // Standard prompt + all classwork directives are hard-coded (see top of
+  // file). Only the per-teacher prompt is still DB-backed.
+  const standardText = HARDCODED_STANDARD_PROMPT_TEXT;
+  const standardPromptHash = HARDCODED_STANDARD_PROMPT_HASH;
+  const STANDARD_SOLUTION_COMPUTE_INSTRUCTION = HARDCODED_SOLUTION_COMPUTE;
+  const STANDARD_SOLUTION_SKIP_INSTRUCTION = HARDCODED_SOLUTION_SKIP;
+  const COMMON_MISTAKE_COMPUTE_INSTRUCTION = HARDCODED_MISTAKE_COMPUTE;
+  const COMMON_MISTAKE_SKIP_INSTRUCTION = HARDCODED_MISTAKE_SKIP;
+  const HINT_STREAM_INSTRUCTION = HARDCODED_HINT_STREAM;
+  const MATH_EQUIVALENCE_INSTRUCTION = HARDCODED_MATH_EQUIVALENCE;
+  const ASK_MODE_INSTRUCTION = HARDCODED_ASK_MODE;
+  const TELL_MODE_INSTRUCTION = HARDCODED_TELL_MODE;
+  const teacherPrompt = await getTeacherPromptCached(teacherId);
 
   const cachedSolution =
     typeof cachedContext?.standardSolution === "string"
@@ -658,12 +696,12 @@ export async function getClassworkAiFeedback({
   computeCommonMistake = false,
 }) {
   const reqId = newReqId();
-  const [MODEL, FALLBACK_MODEL, retryCfg, feedbackTuning] = await Promise.all([
+  const [MODEL, FALLBACK_MODEL, retryCfg] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
     getAiRetry("classworkFeedback"),
-    getAiTuning("feedback"),
   ]);
+  const feedbackTuning = HARDCODED_FEEDBACK_TUNING;
   const {
     systemInstruction,
     contents,
@@ -725,18 +763,14 @@ export async function getClassworkAiFeedback({
     ? {
         cachedContent: cacheResult.name,
         responseMimeType: "application/json",
-        responseSchema: buildClassworkResponseSchema({
-          includeStandardSolution: Boolean(computeStandardSolution),
-        }),
+        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
         thinkingConfig: { thinkingBudget },
         maxOutputTokens: resolvedMaxOutputTokens,
       }
     : {
         systemInstruction,
         responseMimeType: "application/json",
-        responseSchema: buildClassworkResponseSchema({
-          includeStandardSolution: Boolean(computeStandardSolution),
-        }),
+        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
         thinkingConfig: { thinkingBudget },
         maxOutputTokens: resolvedMaxOutputTokens,
       };
@@ -747,9 +781,7 @@ export async function getClassworkAiFeedback({
   const inlineConfig = {
     systemInstruction,
     responseMimeType: "application/json",
-    responseSchema: buildClassworkResponseSchema({
-      includeStandardSolution: Boolean(computeStandardSolution),
-    }),
+    responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
     thinkingConfig: { thinkingBudget },
     maxOutputTokens: resolvedMaxOutputTokens,
   };
@@ -1090,12 +1122,12 @@ export async function getClassworkAiFeedbackStream({
   onVerdict,
 }) {
   const reqId = newReqId();
-  const [MODEL, FALLBACK_MODEL, retryCfg, feedbackTuning] = await Promise.all([
+  const [MODEL, FALLBACK_MODEL, retryCfg] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
     getAiRetry("classworkFeedback"),
-    getAiTuning("feedback"),
   ]);
+  const feedbackTuning = HARDCODED_FEEDBACK_TUNING;
   const {
     systemInstruction,
     contents,
@@ -1151,18 +1183,14 @@ export async function getClassworkAiFeedbackStream({
     ? {
         cachedContent: cacheResult.name,
         responseMimeType: "application/json",
-        responseSchema: buildClassworkResponseSchema({
-          includeStandardSolution: Boolean(computeStandardSolution),
-        }),
+        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
         thinkingConfig: { thinkingBudget },
         maxOutputTokens: resolvedMaxOutputTokens,
       }
     : {
         systemInstruction,
         responseMimeType: "application/json",
-        responseSchema: buildClassworkResponseSchema({
-          includeStandardSolution: Boolean(computeStandardSolution),
-        }),
+        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
         thinkingConfig: { thinkingBudget },
         maxOutputTokens: resolvedMaxOutputTokens,
       };
@@ -1172,9 +1200,7 @@ export async function getClassworkAiFeedbackStream({
   const inlineConfig = {
     systemInstruction,
     responseMimeType: "application/json",
-    responseSchema: buildClassworkResponseSchema({
-      includeStandardSolution: Boolean(computeStandardSolution),
-    }),
+    responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
     thinkingConfig: { thinkingBudget },
     maxOutputTokens: resolvedMaxOutputTokens,
   };
@@ -1332,24 +1358,39 @@ export async function getClassworkAiFastHint({
   onHintDelta,
 }) {
   const reqId = newReqId();
-  const [MODEL, FALLBACK_MODEL, standardText, teacherPrompt] = await Promise.all([
+  // Fast-hint uses a DEDICATED compact system prompt (`classwork.fastHintSystem`)
+  // instead of the full aiHintPrompt. The full prompt carries thousands of tokens
+  // of JSON/LaTeX/schema guidance that fast-hint doesn't need (plain-text output),
+  // and every one of those tokens rides prefill on every call. Swapping to the
+  // ~120-token distillation cuts Gemini's time-to-first-character noticeably.
+  // Teacher prompt is still layered in for per-teacher voice — it's typically
+  // short, and the explicit prompt cache below still scopes per (teacher, model)
+  // so voice differences don't fragment the cache further than they already did.
+  const [MODEL, FALLBACK_MODEL, fastHintSystemText, teacherPrompt] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
-    getStandardPromptCached().then((r) => r.text),
+    getAiDirective("classwork.fastHintSystem"),
     getTeacherPromptCached(teacherId),
   ]);
   // Prefer fallback (flash-lite) — it's a 1-sentence hint, no reasoning needed.
   const fastModel = FALLBACK_MODEL || MODEL;
 
-  const systemInstruction = [standardText, teacherPrompt].filter(Boolean).join("\n\n");
+  const systemInstruction = [fastHintSystemText, teacherPrompt].filter(Boolean).join("\n\n");
 
+  // For fast-hint, only pay for image OCR when the format genuinely needs
+  // it (handwriting / image-based answers). Text/MCQ/fill-blanks questions
+  // with a decorative image get zero benefit from shipping ~200KB base64
+  // to Gemini for a one-sentence nudge — and pay for it in prefill time.
   const answerImageSource = getAnswerImageSource(answer);
-  const includeRawQuestionImage = Boolean(questionImage);
+  const needsImageOcr = format === "handwriting" || Boolean(answerImageSource);
+  const includeRawQuestionImage = needsImageOcr && Boolean(questionImage);
   const [questionImageData, answerImageData] = await Promise.all([
     includeRawQuestionImage ? sourceToInlineData(questionImage).catch(() => null) : null,
     answerImageSource ? sourceToInlineData(answerImageSource).catch(() => null) : null,
   ]);
 
+  // OUTPUT rules live in the system prompt (`classwork.fastHintSystem`)
+  // now — don't duplicate them here on every submission.
   const promptText = [
     studentName ? `Student name: ${studentName}` : null,
     `Question: ${questionText || ""}`,
@@ -1360,7 +1401,6 @@ export async function getClassworkAiFastHint({
     `Student Answer: ${normalizeAnswerText(answer) || "[No text provided]"}`,
     includeRawQuestionImage ? "A question image is attached." : null,
     answerImageSource ? "A student answer image is attached." : null,
-    "OUTPUT: 1-2 short sentences in the question's language. Plain text only — NO JSON, NO markdown, NO bullets, NO emojis. If the student's answer is correct, warmly congratulate by first name. Otherwise, greet by first name and give the single most important next-step nudge WITHOUT revealing the final answer. Be terse; no acknowledgment paragraphs.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -1394,16 +1434,19 @@ export async function getClassworkAiFastHint({
     tag: `FastHint:${reqId}`,
   });
 
+  // 120 tokens ≈ 90 words, plenty for a 1-2 sentence nudge. Was 180 —
+  // the extra 60-token headroom just let the model wander longer before
+  // hitting its own stop rather than adding useful content.
   const config = cacheResult.ok
     ? {
         cachedContent: cacheResult.name,
         thinkingConfig: { thinkingBudget: 0 },
-        maxOutputTokens: 180,
+        maxOutputTokens: 120,
       }
     : {
         systemInstruction,
         thinkingConfig: { thinkingBudget: 0 },
-        maxOutputTokens: 180,
+        maxOutputTokens: 120,
       };
 
   const apiStartMs = Date.now();

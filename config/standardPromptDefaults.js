@@ -11,35 +11,43 @@
 //      their own copies.
 
 // ---------- aiHintPromptSections (11 slots) ----------
-// Position must match the React AI_HINT_PROMPT_SECTIONS array. Most sections
-// are admin-authored from scratch (empty default); only slot 7
-// (masteryHintStream) ships with canonical text.
+// Position must match the React AI_HINT_PROMPT_SECTIONS array. Response
+// schema (part1 / part2 / part3 / advancedChallenge) is unchanged; only the
+// prompt guidance for each slot is populated below.
 
-const MASTERY_HINT_STREAM_DEFAULT = `When "correct" is true, hintStream MUST be a 4-block breakdown that mirrors the diagnostic-mode structure, positively framed. Use the SAME emoji tokens the diagnostic mode uses, one block per line, in this exact order:
-🛑 <one short line naming the specific mistake the student *avoided* on this attempt — e.g. "You didn't confuse dividing by 3 with subtracting 3">.
-💡 <one short line explaining *why* the operation they applied is the right inverse for this equation/problem shape — the underlying principle, not the numbers>.
-🛠️ <one short line giving a repeatable procedure they can reuse on the next similar problem — a "next time, do X then Y" recipe>.
-🔍 <one short line connecting this to the broader concept (balance / inverse operations / isolating the variable / units / definitions, whichever fits) so the student can generalise beyond this specific question>.
+const AI_HINT_STYLE_GUIDANCE_DEFAULT = `Overview:
+- Give feedback and create new questions in the language of the original question.
+- Use LaTeX form for all math expressions and formulas.`;
 
-Style rules for the correct-answer hintStream:
-- Start with "Hi <studentName>! " on the same line as the first sentence; do NOT put the greeting on its own line.
-- One sentence per block. No numbered prefixes, no markdown headings, no "Great job!" filler.
-- Warm second-person tone, same voice as the diagnostic mode.
-- Keep the whole hintStream under 90 words so it stays scannable on a phone.
-- Do NOT restate the part1 message — that array already carries "you correctly did X". hintStream is the deeper unpack.
-- If the answer is correct after earlier wrong attempts on the same question, weave ONE line into 🛠️ or 🔍 acknowledging the correction (e.g. "you switched from adding to subtracting — good catch") without labelling it separately.`;
+const AI_HINT_PART1_DEFAULT = `Student can do:
+Greet with student's first name first. For STEM, identify the last mathematically correct line/step before the error or gap occurred in a simple sentence. For Humanities/Languages, acknowledge the strongest, most accurate piece of logic, or structural thesis foundation the student has established so far.`;
+
+const AI_HINT_PART2_DEFAULT = `Next Step:
+- the first string: Tell my student DON'T do the incorrect step/inaccurate phrase/etc. Start with a subtitle "DON'T: " with translation.
+- the second string: Ask/tell alternatively my student WHAT is the correct formula, strategy, grammar, phrase, sentence structure, fact, etc., in this step/phrase with a hint. Start with a subtitle "WHAT: " with translation.
+- the third string: If needed, ask/tell alternatively my student HOW to use above formula/grammar/... to do it correctly in this step. Start with a subtitle "HOW: " with translation.
+- the fourth string: If needed, explain above theorem / reason / theory / structure with a subtitle "WHY: " with translation in a short sentence for grade 3 or lower, less than 50 words for grade 4 to 8, a paragraph with appropriate length for grade 8+.`;
+
+const AI_HINT_PART3_DEFAULT = `Training:
+- the first string: advice one training to improve the lack of this issue from previous milestone or learning stage.
+- the second string: advice one training to improve the difficulty from the current milestone or topic.`;
+
+const MASTERY_HINT_STREAM_DEFAULT = `hintStream (correct answer): greet by first name, congratulate in 1–2 short sentences in the question's language, then hand off to advancedChallenge. Do not restate the student's answer.`;
+
+const AI_HINT_ADVANCED_CHALLENGE_DEFAULT = `Advanced Challenge:
+Create a brand-new question exactly one level more advanced than the current one (STEM: introduce an optimization constraint or symbolic variation; Humanities: a deeper thematic prompt, a more complex grammatical structure, or a comparative primary-source analysis). (If the current question includes an image, try to create a more advanced question related to the image.) (When a positive context fits naturally, WEAVE THE SCENARIO DIRECTLY INTO THIS QUESTION TEXT with love or peace, or helping people in war / needs according to seasons and current news.)`;
 
 export const AI_HINT_PROMPT_SECTION_DEFAULTS = [
   "", // 0. responseFormat
   "", // 1. diagnosticIntro
   "", // 2. diagnosticHintStream
-  "", // 3. part1
-  "", // 4. part2
-  "", // 5. part3
+  AI_HINT_PART1_DEFAULT, // 3. part1 — studentCanDo
+  AI_HINT_PART2_DEFAULT, // 4. part2 — nextStep (DON'T/WHAT/HOW/WHY)
+  AI_HINT_PART3_DEFAULT, // 5. part3 — diagnosticTraining
   "", // 6. masteryIntro
   MASTERY_HINT_STREAM_DEFAULT, // 7. masteryHintStream
-  "", // 8. advancedChallenge
-  "", // 9. styleGuidance
+  AI_HINT_ADVANCED_CHALLENGE_DEFAULT, // 8. advancedChallenge
+  AI_HINT_STYLE_GUIDANCE_DEFAULT, // 9. styleGuidance — language + LaTeX overview
   "", // 10. commonMistake
 ];
 
@@ -104,6 +112,31 @@ c) Also give them some more advanced questions that are one level, two levels an
 Please add a message of love, peace or a positive value to the context if possible. But it's not a must when the question doesn't fit a context.
 The following is my teacher's personalized prompt. Please follow his/her advice and the above structure to generate questions if the personalized prompt is good to my learning. But please ignore it if it doesn't fit my needs.`;
 
+// ---------- creatingTestPrompt ----------
+// System-level prompt prepended to every Create Test AI call. Structure
+// mirrors CREATING_ASSIGNMENT_PROMPT_DEFAULT but positions the AI as a
+// post-lesson assessment author rather than a homework designer.
+export const CREATING_TEST_PROMPT_DEFAULT = `My students just completed my lesson and I want to give them ___ questions in _____ format, ... , ... as a test to assess their learning.
+The attachments are the questions used in my lesson and assignments, the contents/steps my student got stuck at, and your suggestions focusing on their weaknesses.
+a) Please provide some questions very similar to the questions attached.
+b) Also some questions focus on their weaknesses (Please count the frequencies of the issues and consider the major weaknesses). Please give them hints for this type of questions.
+c) Also give them some more advanced questions that are one step/level deeper for the abled students.
+Please add a message of love, peace or a positive value to the context if possible. But it's not a must when the question doesn't fit a context.
+The following is my personalized prompt. Please follow my advice and the above structure to generate questions if the personalized prompt is good to my students' learning. But please ignore it if it doesn't fit my students' needs.`;
+
+// ---------- testAiHintPrompt ----------
+// Per-question analysis prompt used when a student submits an answer during
+// a test. Unlike the classwork aiHintPrompt this is a *report* prompt — the
+// output is never surfaced to the student, only rolled into their test
+// report + the class general report generated on expiry.
+export const TEST_AI_HINT_PROMPT_DEFAULT = `a) My student is doing a test. The full mark of this question is ___. Please tell me
+  1) Which one content/step is correct just before the student stuck?
+  2) For the first content/step the student stuck, which formula, keyword, concept, knowledge, method, strategy, theorem can't the student manage?
+  3) Only for this content/step the student stuck, what should the student practice more after class? What useful formula, keyword, concept, knowledge, method, strategy, and theorem should the student pay attention to? Please give me specific but short comment focusing on the student's weakness in this content/step only.
+  4) how many marks that the student can get in this question.
+
+The following is my teacher's personalized prompt. Please follow his/her advice and the above structure to generate my test report if the personalized prompt is good to my learning. But please ignore it if it doesn't fit my needs.`;
+
 // ---------- emailPrompt ----------
 // No canonical default today; admin authors this from scratch.
 export const EMAIL_PROMPT_DEFAULT = "";
@@ -128,20 +161,25 @@ export const RETRY_DEFAULTS = {
 // ---------- tuning ----------
 export const TUNING_DEFAULTS = {
   feedback: {
-    defaultMaxOutputTokens: 800,
+    // Response is ~200-350 tokens with the stripped aiHint prompt
+    // (hintStream 30-50 + part1 20-30 + part2 40-100 + part3 30-40 +
+    // advancedChallenge 0-100). 500 gives comfortable headroom for
+    // verbose grade-8+ WHY paragraphs; the 800 → 500 trim caps runaway
+    // responses without touching the typical case.
+    defaultMaxOutputTokens: 500,
     thinkingBudgetRatio: 0.2,
     maxThinkingBudget: 2048,
     imageStudyFormats: ["handwriting"],
     // Floor for cached-solution calls so the model can execute the
     // normalization/equivalence check (e.g. -(5sin(5x)) vs -5\sin(5x)).
     // Pure prompt rules at thinking=0 collapse to surface string matching.
-    // Trimmed 384 → 256 alongside lever C (fast-path): exact-match cases
-    // no longer reach the AI at all, so the surviving cached-solution
-    // calls are ambiguous-answer cases where the model already has the
-    // canonical solution in the cached systemInstruction. 256 tokens is
-    // enough for equivalence reasoning; ~250ms shaved from every submission
-    // vs the previous 384. Bump back up if false-negatives recur.
-    equivalenceCheckBudget: 256,
+    // Trimmed 384 → 256 → 128: with serverSideEquivalenceMatches catching
+    // the trivially-equivalent notation cases before AI, the surviving
+    // cached-solution calls typically resolve on shape alone. Shaves
+    // another ~150-250ms off time-to-first-hint-chunk on precomputed
+    // questions (the common case in a live class). Bump back up if
+    // false-negatives on ambiguous notation recur.
+    equivalenceCheckBudget: 128,
     // Floor for uncached calls: model must derive the answer AND run
     // equivalence. Trimmed 256 → 192: raw share (160) is very close, and
     // the small difference historically produced ~1-3 flip-flops per class.
@@ -198,6 +236,22 @@ const CLASSWORK_MISTAKE_SKIP_DEFAULT = "commonMistake: Leave it empty";
 
 const CLASSWORK_HINT_STREAM_DEFAULT =
   "hintStream: 2-4 sentences in the question's language. Greet by first name, acknowledge what they got right, then give the key next-step nudge — WITHOUT revealing the answer. Do not just repeat part1.";
+
+// Compact system prompt for the fast-hint "opener" call. Deliberately tiny
+// (~120 tokens) because it's carried on EVERY fast-hint submission and every
+// token of prefill delays time-to-first-character on the student's screen.
+// Mirrors the tone/voice of the full aiHintPrompt (warm, patient, question's
+// language, no reveal) but strips ALL structured-output / LaTeX / JSON /
+// schema guidance since fast-hint returns 1-2 sentences of plain text.
+// Admins can override in the AdminAiPrompts UI without touching the full
+// standard prompt.
+const CLASSWORK_FAST_HINT_SYSTEM_DEFAULT = `You are a warm, patient tutor giving a student one live nudge on their answer.
+Voice: encouraging, specific, terse. Same voice as a teacher standing next to them.
+Output: 2-4 short sentences in the QUESTION'S LANGUAGE. Plain text only — no JSON, no markdown, no bullets, no emojis.
+Greet by first name.
+If the answer looks correct, warmly congratulate.
+If it's off, hint at the single most important next thinking step WITHOUT revealing the final answer.
+No acknowledgment paragraphs, no restatement of what they wrote. Just the nudge.`;
 
 // Compact equivalence rules — judge by mathematical/scientific value, not
 // string form. Trimmed from a ~5700-char superset (math + science +
@@ -331,6 +385,7 @@ export const DIRECTIVE_DEFAULTS = {
   "classwork.mistakeCompute": CLASSWORK_MISTAKE_COMPUTE_DEFAULT,
   "classwork.mistakeSkip": CLASSWORK_MISTAKE_SKIP_DEFAULT,
   "classwork.hintStream": CLASSWORK_HINT_STREAM_DEFAULT,
+  "classwork.fastHintSystem": CLASSWORK_FAST_HINT_SYSTEM_DEFAULT,
   "classwork.mathEquivalence": CLASSWORK_MATH_EQUIVALENCE_DEFAULT,
   "classwork.askMode": CLASSWORK_ASK_MODE_DEFAULT,
   "classwork.tellMode": CLASSWORK_TELL_MODE_DEFAULT,
@@ -353,6 +408,8 @@ export function getStandardPromptDefaults() {
     aiHintPromptSections: AI_HINT_PROMPT_SECTION_DEFAULTS.slice(),
     reportPromptSections: REPORT_PROMPT_SECTION_DEFAULTS.slice(),
     creatingAssignmentPrompt: CREATING_ASSIGNMENT_PROMPT_DEFAULT,
+    creatingTestPrompt: CREATING_TEST_PROMPT_DEFAULT,
+    testAiHintPrompt: TEST_AI_HINT_PROMPT_DEFAULT,
     emailPrompt: EMAIL_PROMPT_DEFAULT,
     models: { ...MODEL_DEFAULTS },
     retry: JSON.parse(JSON.stringify(RETRY_DEFAULTS)),
@@ -405,6 +462,18 @@ export function buildSeedPatch(doc) {
   if (!(typeof d.creatingAssignmentPrompt === "string" && d.creatingAssignmentPrompt.trim())) {
     if (CREATING_ASSIGNMENT_PROMPT_DEFAULT) {
       set.creatingAssignmentPrompt = CREATING_ASSIGNMENT_PROMPT_DEFAULT;
+    }
+  }
+
+  if (!(typeof d.creatingTestPrompt === "string" && d.creatingTestPrompt.trim())) {
+    if (CREATING_TEST_PROMPT_DEFAULT) {
+      set.creatingTestPrompt = CREATING_TEST_PROMPT_DEFAULT;
+    }
+  }
+
+  if (!(typeof d.testAiHintPrompt === "string" && d.testAiHintPrompt.trim())) {
+    if (TEST_AI_HINT_PROMPT_DEFAULT) {
+      set.testAiHintPrompt = TEST_AI_HINT_PROMPT_DEFAULT;
     }
   }
 

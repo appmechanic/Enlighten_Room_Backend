@@ -1016,7 +1016,7 @@ export const updateAssignmentByAdmin = async (req, res) => {
 // Pull every classwork question for the picked lessons and stitch in the
 // per-question diagnostic-training history from ClassworkAiReport (broken out
 // by student). Output matches the shape geminiAssignmentQuestions expects.
-async function buildLessonsReport({ lessonIds }) {
+export async function buildLessonsReport({ lessonIds }) {
   const filterIds = Array.isArray(lessonIds)
     ? lessonIds.map((id) => String(id)).filter(Boolean)
     : [];
@@ -1261,7 +1261,7 @@ async function buildIndividualBundle({
 }
 
 // Map a generated question (gemini shape) onto a Question doc.
-function buildQuestionDoc({
+export function buildQuestionDoc({
   generated,
   classroomId,
   sessionId,
@@ -1302,7 +1302,7 @@ function buildQuestionDoc({
 
 // Concurrency-capped fan-out so one slow image gen doesn't serialise the
 // rest. 3 in flight is a comfortable balance against Gemini rate limits.
-async function runWithConcurrency(items, limit, worker) {
+export async function runWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
   const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {

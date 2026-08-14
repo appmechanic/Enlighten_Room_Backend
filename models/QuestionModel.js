@@ -25,6 +25,12 @@ const questionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Assignment",
     },
+    // Set by createTestWithAI so the Test-by-question lookup mirrors the
+    // Assignment-by-question one. Empty on legacy / classwork questions.
+    testId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Test",
+    },
     course: { type: String, required: true },
     topic: { type: String, required: true },
     questionText: { type: String, required: true },
