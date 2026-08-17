@@ -5,6 +5,7 @@ import {
   getSubscriptionByUserId,
   updateSubscription,
   deleteSubscription,
+  cancelSubscription,
 } from "../controllers/subscriptionController.js";
 import auth_key_header from "../middleware/auth_key_header.js";
 import auth_token from "../middleware/auth_token.js";
@@ -16,6 +17,12 @@ router.post("/", auth_key_header, auth_token, createSubscription);
 router.get("/", auth_key_header, auth_token, getAllSubscriptions);
 router.get("/:userId", auth_key_header, auth_token, getSubscriptionByUserId);
 router.put("/:userId", auth_key_header, auth_token, updateSubscription);
+router.post(
+  "/:userId/cancel",
+  auth_key_header,
+  auth_token,
+  cancelSubscription
+);
 router.delete(
   "/:userId",
   auth_key_header,

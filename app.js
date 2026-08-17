@@ -50,10 +50,13 @@ import articleRoutes from "./routes/articleRoutes.js";
 import connectToDatabase from "./config/db.js";
 import Keys from "./models/keys.js";
 import adminDashboardRoutes from "./routes/adminDashboardRoute.js";
+import registeredSchoolRoutes from "./routes/registeredSchoolRoutes.js";
+import schoolAdminReviewRoutes from "./routes/schoolAdminReviewRoutes.js";
 import aiConfigRoutes from "./routes/aiConfigRoutes.js";
 import whiteBoardRoutes from "./routes/whiteBoardRoute.js";
 import contactRoutes from "./routes/contactRoutes.js";
 import howItWorksRoutes from "./routes/howItWorks.routes.js";
+import appSettingRoutes from "./routes/appSettingRoutes.js";
 import homeCounterRoutes from "./routes/homeCounterRoute.js";
 import focusAlertRoutes from "./routes/focusAlertRoutes.js";
 import waitlistRoutes from "./routes/waitlistRoutes.js";
@@ -122,6 +125,7 @@ app.use("/api/articles", articleRoutes);
 app.use("/api/contact_form", contactRoutes);
 // mount under /api/settings
 app.use("/api/settings", howItWorksRoutes);
+app.use("/api/settings", appSettingRoutes);
 //stripe
 // 1) Webhook FIRST w/ raw body
 app.use("/api/billing/webhook", bodyParser.raw({ type: "application/json" }));
@@ -151,6 +155,8 @@ app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/team", teamRoutes);
 // admin dashboard
 app.use("/api/admin", adminDashboardRoutes);
+app.use("/api/admin/registered-schools", registeredSchoolRoutes);
+app.use("/api/admin/school-admins", schoolAdminReviewRoutes);
 // public AI tuning config (grade bands, multipliers) — read-only, no auth
 app.use("/api/ai-config", aiConfigRoutes);
 //home page counter

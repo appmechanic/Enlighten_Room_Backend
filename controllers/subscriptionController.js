@@ -1,4 +1,6 @@
 import Subscription from "../models/SubscriptionModel.js";
+import User from "../models/user.js";
+import { cancelPreviousSubscription } from "../utils/cancelPreviousSubscription.js";
 
 // Create
 export const createSubscription = async (req, res) => {
@@ -74,6 +76,38 @@ export const updateSubscription = async (req, res) => {
     res.json(subscription);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+};
+
+// Cancel — usable by an admin OR the subscription owner themselves.
+// Cancels with the payment provider and flips the user's isPaid flag.
+export const cancelSubscription = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const caller = req.user;
+    if (!caller) return res.status(401).json({ error: "Not authenticated." });
+
+    const isSelf = String(caller._id) === String(userId);
+    if (!isSelf && !caller.isAdmin) {
+      return res.status(403).json({ error: "Not allowed." });
+    }
+
+    const cancelled = await cancelPreviousSubscription(userId);
+    await User.findByIdAndUpdate(userId, { $set: { isPaid: false } });
+
+    if (!cancelled) {
+      return res.json({
+        message: "No active subscription to cancel.",
+        subscription: null,
+      });
+    }
+    return res.json({
+      message: "Subscription cancelled successfully.",
+      subscription: cancelled,
+    });
+  } catch (err) {
+    console.error("cancelSubscription failed:", err);
+    return res.status(500).json({ error: err.message });
   }
 };
 

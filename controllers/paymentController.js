@@ -127,6 +127,23 @@ export const createPaymentIntent = async (req, res) => {
       return res.status(404).json({ success: false, error: "Plan not found" });
     }
 
+    // Enforce plan/user category matching so a teacher can't subscribe to a
+    // school plan by crafting the request directly (the UI already filters).
+    const planCategory = plan.planCategory || "individual";
+    const isSchoolAdmin = user.userRole === "schoolAdmin";
+    if (planCategory === "school" && !isSchoolAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: "School subscription plans are restricted to school administrators.",
+      });
+    }
+    if (planCategory === "individual" && isSchoolAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: "School administrators must choose a school subscription plan.",
+      });
+    }
+
     // Validate coupon if provided
     let coupon = null;
     let discountAmount = 0;

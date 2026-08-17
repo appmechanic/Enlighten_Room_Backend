@@ -20,8 +20,7 @@ export const sendLessonReminderEmails = async (students, datetime) => {
 export const sendFeeReminderEmails = async (parents, students, amount) => {
   const subject = "Tuition Fee Due Reminder";
 
-  // Send to each parent
-  for (const parent of parents) {
+  const parentEmailJobs = parents.map((parent) => {
     const fullName =
       parent.firstName && parent.lastName
         ? `${parent.firstName} ${parent.lastName}`
@@ -32,36 +31,28 @@ export const sendFeeReminderEmails = async (parents, students, amount) => {
       <p>Please make the payment at your earliest convenience.</p>
       <p>We appreciate your cooperation and support.</p>
     `;
-
     return sendEmail({ to: parent.email, subject, html: parentHtml });
-  }
+  });
 
-  // Send to each student
-  for (const student of students) {
+  const studentEmailJobs = students.map((student) => {
     const fullName =
       student.firstName && student.lastName
         ? `${student.firstName} ${student.lastName}`
         : "Student";
-
     const studentHtml = `
       <p>Dear ${fullName},</p>
       <p>This is a reminder that your tuition fee of <strong>$${amount}</strong> is due.</p>
       <p>Please remind your parent or guardian to make the payment.</p>
       <p>Thank you for staying responsible.</p>
     `;
-
     return sendEmail({ to: student.email, subject, html: studentHtml });
-  }
-
-  // Combine and send all emails in parallel
-  const allEmailJobs = [...parentEmailJobs, ...studentEmailJobs];
+  });
 
   try {
-    await Promise.all(allEmailJobs);
+    await Promise.all([...parentEmailJobs, ...studentEmailJobs]);
     console.log("✅ All fee reminders sent successfully.");
   } catch (err) {
     console.error("❌ Some fee reminders failed to send:", err.message);
-    // Optional: return or throw for controller to handle
     throw new Error("Failed to send some or all fee reminder emails.");
   }
 };
@@ -69,13 +60,13 @@ export const sendFeeReminderEmails = async (parents, students, amount) => {
 // 📝 Homework Reminder
 export const sendHomeworkReminderEmails = async (students, dueDate) => {
   const subject = "Assignment Due Reminder";
-  const html = `
-    <p>Dear ${students.firstName} ${students.lastName},</p>
-    <p>This is a reminder that your assignment is due on <strong>${dueDate}</strong>.</p>
-    <p>Please make sure to complete and submit it before the deadline.</p>
-  `;
 
   for (const student of students) {
+    const html = `
+      <p>Dear ${student.firstName} ${student.lastName},</p>
+      <p>This is a reminder that your assignment is due on <strong>${dueDate}</strong>.</p>
+      <p>Please make sure to complete and submit it before the deadline.</p>
+    `;
     await sendEmail({ to: student.email, subject, html });
   }
 };

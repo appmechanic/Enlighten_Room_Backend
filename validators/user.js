@@ -34,6 +34,8 @@ const signupSchema = z.object({
   isAdmin: z.boolean().optional(),
   date_of_birth: z.boolean().optional(),
 
+  userRole: z.enum(["teacher", "schoolAdmin"]).optional(),
+
   address: addressSchema.optional(),
 });
 export { signupSchema };

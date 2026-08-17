@@ -1,7 +1,14 @@
 import User from "../models/user.js";
 import stripe from "../config/stripe.js";
-import { sendEmail, sendResetEmail } from "../utils/helper.js";
+import {
+  sendEmail,
+  sendResetEmail,
+  sendSchoolAdminApprovedEmail,
+  sendSchoolAdminPendingEmail,
+} from "../utils/helper.js";
 import { signupSchema } from "../validators/user.js";
+import { verifySchool } from "../utils/schoolVerifier.js";
+import RegisteredSchool from "../models/RegisteredSchool.js";
 import { OAuth2Client } from "google-auth-library";
 import jwt from "jsonwebtoken";
 import ms from "ms";
@@ -40,16 +47,17 @@ const isSameDay = (d1, d2) => {
 
 const signup = async (req, res) => {
   try {
-    // Strip disallowed fields
+    // Strip disallowed fields. userRole is allowed but validator restricts it
+    // to "teacher" | "schoolAdmin" so callers can't self-promote to admin.
     const cleanBody = filterDisallowedFields(req.body, [
       "is_verified",
       "is_active",
       "isPaid",
       "isAdmin",
-      "userRole",
     ]);
 
     const data = signupSchema.parse(cleanBody);
+    const requestedRole = data.userRole === "schoolAdmin" ? "schoolAdmin" : "teacher";
     // ✅ Check if email format is valid and has no spaces
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(data.email)) {
@@ -64,14 +72,56 @@ const signup = async (req, res) => {
       });
     }
 
-    // Set isAdmin based on usertype
-    data.isAdmin = data.userRole === "admin";
+    // Signup never grants admin — that only happens via addAdmin.
+    data.isAdmin = false;
+
+    // If the caller requested schoolAdmin, verify their org against the
+    // registered-schools list. On failure we downgrade to teacher and send a
+    // "further verification" email instead of the approval email.
+    let schoolVerification = {
+      status: "pending",
+      matchedSchoolId: null,
+      reason: "",
+      verifiedAt: null,
+    };
+    let schoolMatchName = null;
+
+    if (requestedRole === "schoolAdmin") {
+      const result = await verifySchool({
+        email: data.email,
+        organization: data.organization,
+      });
+      if (result.verified) {
+        data.userRole = "schoolAdmin";
+        schoolVerification = {
+          status: "verified",
+          matchedSchoolId: result.matchedSchoolId,
+          reason: result.reason,
+          verifiedAt: new Date(),
+        };
+        const matched = await RegisteredSchool.findById(
+          result.matchedSchoolId
+        ).select("name").lean();
+        schoolMatchName = matched?.name || data.organization;
+      } else {
+        data.userRole = "teacher";
+        schoolVerification = {
+          status: "rejected",
+          matchedSchoolId: null,
+          reason: result.reason,
+          verifiedAt: null,
+        };
+      }
+    } else {
+      data.userRole = "teacher";
+    }
+    data.schoolVerification = schoolVerification;
 
     // Generate OTP
     data.OTP_code = Math.floor(1000 + Math.random() * 9000).toString();
     //userName
     data.userName = await generateUniqueUserName(data.firstName, data.lastName);
-    // Send email
+    // Send OTP/invitation email
     const emailSent = await sendEmail(data, data.OTP_code, data.userName);
     if (!emailSent) {
       return res.status(500).json({
@@ -82,6 +132,19 @@ const signup = async (req, res) => {
 
     // Create user
     const user = await User.create(data);
+
+    // Fire school-admin-specific status email (best-effort, don't block signup).
+    if (requestedRole === "schoolAdmin") {
+      if (schoolVerification.status === "verified") {
+        sendSchoolAdminApprovedEmail(user, schoolMatchName).catch((e) =>
+          console.error("school-admin approval email failed:", e?.message)
+        );
+      } else {
+        sendSchoolAdminPendingEmail(user, schoolVerification.reason).catch(
+          (e) => console.error("school-admin pending email failed:", e?.message)
+        );
+      }
+    }
 
     // // Extract common fields
     // const commonFields = {
@@ -116,6 +179,12 @@ const signup = async (req, res) => {
       success: true,
       userId: user._id.toString(),
       emailVerification: "Email verification code sent",
+      requestedRole,
+      userRole: user.userRole,
+      schoolVerification: {
+        status: user.schoolVerification?.status || "pending",
+        reason: user.schoolVerification?.reason || "",
+      },
     });
   } catch (err) {
     console.log(err);
@@ -358,7 +427,35 @@ const verifyOTP = async (req, res) => {
       user.OTP_code = "";
       await user.save();
 
-      return res.status(200).json({ message: "Verified", success: true });
+      // Issue a login token so the React app can auto-log-in the freshly
+      // verified user and route them straight to the subscription plans
+      // page instead of forcing a second manual login. Payload mirrors the
+      // /login handler above so the auth slice stores the same shape.
+      const payload = {
+        userId: user._id.toString(),
+        studentId: user._id,
+        email: user.email,
+        userName: user.userName,
+        role: user.userRole,
+        is_verified: user.is_verified,
+        is_active: user.is_active,
+        is_admin: user.isAdmin,
+        isPaid: user.isPaid,
+        createdAt: user.createdAt,
+      };
+      const token = jwt.sign(payload, process.env.JWT_SECRET_KEY, {
+        expiresIn: "1d",
+      });
+
+      return res.status(200).json({
+        message: "Verified",
+        success: true,
+        token,
+        userRole: user.userRole,
+        schoolVerification: {
+          status: user.schoolVerification?.status || "pending",
+        },
+      });
     } else {
       return res.status(401).json({ message: "Wrong OTP" });
     }

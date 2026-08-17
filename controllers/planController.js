@@ -6,6 +6,7 @@ export const createPlan = async (req, res) => {
     const {
       name,
       planType,
+      planCategory,
       priceMonthly,
       discountPrice,
       priceYearly,
@@ -22,6 +23,7 @@ export const createPlan = async (req, res) => {
       name,
       discountPrice,
       planType,
+      planCategory,
       priceMonthly,
       priceYearly,
       features,
@@ -34,10 +36,17 @@ export const createPlan = async (req, res) => {
   }
 };
 
-// READ all plans
+// READ all plans. Accepts ?category=individual|school to segment the results
+// for the signed-in user (teachers see individual, school admins see school).
+// Unrecognised or missing category returns every plan for admin/CMS use.
 export const getAllPlans = async (req, res) => {
   try {
-    const plans = await Plan.find();
+    const { category } = req.query;
+    const query =
+      category === "individual" || category === "school"
+        ? { planCategory: category }
+        : {};
+    const plans = await Plan.find(query);
     res.json(plans);
   } catch (error) {
     res.status(500).json({ error: error.message });

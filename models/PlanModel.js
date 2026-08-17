@@ -12,6 +12,12 @@ const planSchema = new mongoose.Schema(
       required: true,
       unique: true,
     },
+    planCategory: {
+      type: String,
+      enum: ["individual", "school"],
+      default: "individual",
+      index: true,
+    },
     priceMonthly: {
       type: Number,
       required: true,

@@ -34,7 +34,7 @@ const userSchema = new mongoose.Schema(
     },
     userName: {
       type: String,
-      // unique: true,
+      // unique: true,.
       // required: true,
       lowercase: true,
       trim: true,
@@ -110,8 +110,22 @@ const userSchema = new mongoose.Schema(
     },
     userRole: {
       type: String,
-      enum: ["teacher", "admin", "student", "parent"],
+      enum: ["teacher", "schoolAdmin", "admin", "student", "parent"],
       default: "teacher",
+    },
+    schoolVerification: {
+      status: {
+        type: String,
+        enum: ["pending", "verified", "rejected"],
+        default: "pending",
+      },
+      matchedSchoolId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "RegisteredSchool",
+        default: null,
+      },
+      reason: { type: String, default: "" },
+      verifiedAt: { type: Date, default: null },
     },
     isAdmin: {
       type: Boolean,
