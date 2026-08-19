@@ -368,7 +368,7 @@ function normalizeCommonMistake(value) {
     answerLatex: firstNonEmptyString([source.answerLatex, source.latex]),
   };
 }
-
+ 
 function getAnswerImageSource(answer) {
   if (!answer) return null;
   if (typeof answer === "string") {
