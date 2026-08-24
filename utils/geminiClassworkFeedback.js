@@ -1111,6 +1111,174 @@ export function createHintStreamScanner({ onDelta, onClose }) {
   };
 }
 
+// Incremental scanner that walks a top-level JSON array of strings and
+// forwards decoded chars for each element as they arrive. Mirrors
+// createHintStreamScanner's escape/unicode handling. `fieldName` is the
+// bare property name (e.g. "part1"); the scanner looks for `"part1"` at
+// the buffer's top level. Callbacks fire in order:
+//   onDelta(index, chunk)     — decoded chars for the item at `index`,
+//                               batched per push() call
+//   onItemClose(index, full)  — item's closing quote seen; delivers the
+//                               fully decoded string for that item
+//   onArrayClose()            — array's closing `]` seen; scanner is done
+// A bare literal `"part1"` cannot appear inside another JSON string value
+// (the quotes would be escaped as `\"`), so top-level indexOf is safe.
+export function createArrayStreamScanner({ fieldName, onDelta, onItemClose, onArrayClose }) {
+  const KEY = `"${fieldName}"`;
+  let buffer = "";
+  let cursor = 0;
+  // SEARCH_KEY → AWAIT_COLON → AWAIT_ARRAY → BETWEEN_ITEMS → IN_STRING → DONE
+  let state = "SEARCH_KEY";
+  let escape = false;
+  let unicodePending = null;
+  let currentIndex = -1;
+  let currentDecoded = "";
+  let currentPending = "";
+  let arrayCloseFired = false;
+
+  const safeFire = (name, fn, ...args) => {
+    if (typeof fn !== "function") return;
+    try {
+      fn(...args);
+    } catch (err) {
+      console.error(`[ArrayStreamScanner:${fieldName}] ${name} threw:`, err);
+    }
+  };
+
+  const flushDelta = () => {
+    if (!currentPending || currentIndex < 0) return;
+    const chunk = currentPending;
+    currentPending = "";
+    safeFire("onDelta", onDelta, currentIndex, chunk);
+  };
+
+  const emitChar = (ch) => {
+    if (!ch) return;
+    currentPending += ch;
+    currentDecoded += ch;
+  };
+
+  const isWs = (ch) => ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+
+  function scan() {
+    while (cursor < buffer.length && state !== "DONE") {
+      if (state === "SEARCH_KEY") {
+        const idx = buffer.indexOf(KEY, cursor);
+        if (idx === -1) {
+          cursor = Math.max(buffer.length - KEY.length, cursor);
+          return;
+        }
+        cursor = idx + KEY.length;
+        state = "AWAIT_COLON";
+        continue;
+      }
+
+      if (state === "AWAIT_COLON") {
+        const ch = buffer[cursor];
+        cursor += 1;
+        if (ch === ":") state = "AWAIT_ARRAY";
+        else if (!isWs(ch)) {
+          state = "DONE";
+          return;
+        }
+        continue;
+      }
+
+      if (state === "AWAIT_ARRAY") {
+        const ch = buffer[cursor];
+        cursor += 1;
+        if (ch === "[") state = "BETWEEN_ITEMS";
+        else if (!isWs(ch)) {
+          state = "DONE";
+          return;
+        }
+        continue;
+      }
+
+      if (state === "BETWEEN_ITEMS") {
+        const ch = buffer[cursor];
+        cursor += 1;
+        if (ch === '"') {
+          currentIndex += 1;
+          currentDecoded = "";
+          currentPending = "";
+          state = "IN_STRING";
+        } else if (ch === "]") {
+          state = "DONE";
+          arrayCloseFired = true;
+          safeFire("onArrayClose", onArrayClose);
+          return;
+        } else if (ch !== "," && !isWs(ch)) {
+          state = "DONE";
+          return;
+        }
+        continue;
+      }
+
+      if (state === "IN_STRING") {
+        const ch = buffer[cursor];
+        cursor += 1;
+        if (unicodePending !== null) {
+          unicodePending += ch;
+          if (unicodePending.length === 4) {
+            const code = parseInt(unicodePending, 16);
+            unicodePending = null;
+            if (Number.isFinite(code)) emitChar(String.fromCharCode(code));
+          }
+          continue;
+        }
+        if (escape) {
+          escape = false;
+          if (ch === "n") emitChar("\n");
+          else if (ch === "t") emitChar("\t");
+          else if (ch === "r") emitChar("\r");
+          else if (ch === "u") unicodePending = "";
+          else if (ch === "\\" || ch === '"' || ch === "/") emitChar(ch);
+          else emitChar(ch);
+          continue;
+        }
+        if (ch === "\\") {
+          if (cursor >= buffer.length) {
+            cursor -= 1;
+            return;
+          }
+          escape = true;
+          continue;
+        }
+        if (ch === '"') {
+          // Close of current item — flush any pending delta first so
+          // onItemClose fires strictly after the last onDelta for this
+          // index. Then continue scanning; the array may close in the
+          // same push().
+          flushDelta();
+          safeFire("onItemClose", onItemClose, currentIndex, currentDecoded);
+          state = "BETWEEN_ITEMS";
+          continue;
+        }
+        emitChar(ch);
+      }
+    }
+  }
+
+  return {
+    push(chunk) {
+      if (typeof chunk !== "string" || chunk.length === 0) return;
+      buffer += chunk;
+      try {
+        scan();
+      } finally {
+        flushDelta();
+      }
+    },
+    isDone() {
+      return state === "DONE";
+    },
+    isArrayClosed() {
+      return arrayCloseFired;
+    },
+  };
+}
+
 // Streaming twin of getClassworkAiFeedback. Runs the same Gemini call via
 // generateContentStream, forwards decoded `hintStream` characters to
 // `onHintDelta` the moment they arrive, and — once the full stream ends
@@ -1139,6 +1307,8 @@ export async function getClassworkAiFeedbackStream({
   onHintDelta,
   onHintClose,
   onVerdict,
+  onBodyDelta,
+  onBodyClose,
 }) {
   const reqId = newReqId();
   const [MODEL, FALLBACK_MODEL, retryCfg] = await Promise.all([
@@ -1268,6 +1438,48 @@ export async function getClassworkAiFeedbackStream({
     },
   });
 
+  // Body streaming: part1 (acknowledgment) + part2 (DON'T/WHAT/HOW/WHY)
+  // arrive after hintStream in schema order. We fan each into the SSE
+  // layer as it decodes so the client can type them out live under the
+  // hint instead of receiving them all at once in the terminal payload.
+  const bodyFieldsSeen = new Set(); // "part1"|"part2" — remembered so the
+  // done-time fallback below only fires for fields whose scanner truly
+  // never saw a close (e.g. malformed / fenced JSON).
+  const bodyItemClosed = new Set(); // "field:index" — same rationale, but
+  // per item, so the fallback can top up individual missed items.
+  const makeArrayScanner = (fieldName) =>
+    createArrayStreamScanner({
+      fieldName,
+      onDelta: (index, chunk) => {
+        if (typeof onBodyDelta !== "function") return;
+        try {
+          onBodyDelta({ field: fieldName, index, chunk });
+        } catch (err) {
+          console.error(
+            `[ClassworkFeedback][req=${reqId}][stream] onBodyDelta threw:`,
+            err,
+          );
+        }
+      },
+      onItemClose: (index, text) => {
+        bodyItemClosed.add(`${fieldName}:${index}`);
+        if (typeof onBodyClose !== "function") return;
+        try {
+          onBodyClose({ field: fieldName, index, text });
+        } catch (err) {
+          console.error(
+            `[ClassworkFeedback][req=${reqId}][stream] onBodyClose threw:`,
+            err,
+          );
+        }
+      },
+      onArrayClose: () => {
+        bodyFieldsSeen.add(fieldName);
+      },
+    });
+  const part1Scanner = makeArrayScanner("part1");
+  const part2Scanner = makeArrayScanner("part2");
+
   // The SDK's streaming call doesn't return a status code the retry
   // wrapper knows how to inspect until we start iterating — so we retry
   // the whole stream-open + drain sequence together. The classwork
@@ -1289,6 +1501,8 @@ export async function getClassworkAiFeedbackStream({
         responseText += piece;
         verdictScanner.push(piece);
         scanner.push(piece);
+        part1Scanner.push(piece);
+        part2Scanner.push(piece);
       }
       // Keep the LAST chunk that carries either usage or a finishReason —
       // Gemini emits finishReason on the final chunk (usually the same chunk
@@ -1360,6 +1574,44 @@ export async function getClassworkAiFeedbackStream({
       );
     }
   }
+
+  // Body fallback: for any part1/part2 item the incremental scanner missed
+  // (fenced JSON, malformed stream, or an interior string that ended after
+  // the maxOutputTokens cutoff) synthesize a single delta + close from the
+  // shaped result so the client's per-line accumulator lands with the same
+  // final text as feedback.part1/part2. Skips items the scanner already
+  // closed — those are authoritative from the live stream.
+  const fallbackBodyField = (fieldName, items) => {
+    if (!Array.isArray(items) || !items.length) return;
+    items.forEach((rawText, index) => {
+      const key = `${fieldName}:${index}`;
+      if (bodyItemClosed.has(key)) return;
+      const text = String(rawText ?? "");
+      if (typeof onBodyDelta === "function" && text) {
+        try {
+          onBodyDelta({ field: fieldName, index, chunk: text });
+        } catch (err) {
+          console.error(
+            `[ClassworkFeedback][req=${reqId}][stream] fallback onBodyDelta threw:`,
+            err,
+          );
+        }
+      }
+      if (typeof onBodyClose === "function") {
+        try {
+          onBodyClose({ field: fieldName, index, text });
+        } catch (err) {
+          console.error(
+            `[ClassworkFeedback][req=${reqId}][stream] fallback onBodyClose threw:`,
+            err,
+          );
+        }
+      }
+      bodyItemClosed.add(key);
+    });
+  };
+  fallbackBodyField("part1", feedback.part1);
+  fallbackBodyField("part2", feedback.part2);
 
   setImmediate(() => {
     recordAiTokenUsage(usageMetadata, {

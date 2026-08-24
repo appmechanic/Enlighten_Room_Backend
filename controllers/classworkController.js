@@ -2046,6 +2046,24 @@ export const submitAnswer = async (req, res) => {
   }
 };
 
+// Emit synthetic body/body_close events for a shaped AI result on the
+// non-Gemini branches (fast-path, answer-hash cache). Keeps the SSE
+// wire contract uniform so the client's per-line accumulator doesn't
+// need to branch on cache-hit vs live stream.
+function replayBodyEvents(res, aiResult) {
+  if (!aiResult) return;
+  const replay = (field) => {
+    const items = Array.isArray(aiResult[field]) ? aiResult[field] : [];
+    items.forEach((rawText, index) => {
+      const text = String(rawText ?? '');
+      if (text) writeSseEvent(res, 'body', { field, index, chunk: text });
+      writeSseEvent(res, 'body_close', { field, index, text });
+    });
+  };
+  replay('part1');
+  replay('part2');
+}
+
 // Small SSE writer. Each event is a single `event:` + `data:` pair
 // terminated by a blank line, per the spec. Keeps the payload one JSON
 // object per event so the client can `JSON.parse(evt.data)` uniformly.
@@ -2126,6 +2144,7 @@ export const submitAnswerStream = async (req, res) => {
             hintStream: aiResult.hintStream || '',
             correct: true,
           });
+          replayBodyEvents(res, aiResult);
         }
       }
 
@@ -2169,6 +2188,7 @@ export const submitAnswerStream = async (req, res) => {
             hintStream: aiResult.hintStream || '',
             correct: Boolean(aiResult.correct),
           });
+          replayBodyEvents(res, aiResult);
         }
       } else {
         try {
@@ -2217,6 +2237,20 @@ export const submitAnswerStream = async (req, res) => {
                 hintStream: fullHint,
                 correct: lastVerdict,
               });
+            },
+            // Per-chunk body deltas for part1[] / part2[] — the client
+            // types each item into its own line under the hintStream so
+            // the whole feedback body streams as one continuous popup
+            // instead of jumping in at `done`.
+            onBodyDelta: ({ field, index, chunk }) => {
+              if (clientGone) return;
+              writeSseEvent(res, 'body', { field, index, chunk });
+            },
+            // Marks a body line as fully decoded. Client swaps the plain
+            // text for math-typeset markup once caught up.
+            onBodyClose: ({ field, index, text }) => {
+              if (clientGone) return;
+              writeSseEvent(res, 'body_close', { field, index, text });
             },
           });
 
