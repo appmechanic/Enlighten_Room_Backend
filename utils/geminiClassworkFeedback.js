@@ -1394,3 +1394,54 @@ export async function getClassworkAiFeedbackStream({
   return feedback;
 }
 
+// Establish the Gemini explicit prompt-cache entry for a question BEFORE the
+// first student submits, so the first submit hits a warm cache instead of
+// paying the cache-creation round-trip (typically 500ms-1.5s of TTFT). The
+// systemInstruction here mirrors buildGeminiRequest's stable prefix exactly
+// (standard prompt + teacher prompt + canonical solution), otherwise the
+// digest wouldn't match and the on-submit path would create a second entry.
+//
+// Silent no-op on failure: on-submit will just fall through to inline
+// systemInstruction as it did before.
+export async function warmClassworkFeedbackCache({
+  teacherId,
+  questionId,
+  standardSolution,
+}) {
+  try {
+    if (!questionId) return { ok: false, reason: "no-question" };
+    const [MODEL, teacherPrompt] = await Promise.all([
+      getAiModel(),
+      getTeacherPromptCached(teacherId),
+    ]);
+    const cachedSolution = (standardSolution || "").trim();
+    const solutionBlock = cachedSolution
+      ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
+      : "";
+    const systemInstruction = [
+      HARDCODED_STANDARD_PROMPT_TEXT,
+      teacherPrompt,
+      solutionBlock,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const result = await getOrCreateClassworkFeedbackCache({
+      model: MODEL,
+      teacherId,
+      questionId,
+      systemInstruction,
+      tag: `WarmCache:${questionId}`,
+    });
+    console.log(
+      `[ClassworkFeedback][warm][q=${questionId}] cache=${result.ok ? (result.reused ? "hit" : "created") : `miss:${result.reason || "unknown"}`}`,
+    );
+    return result;
+  } catch (err) {
+    console.warn(
+      `[ClassworkFeedback][warm][q=${questionId}] failed:`,
+      err?.message || err,
+    );
+    return { ok: false, reason: "warm-failed" };
+  }
+}
+

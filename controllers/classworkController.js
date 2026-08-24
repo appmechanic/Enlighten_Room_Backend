@@ -9,6 +9,7 @@ import Lesson from '../models/LessonModel.js';
 import {
   getClassworkAiFeedback,
   getClassworkAiFeedbackStream,
+  warmClassworkFeedbackCache,
 } from '../utils/geminiClassworkFeedback.js';
 import {
   fingerprintAnswer,
@@ -710,6 +711,16 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
             { $set: update },
           );
         }
+        // Warm Gemini's explicit prompt cache with the (standard + teacher +
+        // solution) prefix so the first student's submit doesn't pay the
+        // cache-creation round-trip. Fire-and-forget: any failure is logged
+        // by the warmer and the submit path silently falls through to inline
+        // systemInstruction as before.
+        warmClassworkFeedbackCache({
+          teacherId,
+          questionId: newQuestion.id,
+          standardSolution: solution || "",
+        }).catch(() => {});
       }
     } catch (err) {
       console.error(
