@@ -9,7 +9,6 @@ import Lesson from '../models/LessonModel.js';
 import {
   getClassworkAiFeedback,
   getClassworkAiFeedbackStream,
-  getClassworkAiFastHint,
 } from '../utils/geminiClassworkFeedback.js';
 import {
   fingerprintAnswer,
@@ -2081,13 +2080,11 @@ export const submitAnswerStream = async (req, res) => {
 
     let aiResult = emptyAiFeedback();
     let aiFailed = false;
-    // Fast plain-text hint used to live on its own /submit/fast-hint SSE
-    // route that the client fired in parallel. It's now folded in here so
-    // the client only opens one connection. Emits `greeting` events into
-    // the opener region alongside the structured `verdict` + `hint`.
-    // Same skip conditions as the old standalone route: no fast-hint on
-    // AI-expired, fast-path exact-match, or answer-hash cache-hit paths.
-    let greetingPromise = Promise.resolve();
+    // Verdict is captured out-of-band by the verdict scanner (fires as soon
+    // as `"correct":…` shows up in the Gemini stream). We stash it here so
+    // the follow-on hint_complete event can include it in the same payload
+    // without asking the client to correlate two events.
+    let lastVerdict = null;
 
     if (!ctx.aiExpired) {
       // Exact-match fast path: for mcq / fill-blanks / textbox, when the
@@ -2114,6 +2111,10 @@ export const submitAnswerStream = async (req, res) => {
           if (aiResult.hintStream) {
             writeSseEvent(res, 'hint', { chunk: aiResult.hintStream });
           }
+          writeSseEvent(res, 'hint_complete', {
+            hintStream: aiResult.hintStream || '',
+            correct: true,
+          });
         }
       }
 
@@ -2153,40 +2154,14 @@ export const submitAnswerStream = async (req, res) => {
           if (aiResult.hintStream) {
             writeSseEvent(res, 'hint', { chunk: aiResult.hintStream });
           }
+          writeSseEvent(res, 'hint_complete', {
+            hintStream: aiResult.hintStream || '',
+            correct: Boolean(aiResult.correct),
+          });
         }
       } else {
         try {
           const hasPrecomputedSolution = Boolean(ctx.question.standardSolution);
-
-          // Kick off the fast plain-text hint in parallel with the
-          // structured stream — its `greeting` events start arriving in
-          // ~1s (flash-lite, no schema, no thinking budget) while the
-          // structured call spends 4-9s on the reasoned hintStream. The
-          // greeting is display-only; the structured hintStream is still
-          // the authoritative one that gets persisted. Errors are
-          // swallowed so a fast-hint failure never surfaces to the
-          // student. Awaited before we emit the terminal `done` event so
-          // all greeting chunks flush first.
-          greetingPromise = getClassworkAiFastHint({
-            questionText: ctx.questionTextForAi,
-            answer: ctx.normalizedAnswer,
-            correctAnswer: ctx.isFollowUp ? '' : ctx.question.correctAnswer,
-            questionImage: ctx.isFollowUp ? null : (ctx.question.image || null),
-            format: ctx.question.format,
-            studentName: ctx.studentName,
-            teacherId: ctx.resolvedTeacherId,
-            onHintDelta: (chunk) => {
-              if (clientGone) return;
-              if (typeof chunk === 'string' && chunk.length) {
-                writeSseEvent(res, 'greeting', { chunk });
-              }
-            },
-          }).catch((err) => {
-            console.warn(
-              '[Classwork][stream] fast-hint (greeting) failed:',
-              err?.message || err,
-            );
-          });
 
           aiResult = await getClassworkAiFeedbackStream({
             questionText: ctx.questionTextForAi,
@@ -2211,9 +2186,26 @@ export const submitAnswerStream = async (req, res) => {
               if (clientGone) return;
               writeSseEvent(res, 'hint', { chunk });
             },
+            // Verdict lands within a token or two of the first Gemini chunk
+            // (schema puts `correct` first). Capture it so hint_complete
+            // can ship both the verdict and the assembled hint in a single
+            // event without racing.
             onVerdict: (isCorrect) => {
               if (clientGone) return;
-              writeSseEvent(res, 'verdict', { correct: Boolean(isCorrect) });
+              lastVerdict = Boolean(isCorrect);
+              writeSseEvent(res, 'verdict', { correct: lastVerdict });
+            },
+            // Fires when the hintStream JSON string terminates — the trailing
+            // pedagogy fields (part1/2/3/advancedChallenge) are still
+            // streaming after this. Ships the assembled hint so the client
+            // can transition the modal to "feedback ready" ~3-5s before the
+            // full response completes.
+            onHintClose: (fullHint) => {
+              if (clientGone) return;
+              writeSseEvent(res, 'hint_complete', {
+                hintStream: fullHint,
+                correct: lastVerdict,
+              });
             },
           });
 
@@ -2224,10 +2216,6 @@ export const submitAnswerStream = async (req, res) => {
         }
       }
     }
-
-    // Let any in-flight fast-hint (greeting) writes finish before we
-    // emit the terminal event and close the response.
-    await greetingPromise;
 
     if (aiFailed) {
       writeSseEvent(res, 'error', {

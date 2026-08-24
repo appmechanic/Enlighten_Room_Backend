@@ -977,7 +977,7 @@ export function createVerdictScanner({ onVerdict }) {
   };
 }
 
-export function createHintStreamScanner({ onDelta }) {
+export function createHintStreamScanner({ onDelta, onClose }) {
   const KEY = '"hintStream"';
   let buffer = "";
   let cursor = 0;
@@ -988,10 +988,19 @@ export function createHintStreamScanner({ onDelta }) {
   // "just saw \u, expecting digits" from "no escape in progress".)
   let unicodePending = null;
   let pending = ""; // decoded chars accumulated during the current push()
+  // Full decoded hintStream text so onClose can hand the assembled string
+  // to callers (e.g. the SSE layer) without re-scanning.
+  let decoded = "";
+  // Distinguishes graceful end-of-string ('"' terminator) from error bail-outs
+  // ("Unexpected between…" branches also set state=DONE) so onClose fires only
+  // when we actually saw the closing quote.
+  let sawStringEnd = false;
+  let onCloseFired = false;
 
   function emit(char) {
     if (!char) return;
     pending += char;
+    decoded += char;
   }
 
   // Deliver everything decoded during this push() as a single chunk.
@@ -1068,6 +1077,7 @@ export function createHintStreamScanner({ onDelta }) {
           }
           if (ch === '"') {
             state = "DONE";
+            sawStringEnd = true;
             return;
           }
           emit(ch);
@@ -1085,6 +1095,14 @@ export function createHintStreamScanner({ onDelta }) {
         // Emit whatever this chunk decoded, even when scan() bailed
         // early (split escape, key straddling chunks, string ended).
         flush();
+      }
+      if (sawStringEnd && !onCloseFired && typeof onClose === "function") {
+        onCloseFired = true;
+        try {
+          onClose(decoded);
+        } catch (err) {
+          console.error("[HintStreamScanner] onClose threw:", err);
+        }
       }
     },
     isDone() {
@@ -1119,6 +1137,7 @@ export async function getClassworkAiFeedbackStream({
   computeStandardSolution = false,
   computeCommonMistake = false,
   onHintDelta,
+  onHintClose,
   onVerdict,
 }) {
   const reqId = newReqId();
@@ -1205,8 +1224,28 @@ export async function getClassworkAiFeedbackStream({
     maxOutputTokens: resolvedMaxOutputTokens,
   };
 
+  // Fires once when the hintStream string terminates in the JSON stream —
+  // signals that everything the student sees typing has landed and the
+  // trailing pedagogy fields (part1/2/3/advancedChallenge) are still
+  // streaming. Lets the SSE layer flip the modal from "checking" to
+  // "feedback ready" ~3-5s before the full response completes.
+  let hintCloseFired = false;
   const scanner = createHintStreamScanner({
     onDelta: typeof onHintDelta === "function" ? onHintDelta : () => {},
+    onClose: (fullHint) => {
+      if (hintCloseFired) return;
+      hintCloseFired = true;
+      if (typeof onHintClose === "function") {
+        try {
+          onHintClose(fullHint);
+        } catch (err) {
+          console.error(
+            `[ClassworkFeedback][req=${reqId}][stream] onHintClose threw:`,
+            err,
+          );
+        }
+      }
+    },
   });
   // Fires once, as soon as `"correct":true|false` shows up in the stream —
   // usually within the first Gemini chunk since the schema puts `correct`
@@ -1307,6 +1346,21 @@ export async function getClassworkAiFeedbackStream({
     }
   }
 
+  // Same fallback for onHintClose: if the incremental scanner never fired
+  // (fenced JSON, hintStream not first key, malformed stream) still hand
+  // the client the final hint so it can transition out of "checking".
+  if (!hintCloseFired && typeof onHintClose === "function") {
+    hintCloseFired = true;
+    try {
+      onHintClose(String(feedback.hintStream || ""));
+    } catch (err) {
+      console.error(
+        `[ClassworkFeedback][req=${reqId}][stream] fallback onHintClose threw:`,
+        err,
+      );
+    }
+  }
+
   setImmediate(() => {
     recordAiTokenUsage(usageMetadata, {
       sessionId,
@@ -1340,149 +1394,3 @@ export async function getClassworkAiFeedbackStream({
   return feedback;
 }
 
-// Fast-hint call: plain-text, no responseSchema, no thinkingConfig, tight
-// output cap. Runs in parallel with the full structured call so the student
-// sees a 1-2 sentence live hint in ~1-2s instead of waiting the full 4-9s
-// for the structured JSON to complete. Uses the fallback (smaller) model
-// so it's both faster and cheaper than the primary reasoning model.
-// The authoritative structured hintStream still overwrites this on the
-// server side before persistence — this exists purely to hide latency.
-export async function getClassworkAiFastHint({
-  questionText,
-  answer,
-  correctAnswer,
-  questionImage,
-  format,
-  studentName,
-  teacherId,
-  onHintDelta,
-}) {
-  const reqId = newReqId();
-  // Fast-hint uses a DEDICATED compact system prompt (`classwork.fastHintSystem`)
-  // instead of the full aiHintPrompt. The full prompt carries thousands of tokens
-  // of JSON/LaTeX/schema guidance that fast-hint doesn't need (plain-text output),
-  // and every one of those tokens rides prefill on every call. Swapping to the
-  // ~120-token distillation cuts Gemini's time-to-first-character noticeably.
-  // Teacher prompt is still layered in for per-teacher voice — it's typically
-  // short, and the explicit prompt cache below still scopes per (teacher, model)
-  // so voice differences don't fragment the cache further than they already did.
-  const [MODEL, FALLBACK_MODEL, fastHintSystemText, teacherPrompt] = await Promise.all([
-    getAiModel(),
-    getAiModel("fallback"),
-    getAiDirective("classwork.fastHintSystem"),
-    getTeacherPromptCached(teacherId),
-  ]);
-  // Prefer fallback (flash-lite) — it's a 1-sentence hint, no reasoning needed.
-  const fastModel = FALLBACK_MODEL || MODEL;
-
-  const systemInstruction = [fastHintSystemText, teacherPrompt].filter(Boolean).join("\n\n");
-
-  // For fast-hint, only pay for image OCR when the format genuinely needs
-  // it (handwriting / image-based answers). Text/MCQ/fill-blanks questions
-  // with a decorative image get zero benefit from shipping ~200KB base64
-  // to Gemini for a one-sentence nudge — and pay for it in prefill time.
-  const answerImageSource = getAnswerImageSource(answer);
-  const needsImageOcr = format === "handwriting" || Boolean(answerImageSource);
-  const includeRawQuestionImage = needsImageOcr && Boolean(questionImage);
-  const [questionImageData, answerImageData] = await Promise.all([
-    includeRawQuestionImage ? sourceToInlineData(questionImage).catch(() => null) : null,
-    answerImageSource ? sourceToInlineData(answerImageSource).catch(() => null) : null,
-  ]);
-
-  // OUTPUT rules live in the system prompt (`classwork.fastHintSystem`)
-  // now — don't duplicate them here on every submission.
-  const promptText = [
-    studentName ? `Student name: ${studentName}` : null,
-    `Question: ${questionText || ""}`,
-    format ? `Answer Format: ${format}` : null,
-    correctAnswer
-      ? `Reference / Correct Answer: ${formatCorrectAnswerForPrompt(correctAnswer)}`
-      : null,
-    `Student Answer: ${normalizeAnswerText(answer) || "[No text provided]"}`,
-    includeRawQuestionImage ? "A question image is attached." : null,
-    answerImageSource ? "A student answer image is attached." : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const parts = [];
-  if (questionImageData) {
-    parts.push({ text: "Question image:" });
-    parts.push({
-      inlineData: { data: questionImageData.base64, mimeType: questionImageData.mimeType },
-    });
-  }
-  if (answerImageData) {
-    parts.push({ text: "Student answer image:" });
-    parts.push({
-      inlineData: { data: answerImageData.base64, mimeType: answerImageData.mimeType },
-    });
-  }
-  parts.push({ text: promptText });
-
-  // Explicit prompt cache: systemInstruction here is standard + teacher
-  // prompt only (no question/solution), so the natural scope is per
-  // (teacher, model) and a single cache entry serves every submission from
-  // every student in every class that teacher runs. Use a sentinel
-  // questionId so the shared cache module keeps fast-hint entries in their
-  // own namespace and question-level invalidation can't sweep them.
-  const cacheResult = await getOrCreateClassworkFeedbackCache({
-    model: fastModel,
-    teacherId,
-    questionId: "__fast_hint__",
-    systemInstruction,
-    tag: `FastHint:${reqId}`,
-  });
-
-  // 120 tokens ≈ 90 words, plenty for a 1-2 sentence nudge. Was 180 —
-  // the extra 60-token headroom just let the model wander longer before
-  // hitting its own stop rather than adding useful content.
-  const config = cacheResult.ok
-    ? {
-        cachedContent: cacheResult.name,
-        thinkingConfig: { thinkingBudget: 0 },
-        maxOutputTokens: 120,
-      }
-    : {
-        systemInstruction,
-        thinkingConfig: { thinkingBudget: 0 },
-        maxOutputTokens: 120,
-      };
-
-  const apiStartMs = Date.now();
-  console.log(
-    `[FastHint][req=${reqId}] AI fast hint API start (model=${fastModel}, cache=${cacheResult.ok ? (cacheResult.reused ? "hit" : "created") : `miss:${cacheResult.reason || "unknown"}`}): ${new Date(apiStartMs).toISOString()}`,
-  );
-
-  let hintText = "";
-  try {
-    const stream = await ai.models.generateContentStream({
-      model: fastModel,
-      contents: [{ role: "user", parts }],
-      config,
-    });
-    for await (const chunk of stream) {
-      const piece = chunk?.text ?? "";
-      if (piece) {
-        hintText += piece;
-        if (typeof onHintDelta === "function") {
-          try {
-            onHintDelta(piece);
-          } catch (err) {
-            console.error(`[FastHint][req=${reqId}] onHintDelta threw:`, err);
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`[FastHint][req=${reqId}] stream failed:`, err?.message || err);
-    throw err;
-  }
-
-  const apiEndMs = Date.now();
-  console.log(
-    `[FastHint][req=${reqId}] AI fast hint API end: ${new Date(apiEndMs).toISOString()} (duration ${apiEndMs - apiStartMs}ms, chars=${hintText.length})`,
-  );
-
-  return hintText.trim();
-}
