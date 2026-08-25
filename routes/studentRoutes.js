@@ -14,10 +14,15 @@ import {
   getStudentDashboard,
   getClassroomsByStudentId,
 } from "../controllers/studentController.js";
+import {
+  bulkCreateStudents,
+  excelUploadMiddleware,
+} from "../controllers/adminDashboardController.js";
 import auth_key_header from "../middleware/auth_key_header.js";
 import auth_token from "../middleware/auth_token.js";
 import auth_admin from "../middleware/auth_admin.js";
 import checkRoles from "../middleware/check_roles.js";
+import { requireFeatureFlag } from "../middleware/requirePlan.js";
 
 const router = express.Router();
 // Helper to allow only teacher or admin
@@ -29,6 +34,29 @@ const allowTeacherOrAdmin = (req, res, next) => {
     .status(403)
     .json({ message: "Access denied. Teacher or Admin only." });
 };
+
+// POST /api/students/bulk-upload
+// Teacher-scoped Excel/Google Sheets import. Students created here are
+// attributed to the teacher via `referedBy: req.user._id` (already done
+// by bulkCreateStudents). Same body shape as the admin endpoint:
+// multipart file OR JSON { excelUrl }. Gated by the `excelImport`
+// feature flag on the teacher's plan; also enforces `maxStudents` cap
+// inside the controller.
+router.post(
+  "/bulk-upload",
+  auth_key_header,
+  auth_token,
+  (req, res, next) => {
+    const role = req.user?.userRole;
+    if (role === "teacher" || role === "admin") return next();
+    return res
+      .status(403)
+      .json({ error: "Access denied. Teacher or Admin only." });
+  },
+  requireFeatureFlag("excelImport"),
+  excelUploadMiddleware,
+  bulkCreateStudents
+);
 
 router.post("/start", auth_key_header, auth_token, startAssignment);
 router.post("/submit", auth_key_header, auth_token, submitAssignment);
