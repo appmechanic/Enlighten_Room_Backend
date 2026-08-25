@@ -4,13 +4,32 @@ import cors from "cors";
 import multer from "multer";
 import bodyParser from "body-parser";
 import cron from "node-cron";
-import helmet from "helmet";
-import compression from "compression";
-import morgan from "morgan";
-import rateLimit from "express-rate-limit";
 dotenv.config();
 import fs from "fs";
 import mongoose from "mongoose";
+
+// Hardening middlewares are loaded dynamically so the server still boots
+// on a checkout where `npm install` hasn't been re-run since they were
+// added to package.json. Each returns null when missing; the wiring
+// below no-ops for anything that failed to load. Recommended: run
+// `npm install` to enable them all.
+async function optionalImport(name) {
+  try {
+    const mod = await import(name);
+    return mod.default ?? mod;
+  } catch {
+    console.warn(
+      `[app] Optional middleware "${name}" not installed — skipping. Run \`npm install\` to enable it.`
+    );
+    return null;
+  }
+}
+const [helmet, compression, morgan, rateLimit] = await Promise.all([
+  optionalImport("helmet"),
+  optionalImport("compression"),
+  optionalImport("morgan"),
+  optionalImport("express-rate-limit"),
+]);
 import authRoutes from "./routes/auth.js";
 import userRoutes from "./routes/user.js";
 import keysRoutes from "./routes/keys.js";
@@ -79,12 +98,14 @@ app.set("trust proxy", 1);
 // Security headers. `crossOriginResourcePolicy` is relaxed so /uploads
 // static assets can be embedded from the FrontEnd origin (video app +
 // React admin run on different ports/subdomains than the API).
-app.use(
-  helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" },
-    contentSecurityPolicy: false, // API server; CSP set by frontends
-  })
-);
+if (helmet) {
+  app.use(
+    helmet({
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+      contentSecurityPolicy: false, // API server; CSP set by frontends
+    })
+  );
+}
 
 // CORS: whitelist from env (comma-separated). Empty/missing → allow all
 // (dev default). Never leaves prod without CORS_ORIGINS set — the boot
@@ -105,25 +126,29 @@ app.use(
   })
 );
 
-app.use(compression());
-app.use(
-  morgan(process.env.NODE_ENV === "production" ? "combined" : "dev", {
-    // Health-check spam pollutes logs; skip 2xx GETs on /health.
-    skip: (req, res) => req.path === "/health" && res.statusCode < 400,
-  })
-);
+if (compression) app.use(compression());
+if (morgan) {
+  app.use(
+    morgan(process.env.NODE_ENV === "production" ? "combined" : "dev", {
+      // Health-check spam pollutes logs; skip 2xx GETs on /health.
+      skip: (req, res) => req.path === "/health" && res.statusCode < 400,
+    })
+  );
+}
 
 // Baseline rate limit for /api. Chosen to be permissive — teachers on a
 // classwork panel can burst hundreds of small requests. Tighter limits
 // live on the individual routes that need them (auth, AI, payments).
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: Number(process.env.RATE_LIMIT_MAX_PER_MIN || 300),
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests, please slow down." },
-});
-app.use("/api", apiLimiter);
+if (rateLimit) {
+  const apiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: Number(process.env.RATE_LIMIT_MAX_PER_MIN || 300),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests, please slow down." },
+  });
+  app.use("/api", apiLimiter);
+}
 
 // Increase payload size limits (adjust as needed)
 app.use(express.json({ limit: "50mb" }));
