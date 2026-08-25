@@ -39,13 +39,26 @@ export const createPlan = async (req, res) => {
 // READ all plans. Accepts ?category=individual|school to segment the results
 // for the signed-in user (teachers see individual, school admins see school).
 // Unrecognised or missing category returns every plan for admin/CMS use.
+//
+// For "individual", legacy docs that predate the planCategory field (i.e.
+// where the field is missing or null) are treated as individual so they
+// still appear on the teacher-facing subscription page. Without this,
+// only newly-created plans render and the page looks empty.
 export const getAllPlans = async (req, res) => {
   try {
     const { category } = req.query;
-    const query =
-      category === "individual" || category === "school"
-        ? { planCategory: category }
-        : {};
+    let query = {};
+    if (category === "individual") {
+      query = {
+        $or: [
+          { planCategory: "individual" },
+          { planCategory: { $exists: false } },
+          { planCategory: null },
+        ],
+      };
+    } else if (category === "school") {
+      query = { planCategory: "school" };
+    }
     const plans = await Plan.find(query);
     res.json(plans);
   } catch (error) {
