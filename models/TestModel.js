@@ -28,6 +28,12 @@ const TestSubmissionSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  // Set the first time `isCompleted` transitions true, so we can dedupe
+  // completion emails and report on when the attempt actually finished
+  // vs. when it was first started.
+  completedAt: {
+    type: Date,
+  },
   questions: [
     {
       type: mongoose.Schema.Types.ObjectId,
@@ -45,6 +51,12 @@ const TestSubmissionSchema = new mongoose.Schema({
   fullscreenExits: {
     type: [FullscreenExitSchema],
     default: [],
+  },
+  // Set the first time this submission crosses FULLSCREEN_EXIT_ALERT_THRESHOLD
+  // and a parent email is dispatched. Presence prevents re-sending the
+  // alert on every subsequent exit for the same submission.
+  parentAlertSentAt: {
+    type: Date,
   },
 });
 

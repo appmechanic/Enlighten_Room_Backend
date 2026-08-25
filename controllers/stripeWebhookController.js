@@ -72,6 +72,49 @@ const findUserByCustomerId = async (customerId) => {
 };
 
 /**
+ * Resolve a Plan from a Stripe price ID. The Plan schema stores separate
+ * fields for the monthly / yearly Stripe price IDs, and legacy code also
+ * populated `stripePriceId`, so try all three before giving up. Returns
+ * null when no plan matches — callers already handle that.
+ */
+const findPlanByStripePriceId = async (priceId) => {
+  if (!priceId) return null;
+  return Plan.findOne({
+    $or: [
+      { stripePriceMonthly: priceId },
+      { stripePriceYearly: priceId },
+      { stripePriceId: priceId },
+    ],
+  });
+};
+
+/**
+ * Extract add-on identifiers from a Stripe Subscription. Convention:
+ *   - The FIRST item on the subscription is the base plan.
+ *   - Any additional item is an add-on. Prefer `price.lookup_key` or
+ *     `price.nickname` as the human-readable id (matches how add-ons are
+ *     displayed in the pricing page); fall back to the price id so we
+ *     always record something.
+ *   - Extra guard: if `price.metadata.addOn === "true"` and the item was
+ *     the first, still record it. Handles pure-add-on subscriptions.
+ */
+const extractAddons = (subscription) => {
+  const items = subscription?.items?.data || [];
+  if (!items.length) return [];
+  const addons = [];
+  items.forEach((item, idx) => {
+    const price = item?.price || {};
+    const isMarkedAddon =
+      String(price.metadata?.addOn || "").toLowerCase() === "true";
+    if (idx === 0 && !isMarkedAddon) return; // base plan
+    const id = price.lookup_key || price.nickname || price.id;
+    if (id) addons.push(String(id));
+  });
+  // De-dupe while preserving order.
+  return [...new Set(addons)];
+};
+
+/**
  * Update transaction status
  */
 const updateTransactionStatus = async (externalId, status, details = {}) => {
@@ -400,9 +443,10 @@ async function handleSubscriptionCreated(event) {
 
     const item = subscription.items?.data?.[0];
     const priceId = item?.price?.id;
-    const plan = await Plan.findOne({ stripePriceId: priceId });
+    const plan = await findPlanByStripePriceId(priceId);
     const mappedStatus = mapStripeStatus(subscription.status);
     const frequency = mapStripeFrequency(item?.price?.recurring?.interval);
+    const addons = extractAddons(subscription);
 
     // The checkout-completion handler in paymentController already upserts
     // the local Subscription with all required fields. If a row exists for
@@ -427,6 +471,7 @@ async function handleSubscriptionCreated(event) {
       existing.providerSubscriptionId = subscription.id;
       if (plan?._id) existing.planType = plan._id;
       existing.frequency = frequency;
+      existing.addons = addons;
       existing.cancelledAt = mappedStatus === "cancelled" ? new Date() : null;
       saved = await existing.save();
     } else if (plan?._id) {
@@ -438,6 +483,7 @@ async function handleSubscriptionCreated(event) {
         frequency,
         provider: "stripe",
         providerSubscriptionId: subscription.id,
+        addons,
       });
     } else {
       console.warn(
@@ -490,15 +536,17 @@ async function handleSubscriptionUpdated(event) {
 
     const item = subscription.items?.data?.[0];
     const priceId = item?.price?.id;
-    const plan = await Plan.findOne({ stripePriceId: priceId });
+    const plan = await findPlanByStripePriceId(priceId);
     const mappedStatus = mapStripeStatus(subscription.status);
     const frequency = mapStripeFrequency(item?.price?.recurring?.interval);
+    const addons = extractAddons(subscription);
 
     const update = {
       status: mappedStatus,
       provider: "stripe",
       providerSubscriptionId: subscription.id,
       frequency,
+      addons,
       cancelledAt: subscription.canceled_at
         ? new Date(subscription.canceled_at * 1000)
         : mappedStatus === "cancelled"

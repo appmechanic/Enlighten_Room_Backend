@@ -18,6 +18,15 @@ import {
 import { generateTestFeedback } from "../utils/geminiTestFeedback.js";
 import { generateTestClassReport } from "../utils/geminiTestClassReport.js";
 import User from "../models/user.js";
+import { sendEmail } from "../utils/sendEmail.js";
+import { focusAlertTemplate } from "../utils/focusAlertTemplate.js";
+
+// Repeated fullscreen exits during a proctored test are a strong integrity
+// signal. Fire a parent email once the student crosses this threshold; the
+// same submission won't re-notify (guarded by parentAlertSentAt).
+const FULLSCREEN_EXIT_ALERT_THRESHOLD = Number(
+  process.env.FULLSCREEN_EXIT_ALERT_THRESHOLD || 3
+);
 
 // Runs one-shot: reads every submission's aggregated feedback, calls the
 // class-report util, and writes {generatedAt, body} onto the task doc.
@@ -589,11 +598,64 @@ export const submitTestQuestion = async (req, res) => {
     // Mark completed when the student has submitted every question in the
     // task. Downstream (class-report cron) can then treat this student as
     // "final".
-    if (submission.questions.length >= (task.questions || []).length) {
+    const justCompleted =
+      submission.questions.length >= (task.questions || []).length &&
+      !submission.isCompleted;
+    if (justCompleted) {
       submission.isCompleted = true;
+      submission.completedAt = new Date();
     }
 
     await testDoc.save();
+
+    // Test-completion emails: fire once, at the moment the student finishes
+    // every question. Sends to the student and (when present) the parent so
+    // both have a record of the attempt. Fire-and-forget — student sees the
+    // 200 immediately, mail runs in the background.
+    if (justCompleted) {
+      (async () => {
+        try {
+          const student = await User.findById(studentId)
+            .populate("parentId", "email firstName lastName")
+            .select("firstName lastName email parentId")
+            .lean();
+          if (!student) return;
+          const studentName = `${student.firstName || ""} ${
+            student.lastName || ""
+          }`.trim() || "Student";
+          const testTitle = testDoc.title || task?.title || "Test";
+          const questionCount = (task.questions || []).length;
+          const recipients = [
+            student.email,
+            student.parentId?.email,
+          ].filter(Boolean);
+          if (!recipients.length) return;
+          const html = `
+            <h3>Test completed</h3>
+            <p>Hi,</p>
+            <p><strong>${studentName}</strong> has finished the test
+              "<strong>${testTitle}</strong>" (${questionCount} question${
+              questionCount === 1 ? "" : "s"
+            }).</p>
+            <p>Detailed feedback will be available once the test window
+              closes and the teacher releases the report.</p>
+            <p>— Enlighten Room</p>
+          `;
+          for (const to of recipients) {
+            await sendEmail({
+              to,
+              subject: `Test completed: ${testTitle}`,
+              html,
+            });
+          }
+        } catch (mailErr) {
+          console.error(
+            "Test-completion email failed:",
+            mailErr.message
+          );
+        }
+      })();
+    }
 
     // Response is intentionally minimal — no feedback body, no marks. The
     // student only learns their result after the test expires and the
@@ -659,9 +721,55 @@ export const logFullscreenExit = async (req, res) => {
     }
 
     await testDoc.save();
+
+    // Threshold-based parent alert. Fire once per submission — the
+    // `parentAlertSentAt` guard prevents spamming a parent on every
+    // subsequent exit for the same test. Kept fire-and-forget so a slow
+    // SMTP hop doesn't stretch the student-facing request.
+    const exitCount = submission.fullscreenExits.length;
+    if (
+      !returned &&
+      exitCount >= FULLSCREEN_EXIT_ALERT_THRESHOLD &&
+      !submission.parentAlertSentAt
+    ) {
+      submission.parentAlertSentAt = new Date();
+      await testDoc.save();
+      // Look up student + parent emails outside the critical path.
+      (async () => {
+        try {
+          const student = await User.findById(studentId)
+            .populate("parentId", "email firstName lastName")
+            .select("firstName lastName parentId")
+            .lean();
+          const parentEmail = student?.parentId?.email;
+          if (!parentEmail) return;
+          const studentName = `${student.firstName || ""} ${
+            student.lastName || ""
+          }`.trim() || "Your student";
+          const html = focusAlertTemplate({
+            studentName,
+            className: testDoc.title || "the test",
+            occurredAt: Date.now(),
+            reason: "repeated_fullscreen_exit",
+            details: `The student left fullscreen ${exitCount} times during a proctored test.`,
+          });
+          await sendEmail({
+            to: parentEmail,
+            subject: `Focus Alert: ${studentName} left fullscreen during a test`,
+            html,
+          });
+        } catch (mailErr) {
+          console.error(
+            "Fullscreen parent alert email failed:",
+            mailErr.message
+          );
+        }
+      })();
+    }
+
     return res.json({
       ok: true,
-      exitCount: submission.fullscreenExits.length,
+      exitCount,
     });
   } catch (err) {
     console.error("logFullscreenExit error:", err);

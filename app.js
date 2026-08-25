@@ -4,8 +4,13 @@ import cors from "cors";
 import multer from "multer";
 import bodyParser from "body-parser";
 import cron from "node-cron";
+import helmet from "helmet";
+import compression from "compression";
+import morgan from "morgan";
+import rateLimit from "express-rate-limit";
 dotenv.config();
 import fs from "fs";
+import mongoose from "mongoose";
 import authRoutes from "./routes/auth.js";
 import userRoutes from "./routes/user.js";
 import keysRoutes from "./routes/keys.js";
@@ -66,7 +71,60 @@ import currencyRoutes from "./routes/currencyRoutes.js";
 import { fetchAndStoreCurrencyRates } from "./controllers/currencyController.js";
 
 const app = express();
-app.use(cors());
+
+// Trust the first proxy hop (nginx/ALB) so req.ip resolves correctly for
+// rate-limiting and audit logs. Moved above rate-limit init.
+app.set("trust proxy", 1);
+
+// Security headers. `crossOriginResourcePolicy` is relaxed so /uploads
+// static assets can be embedded from the FrontEnd origin (video app +
+// React admin run on different ports/subdomains than the API).
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    contentSecurityPolicy: false, // API server; CSP set by frontends
+  })
+);
+
+// CORS: whitelist from env (comma-separated). Empty/missing → allow all
+// (dev default). Never leaves prod without CORS_ORIGINS set — the boot
+// warning surfaces the misconfig.
+const corsOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (process.env.NODE_ENV === "production" && corsOrigins.length === 0) {
+  console.warn(
+    "WARNING: CORS_ORIGINS is empty in production — allowing all origins"
+  );
+}
+app.use(
+  cors({
+    origin: corsOrigins.length ? corsOrigins : true,
+    credentials: true,
+  })
+);
+
+app.use(compression());
+app.use(
+  morgan(process.env.NODE_ENV === "production" ? "combined" : "dev", {
+    // Health-check spam pollutes logs; skip 2xx GETs on /health.
+    skip: (req, res) => req.path === "/health" && res.statusCode < 400,
+  })
+);
+
+// Baseline rate limit for /api. Chosen to be permissive — teachers on a
+// classwork panel can burst hundreds of small requests. Tighter limits
+// live on the individual routes that need them (auth, AI, payments).
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_MAX_PER_MIN || 300),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please slow down." },
+});
+app.use("/api", apiLimiter);
+
 // Increase payload size limits (adjust as needed)
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
@@ -78,7 +136,6 @@ connectToDatabase();
 createInitialKeyIfNotExists()
   .then(() => console.log("Initial key check completed"))
   .catch((err) => console.error("Error initializing key:", err));
-app.set("trust proxy", true);
 
 // Routes
 app.use("/api/auth", authRoutes);
@@ -211,6 +268,43 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// Graceful shutdown: stop accepting new connections, drain in-flight
+// requests, close the mongoose pool, then exit. Force-exit after
+// SHUTDOWN_TIMEOUT_MS so stuck connections can't wedge the process.
+const shutdown = (signal) => {
+  console.log(`${signal} received — starting graceful shutdown`);
+  server.close(async (err) => {
+    if (err) {
+      console.error("Error closing HTTP server:", err);
+      process.exit(1);
+    }
+    try {
+      await mongoose.connection.close(false);
+      console.log("Mongoose disconnected — exiting");
+      process.exit(0);
+    } catch (dbErr) {
+      console.error("Error closing mongoose connection:", dbErr);
+      process.exit(1);
+    }
+  });
+  setTimeout(() => {
+    console.error("Forcing shutdown after timeout");
+    process.exit(1);
+  }, Number(process.env.SHUTDOWN_TIMEOUT_MS || 15000)).unref();
+};
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// Log-and-continue rather than crash: an unhandled promise rejection is
+// often a bug in one request; the whole server going down starves the
+// other in-flight requests. Combine with an APM (Sentry) later.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
 });
