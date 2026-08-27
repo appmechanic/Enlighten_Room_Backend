@@ -106,14 +106,30 @@ export const getGradedSubmissionBySubAssignmentId = async (req, res) => {
     const { studentId: studentIdQuery } = req.query;
     const userRole = req.user?.userRole || req.user?.role;
 
-    // Query directly by subAssignmentId — each gradedAnswers[] carries its
-    // own subAssignmentId (see studentController.js submitAssignment). This
-    // replaces the previous approach that filtered by `studentId: req.user._id`
-    // (broke the teacher view — a teacher's userId never matches a student's
-    // graded doc) and relied on a populate-`match` hack against a subdoc path
-    // that inconsistently returned assignmentId as null, causing the
-    // downstream post-filter to drop legitimate submissions.
-    const query = { "gradedAnswers.subAssignmentId": subAssignmentId };
+    // Primary lookup is the top-level `subAssignmentId` (added to the schema
+    // so a graded doc can be found directly). Legacy docs saved before that
+    // field existed only carry the parent `assignmentId`; the fallback below
+    // resolves the parent Assignment containing this sub-assignment and
+    // matches against that so historical submissions keep working.
+    let parentAssignmentId = null;
+    try {
+      const parent = await Assignment.findOne(
+        { "assignments._id": subAssignmentId },
+        { _id: 1 },
+      ).lean();
+      parentAssignmentId = parent?._id || null;
+    } catch (_) {
+      /* fall through — primary path still works for new docs */
+    }
+
+    const query = {
+      $or: [
+        { subAssignmentId },
+        ...(parentAssignmentId
+          ? [{ assignmentId: parentAssignmentId, subAssignmentId: { $exists: false } }]
+          : []),
+      ],
+    };
     if (userRole === "student") {
       // Students only ever see their own submission for a sub-assignment.
       query.studentId = userId;

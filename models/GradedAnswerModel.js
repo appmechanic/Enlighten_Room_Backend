@@ -44,6 +44,13 @@ const GradedAnswerSchema = new mongoose.Schema(
       ref: "Assignment",
       required: true,
     },
+    // ID of the specific sub-assignment inside `assignmentId.assignments[]`
+    // that this submission belongs to. Without this the report endpoint has
+    // no way to find "the graded doc for sub-assignment X" — the parent
+    // Assignment may have many sub-assignments and only one was submitted.
+    subAssignmentId: {
+      type: mongoose.Schema.Types.ObjectId,
+    },
     sessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Session",

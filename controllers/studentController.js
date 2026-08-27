@@ -601,6 +601,12 @@ export const submitAssignment = async (req, res) => {
     const gradedDoc = await GradedAnswerModel.create({
       studentId,
       assignmentId: parentAssignment._id,
+      // Persist the sub-assignment ref at the doc level so the report can
+      // look up "the submission for sub-assignment X" directly. Without this
+      // the field lived only inside gradedAnswers[] and was silently dropped
+      // by the schema (see GradedAnswerModel — SingleGradedQuestionSchema
+      // never declared it), leaving reports unable to find the doc.
+      subAssignmentId,
       sessionId: parentAssignment.sessionId,
       classroomId: parentAssignment.classroomId,
       gradedBy: "AI",
