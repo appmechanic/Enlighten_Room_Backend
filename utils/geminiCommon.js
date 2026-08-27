@@ -70,6 +70,20 @@ export async function withGeminiRetry(
   throw lastErr;
 }
 
+// Collapse pathological runaway character sequences the model sometimes emits
+// while trying to "draw" a fill-blanks placeholder — a chain of escaped or
+// raw underscores that grows until it burns the entire output-token budget.
+// The truncation lands mid-string and JSON.parse dies. Collapsing before
+// parse is only a safety net (the real fix is telling the model not to do
+// this — see the fill-blanks constraint in geminiTestGeneration.js), but it
+// keeps a single misbehaving generation from taking down the whole request.
+function sanitizeAiJson(text) {
+  if (!text) return text;
+  return text
+    .replace(/(?:\\_){10,}/g, "___")
+    .replace(/_{20,}/g, "___");
+}
+
 // Defensive JSON parse for Gemini responses. `responseMimeType=application/json`
 // normally guarantees raw JSON, but the model occasionally still wraps output
 // in ```json fences or prepends a stray note — try direct parse first, then
@@ -77,18 +91,19 @@ export async function withGeminiRetry(
 // [tag] so callers can decide whether to throw or degrade.
 export function parseFirstJsonObject(text, { tag } = {}) {
   if (!text) return null;
+  const cleaned = sanitizeAiJson(text);
   try {
-    return JSON.parse(text);
+    return JSON.parse(cleaned);
   } catch {
-    const match = text.match(/\{[\s\S]*\}/);
+    const match = cleaned.match(/\{[\s\S]*\}/);
     if (!match) {
-      if (tag) console.error(`[${tag}] No JSON object in response:`, text);
+      if (tag) console.error(`[${tag}] No JSON object in response:`, cleaned);
       return null;
     }
     try {
       return JSON.parse(match[0]);
     } catch (err) {
-      if (tag) console.error(`[${tag}] JSON parse failed:`, err, text);
+      if (tag) console.error(`[${tag}] JSON parse failed:`, err, cleaned);
       return null;
     }
   }

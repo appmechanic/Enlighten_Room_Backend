@@ -8,7 +8,11 @@ import Assignment from "../models/AssignmentModel.js";
 import Classroom from "../models/classroomModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Pin baseURL explicitly — see ai-grader.js for the incident context.
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: "https://api.openai.com/v1",
+});
 export const getAllGradedSubmissions = async (req, res) => {
   try {
     // const userId = req.user?._id;

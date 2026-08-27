@@ -1,5 +1,9 @@
 import { OpenAI } from "openai";
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Pin baseURL explicitly — see ai-grader.js for the incident context.
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: "https://api.openai.com/v1",
+});
 
 export const generateAIQuestions = async ({
   numberOfQuestions,

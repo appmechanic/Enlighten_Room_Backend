@@ -1,7 +1,14 @@
 import { OpenAI } from "openai";
 import TeacherAIConfig from "../../models/teacherAiConfigModel.js";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Pin baseURL explicitly so a stray OPENAI_BASE_URL env var in the deployment
+// can't silently reroute grading calls to a proxy that doesn't expose gpt-4o.
+// That misconfig produced 404 "no body" errors from a Google Frontend and
+// blocked student assignment submissions entirely — see the prior incident.
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: "https://api.openai.com/v1",
+});
 
 export async function gradeDynamic(
   questionsWithAnswers = [],
@@ -132,13 +139,28 @@ ONLY return pure JSON array as output. Do not include any comments or markdown.`
 ${formattedInput}
 `;
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  });
+  let response;
+  try {
+    response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+  } catch (err) {
+    // Grader failed — most commonly a 4xx from OpenAI (bad key, wrong model,
+    // hijacked baseURL). Log the specific failure and DEGRADE GRACEFULLY:
+    // return the same empty-graded shape the JSON-parse failure path uses
+    // below. This lets submitAssignment persist the student's submission
+    // without a grade instead of hard-erroring the whole POST — a teacher
+    // (or a later re-grade) can still assign scores.
+    console.error(
+      `ai-grader: OpenAI call failed (status=${err?.status ?? "n/a"}, baseURL=${openai.baseURL}, model=gpt-4o):`,
+      err?.message || err,
+    );
+    return { graded: [], overall_remarks: "" };
+  }
 
   try {
     const content = response.choices[0].message.content;

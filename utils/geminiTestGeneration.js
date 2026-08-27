@@ -173,6 +173,11 @@ export async function generateTestQuestions({
     standardPrompt,
     teacherPrompt,
     classroomPrompt,
+    // Placeholder guard: without this the model has been observed to render
+    // a fill-blanks blank as a runaway chain of `\_\_\_...` LaTeX escapes,
+    // exhausting the output-token budget and truncating the JSON mid-string.
+    // Pin the placeholder shape so it can never enter that state.
+    "For any question with format \"fill-blanks\": render EACH blank in `questionText` as EXACTLY three ASCII underscores `___`. Never use more than three. Never use LaTeX-escaped underscores like `\\_`. The `blanks[]` array carries the label for each blank in order.",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -197,6 +202,11 @@ export async function generateTestQuestions({
           systemInstruction,
           responseMimeType: "application/json",
           responseSchema: QUESTION_RESPONSE_SCHEMA,
+          // Hard ceiling. A well-formed response for the largest realistic test
+          // fits in ~12k tokens; capping at 16k means a runaway generation
+          // (see the fill-blanks placeholder guard in systemInstruction above)
+          // fails fast on the API side instead of after burning 60k+ tokens.
+          maxOutputTokens: 16384,
         },
       }),
     {
