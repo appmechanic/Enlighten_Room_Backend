@@ -99,16 +99,30 @@ export const getAllGradedSubmissions = async (req, res) => {
 export const getGradedSubmissionBySubAssignmentId = async (req, res) => {
   try {
     const userId = req.user?._id;
-    console.log("userId", userId);
-
     if (!userId) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
     const { subAssignmentId } = req.params;
+    const { studentId: studentIdQuery } = req.query;
+    const userRole = req.user?.userRole || req.user?.role;
 
-    const submissions = await GradedAnswerModel.find({
-      studentId: userId,
-    })
+    // Query directly by subAssignmentId — each gradedAnswers[] carries its
+    // own subAssignmentId (see studentController.js submitAssignment). This
+    // replaces the previous approach that filtered by `studentId: req.user._id`
+    // (broke the teacher view — a teacher's userId never matches a student's
+    // graded doc) and relied on a populate-`match` hack against a subdoc path
+    // that inconsistently returned assignmentId as null, causing the
+    // downstream post-filter to drop legitimate submissions.
+    const query = { "gradedAnswers.subAssignmentId": subAssignmentId };
+    if (userRole === "student") {
+      // Students only ever see their own submission for a sub-assignment.
+      query.studentId = userId;
+    } else if (studentIdQuery) {
+      // Teachers/parents can narrow to one student via ?studentId=…
+      query.studentId = studentIdQuery;
+    }
+
+    const submissions = await GradedAnswerModel.find(query)
       .populate({
         path: "gradedAnswers.questionId",
         model: "Question",
@@ -117,37 +131,11 @@ export const getGradedSubmissionBySubAssignmentId = async (req, res) => {
       })
       .populate({
         path: "assignmentId",
-        match: {
-          "assignments._id": subAssignmentId,
+        populate: {
+          path: "assignments",
+          select:
+            "title description dueDate duration resources maxMarks questions createdAt updatedAt",
         },
-        populate: [
-          {
-            path: "assignments",
-            match: { _id: subAssignmentId },
-            select:
-              "title description dueDate duration resources maxMarks questions createdAt updatedAt",
-            // populate: [
-            // {
-            //   path: "questions",
-            //   model: "Question",
-            //   select:
-            //     "course topic questionText type options correctAnswer hints fineTuningInstructions createdAt updatedAt",
-            // },
-            // {
-            //   path: "studentIds",
-            //   model: "User",
-            //   select:
-            //     "firstName lastName email userName phone image userRole city state country streetAddress zip parentId",
-            //   populate: {
-            //     path: "parentId",
-            //     model: "User",
-            //     select:
-            //       "firstName lastName email userName phone image userRole city state country streetAddress zip",
-            //   },
-            // },
-            // ],
-          },
-        ],
       })
       .populate("studentId", "firstName lastName email city userName parentId")
       .populate("sessionId", "sessionDate topic notes createdAt")
@@ -169,26 +157,16 @@ export const getGradedSubmissionBySubAssignmentId = async (req, res) => {
           },
         ],
       })
-
       .lean();
 
-    const filteredSubmissions = submissions.filter(
-      (submission) =>
-        submission.assignmentId &&
-        submission.assignmentId.assignments &&
-        submission.assignmentId.assignments.some(
-          (sub) => sub._id.toString() === subAssignmentId
-        )
-    );
-
-    if (filteredSubmissions.length === 0) {
+    if (submissions.length === 0) {
       return res.status(404).json({
         success: false,
         message: "No submissions found for the given sub-assignment ID",
       });
     }
 
-    res.status(200).json({ success: true, data: filteredSubmissions });
+    res.status(200).json({ success: true, data: submissions });
   } catch (error) {
     console.error(
       "Error fetching graded submission by sub-assignment ID:",
