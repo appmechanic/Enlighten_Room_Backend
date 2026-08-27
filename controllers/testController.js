@@ -17,6 +17,8 @@ import {
 } from "../utils/geminiAssignmentImage.js";
 import { generateTestFeedback } from "../utils/geminiTestFeedback.js";
 import { generateTestClassReport } from "../utils/geminiTestClassReport.js";
+import GradedTestAnswerModel from "../models/GradedTestAnswerModel.js";
+import GradeSetting from "../models/GradeSetting.js";
 import User from "../models/user.js";
 import { sendEmail } from "../utils/sendEmail.js";
 import { focusAlertTemplate } from "../utils/focusAlertTemplate.js";
@@ -552,18 +554,34 @@ export const submitTestQuestion = async (req, res) => {
       student = null;
     }
 
-    const feedback = await generateTestFeedback({
-      teacherId: testDoc.teacherId,
-      studentName: student?.name || "",
-      question: {
-        text: questionDoc.questionText,
-        format: questionDoc.type,
-        correctAnswer: questionDoc.correctAnswer,
-        solution: questionDoc.solution,
-      },
-      studentAnswer: answer,
-      fullMarks: perQFull,
-    });
+    // Empty submissions bypass the AI — same short-circuit as the Assignment
+    // path. Without this Gemini has been rubber-stamping blank answers as
+    // "correct" and awarding full marks.
+    const answerText = Array.isArray(answer)
+      ? answer.join(", ").trim()
+      : String(answer ?? "").trim();
+    let feedback;
+    if (answerText === "") {
+      feedback = {
+        marksAwarded: 0,
+        correctBeforeStuck: "",
+        stuckOn: "No answer provided",
+        practiceAdvice: "No answer submitted.",
+      };
+    } else {
+      feedback = await generateTestFeedback({
+        teacherId: testDoc.teacherId,
+        studentName: student?.name || "",
+        question: {
+          text: questionDoc.questionText,
+          format: questionDoc.type,
+          correctAnswer: questionDoc.correctAnswer,
+          solution: questionDoc.solution,
+        },
+        studentAnswer: answer,
+        fullMarks: perQFull,
+      });
+    }
 
     // Compose feedback rollup on the submission doc. `feedback` is kept as a
     // human-readable running log so the class-report generator can slice on
@@ -607,6 +625,117 @@ export const submitTestQuestion = async (req, res) => {
     }
 
     await testDoc.save();
+
+    // Persist a per-question grade row so the student panel + details page
+    // can render score cards without parsing the human-readable feedback
+    // log. Uses the same shape as GradedAnswerModel to keep the UI mirrors
+    // simple. `upsert` because the submission is built one question at a
+    // time and this handler runs per-question.
+    try {
+      const submittedAnswerArray = Array.isArray(answer)
+        ? answer.map((s) => String(s ?? "").trim())
+        : answerText
+        ? [answerText]
+        : [];
+      const correctAnswerArray = Array.isArray(questionDoc.correctAnswer)
+        ? questionDoc.correctAnswer.map((s) => String(s ?? "").trim())
+        : [];
+      const marksAwarded = Number(feedback.marksAwarded) || 0;
+      await GradedTestAnswerModel.updateOne(
+        { studentId, taskId: task._id },
+        {
+          $setOnInsert: {
+            studentId,
+            testId: testDoc._id,
+            taskId: task._id,
+            sessionId: testDoc.sessionId,
+            classroomId: testDoc.classroomId,
+            teacherId: testDoc.teacherId,
+            gradedBy: "AI",
+          },
+          $push: {
+            gradedAnswers: {
+              questionId,
+              submittedAnswer: submittedAnswerArray,
+              correctAnswer: correctAnswerArray,
+              isCorrect: marksAwarded >= perQFull,
+              score: marksAwarded,
+              maxScore: perQFull,
+              feedback: [
+                answerText === "" ? "No answer submitted." : "",
+                feedback.practiceAdvice || "",
+              ]
+                .filter(Boolean)
+                .join(" ")
+                .trim(),
+            },
+          },
+        },
+        { upsert: true },
+      );
+
+      // On the last question flip status + fill in aggregate stats. Load
+      // the whole doc so the aggregate calculation works off the fresh
+      // gradedAnswers array (updateOne pushes are not observable in
+      // memory).
+      if (justCompleted) {
+        const graded = await GradedTestAnswerModel.findOne({
+          studentId,
+          taskId: task._id,
+        });
+        if (graded) {
+          const totalQuestions = graded.gradedAnswers.length;
+          const correctCount = graded.gradedAnswers.filter(
+            (a) => a.isCorrect,
+          ).length;
+          const totalScore = graded.gradedAnswers.reduce(
+            (s, a) => s + (Number(a.score) || 0),
+            0,
+          );
+          const maxScore = graded.gradedAnswers.reduce(
+            (s, a) => s + (Number(a.maxScore) || 0),
+            0,
+          );
+          const percentage =
+            maxScore > 0
+              ? parseFloat(((totalScore / maxScore) * 100).toFixed(2))
+              : 0;
+          let grade = "Grades not defined";
+          try {
+            const setting = await GradeSetting.findOne({
+              teacherId: testDoc.teacherId,
+            });
+            if (setting && Array.isArray(setting.grades)) {
+              const match = setting.grades.find(
+                (g) =>
+                  percentage >= g.minPercent && percentage <= g.maxPercent,
+              );
+              if (match) grade = match.letter;
+            }
+          } catch {
+            /* grade defaults handled above */
+          }
+          graded.totalQuestions = totalQuestions;
+          graded.correctCount = correctCount;
+          graded.incorrectCount = totalQuestions - correctCount;
+          graded.percentage = String(percentage);
+          graded.grade = grade;
+          await graded.save();
+        }
+
+        // Flip the sub-task status the same way the Assignment path does
+        // so the student panel can render "graded" instead of stuck-at-
+        // "pending" once the last question lands.
+        await Test.updateOne(
+          { "tests._id": task._id },
+          { $set: { "tests.$.testStatus": "graded" } },
+        );
+      }
+    } catch (gradeErr) {
+      console.error("submitTestQuestion: grade persist failed:", gradeErr);
+      // Do not fail the submission — the human-readable feedback log on
+      // TestSubmissionSchema is still populated and downstream reports work.
+    }
 
     // Test-completion emails: fire once, at the moment the student finishes
     // every question. Sends to the student and (when present) the parent so
@@ -843,6 +972,169 @@ export const triggerTestClassReport = async (req, res) => {
     return res.json({ ok: true, classReport: report });
   } catch (err) {
     console.error("triggerTestClassReport error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/test/student/:studentId/classroom/:classroomId
+// Mirrors getStudentAssignmentsByClassroom — returns every Test task the
+// student is assigned to in this classroom, with score/grade/submittedAt
+// attached from GradedTestAnswerModel. Correct answers are stripped from
+// the questions (spec: students never see the answer while the test is
+// live).
+export const getStudentTestsByClassroom = async (req, res) => {
+  const { studentId, classroomId } = req.params;
+  if (!studentId || !classroomId) {
+    return res.status(400).json({
+      error: "Both studentId and classroomId are required",
+    });
+  }
+  try {
+    const tests = await Test.find({
+      classroomId,
+      "tests.studentIds": studentId,
+    })
+      .populate("classroomId")
+      .populate("sessionId")
+      .populate("teacherId", "firstName lastName email")
+      .populate("tests.questions");
+
+    if (!tests || tests.length === 0) {
+      return res.status(200).json({
+        message: `No tests found for student in this classroom`,
+        count: 0,
+        assignments: [],
+      });
+    }
+
+    const allTaskIds = tests.flatMap((doc) =>
+      doc.tests.map((t) => t._id),
+    );
+    const gradedDocs = await GradedTestAnswerModel.find({
+      studentId,
+      taskId: { $in: allTaskIds },
+    })
+      .select(
+        "taskId percentage grade totalQuestions correctCount incorrectCount overall_remarks createdAt",
+      )
+      .lean();
+    const gradedByTaskId = new Map(
+      gradedDocs.map((g) => [String(g.taskId), g]),
+    );
+
+    const studentTests = [];
+    tests.forEach((testDoc) => {
+      const {
+        classroomId: cls,
+        sessionId,
+        teacherId,
+        _id: parentTestId,
+      } = testDoc;
+      testDoc.tests.forEach((task) => {
+        if (
+          !task.studentIds.some((id) => id.toString() === studentId)
+        )
+          return;
+        const graded = gradedByTaskId.get(String(task._id));
+        // Strip correctAnswer/solution from questions on the pre-submit
+        // path — students shouldn't be able to sniff the answer via
+        // devtools while the test is live. Once graded we surface them
+        // through getStudentTestGradeDetails instead.
+        const strippedQuestions = (task.questions || []).map((q) => {
+          const qObj = q.toObject ? q.toObject() : q;
+          if (graded) return qObj;
+          const { correctAnswer, solution, ...safe } = qObj;
+          return safe;
+        });
+        studentTests.push({
+          testId: parentTestId,
+          taskId: task._id,
+          testStatus: task.testStatus,
+          title: task.title,
+          description: task.description,
+          startDate: task.startDate,
+          expiredDate: task.expiredDate,
+          duration: task.duration,
+          resources: task.resources,
+          maxMarks: task.maxMarks,
+          questions: strippedQuestions,
+          classroomId: cls,
+          sessionId,
+          teacher: teacherId,
+          score: graded?.percentage ?? undefined,
+          grade: graded?.grade ?? undefined,
+          correctCount: graded?.correctCount ?? undefined,
+          totalQuestions: graded?.totalQuestions ?? undefined,
+          submittedAt: graded?.createdAt ?? undefined,
+        });
+      });
+    });
+
+    return res.status(200).json({
+      message: `Tests for student ${studentId} in classroom ${classroomId}`,
+      count: studentTests.length,
+      assignments: studentTests,
+    });
+  } catch (err) {
+    console.error("getStudentTestsByClassroom error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/test/student-grade/:taskId
+// Per-task graded detail — mirrors the report used by
+// StudentAssignmentDetails.jsx. Returns the GradedTestAnswer for the
+// current student plus enough parent metadata (title, dueDate, session,
+// classroom, teacher) to render the page header.
+export const getStudentTestGradeDetails = async (req, res) => {
+  const { taskId } = req.params;
+  const studentId = String(req.user?._id || req.query?.studentId || "");
+  if (!taskId) return res.status(400).json({ error: "taskId is required." });
+  if (!studentId)
+    return res.status(401).json({ error: "Student identity required." });
+
+  try {
+    const graded = await GradedTestAnswerModel.findOne({
+      studentId,
+      taskId,
+    })
+      .populate({
+        path: "gradedAnswers.questionId",
+        select:
+          "questionText type options correctAnswer solution course topic",
+      })
+      .populate("classroomId")
+      .populate("sessionId", "_id topic sessionDate notes sessionUrl")
+      .populate("studentId", "_id firstName lastName email")
+      .populate("teacherId", "_id firstName lastName email")
+      .lean();
+
+    if (!graded) {
+      return res.status(404).json({
+        error: "No graded submission found for this test task yet.",
+      });
+    }
+
+    const testDoc = await Test.findById(graded.testId)
+      .select("tests._id tests.title tests.description tests.expiredDate tests.duration tests.resources tests.maxMarks tests.testStatus")
+      .lean();
+    const task = testDoc?.tests?.find(
+      (t) => String(t._id) === String(taskId),
+    );
+
+    return res.status(200).json({
+      data: [
+        {
+          ...graded,
+          testId: {
+            _id: graded.testId,
+            tests: task ? [task] : [],
+          },
+        },
+      ],
+    });
+  } catch (err) {
+    console.error("getStudentTestGradeDetails error:", err);
     return res.status(500).json({ error: err.message });
   }
 };

@@ -3,6 +3,8 @@ import {
   createTestWithAI,
   getTestsByClassroom,
   getStudentTest,
+  getStudentTestsByClassroom,
+  getStudentTestGradeDetails,
   submitTestQuestion,
   logFullscreenExit,
   triggerTestClassReport,
@@ -42,6 +44,25 @@ router.get(
   auth_key_header,
   auth_token,
   getTestsByClassroom,
+);
+
+// Mirrors GET /api/assignments/:studentId/classroom/:classroomId — used by
+// the student dashboard to render each Test as a card with attached score,
+// grade and submittedAt from GradedTestAnswerModel.
+router.get(
+  "/student/:studentId/classroom/:classroomId",
+  auth_key_header,
+  auth_token,
+  getStudentTestsByClassroom,
+);
+
+// Per-task graded detail (score card + per-question breakdown) used by the
+// student view-details page.
+router.get(
+  "/student-grade/:taskId",
+  auth_key_header,
+  auth_token,
+  getStudentTestGradeDetails,
 );
 
 // Manual/cron trigger for the post-expiry class report. Idempotent.
