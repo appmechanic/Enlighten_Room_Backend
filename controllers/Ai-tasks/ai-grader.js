@@ -1,28 +1,33 @@
-import { OpenAI } from "openai";
+import { GoogleGenAI, Type } from "@google/genai";
+import { withGeminiRetry, parseFirstJsonObject } from "../../utils/geminiCommon.js";
 import TeacherAIConfig from "../../models/teacherAiConfigModel.js";
 
-// Pin baseURL explicitly so a stray OPENAI_BASE_URL env var in the deployment
-// can't silently reroute grading calls to a proxy that doesn't expose gpt-4o.
-// That misconfig produced 404 "no body" errors from a Google Frontend and
-// blocked student assignment submissions entirely — see the prior incident.
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: "https://api.openai.com/v1",
-});
+// Assignment grader. Previously used gpt-4o via OpenAI, but the deployed
+// environment ships a Gemini key (Google AIza…) in OPENAI_API_KEY, so every
+// call 401'd and every submission fell through to the rule-based fallback.
+// Migrating to Gemini keeps this on the single API key the rest of the
+// project already uses (classwork feedback, assignment questions, hints).
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const MODEL = "gemini-2.5-flash";
 
 export async function gradeDynamic(
   questionsWithAnswers = [],
   { includeRemarks = true, teacherId = null } = {}
 ) {
-  // console.log("Grading with AI for questions:", questionsWithAnswers);
+  if (!Array.isArray(questionsWithAnswers) || questionsWithAnswers.length === 0) {
+    return { graded: [], overall_remarks: "" };
+  }
+
+  // Include a stable per-question `id` so the caller matches results back
+  // to the original without relying on exact question-text equality.
   const formattedInput = questionsWithAnswers
     .map(
       (item, index) => `
       ${index + 1}.
+      Question ID: ${item.questionId || item.id || index}
       Question: ${item.question}
-      Question Type: ${
-        item.type || "MCQ"
-      }  // optional, agar tum type bhej rahe ho
+      Question Type: ${item.type || "MCQ"}
       Correct Answer(s): ${
         Array.isArray(item.correctAnswer)
           ? item.correctAnswer.join(" | ")
@@ -34,56 +39,37 @@ export async function gradeDynamic(
     )
     .join("\n");
 
-  // console.log("Formatted Input for AI:", formattedInput);
   const baseRules = `
 You are an expert educator AI. Grade each student answer out of the specified Max Marks.
-You must return a JSON array ONLY (no text or formatting around it). Each item must include:
 
-- "question": the question text exactly as given
-- "answer": the student answer text exactly as given
-- "score": the numeric score
-- "maxMarks": the max possible marks
-- "feedback": brief feedback on the answer
-VERY IMPORTANT ABOUT CORRECTNESS:
+For each question in the input, you will see:
+  - "Question ID: ..."         → an opaque identifier — echo it back verbatim as "id"
+  - "Correct Answer(s): ..."   → the ground truth from the system
+  - "Student Answer: ..."      → what the student wrote
 
-- For each question in the input, you will see:
-  - "Correct Answer(s): ..."  → this is the ground truth from the system
-  - "Student Answer: ..."     → this is what the student wrote
-
-- You MUST treat the provided "Correct Answer(s)" as the ONLY source of truth.
-  - Do NOT use your own knowledge to decide what is correct.
-  - If the student's answer matches one of the "Correct Answer(s)" (case-insensitive, ignoring extra spaces),
-    then it is correct.
-  - If it does NOT match any of the provided "Correct Answer(s)", then it is incorrect.
+You MUST treat the provided "Correct Answer(s)" as the ONLY source of truth.
+Do NOT use your own knowledge to decide what is correct.
 
 Grading rules:
-
 - If question type is MCQ:
-  - Give FULL marks ONLY if the student's answer matches (after trimming spaces and ignoring case)
+  - Full marks ONLY if the student's answer matches (case-insensitive, trim spaces)
     ANY of the provided "Correct Answer(s)".
-  - Otherwise, give 0 marks.
-  - Do NOT mark an answer as wrong if it clearly matches the provided correct answer string.
+  - Otherwise 0 marks.
+- If question type is INPUT / textbox / fill-blanks:
+  - Treat "Correct Answer(s)" as reference.
+  - Give partial marks if the answer is partially correct; use 0, 0.5, 0.7, 1 × maxMarks.
 
-- If question type is INPUT:
-  - If a "Correct Answer(s)" field is present, still treat it as the ground truth reference.
-  - Analyze the correctness and depth of the student's answer.
-  - Give partial marks if the answer is partially correct.
-  - Use your judgment to assign score between 0 and maxMarks.
-  - You may use a scale like 0, 0.5, 0.7, 1 of maxMarks if needed for fairness.
-
-Always follow the provided "Correct Answer(s)" strictly. Never override them with your own knowledge.
+Feedback rules:
+- "feedback" must never be blank. Even when the student is wrong, briefly explain what was expected.
+- Keep feedback to 1–2 short sentences.
 `.trim();
 
-  // 2) Teacher AI config (prompt + style + features)
   let teacherConfigSection = "";
-
   if (teacherId) {
     try {
       const config = await TeacherAIConfig.findOne({ user: teacherId }).lean();
-
       if (config) {
         const { prompt, style, features } = config;
-
         teacherConfigSection = `
 ----------------------------
 Teacher/Tutor custom grading preferences:
@@ -100,97 +86,87 @@ ${features || ""}
       }
     } catch (err) {
       console.error("Error loading TeacherAIConfig:", err);
-      // fail silently, just use base rules
     }
   }
 
-  // Only add the "final remarks object" instruction if includeRemarks is true
-  const remarksAppendix = includeRemarks
-    ? `
-  After all individual question entries, ADD ONE FINAL OBJECT to the array like:
-  {
-    "overall_remarks": "General summary remarks about the student's overall performance based on all answers within 3-5 lines."
-  }
-  `.trim()
-    : ``;
+  const remarksInstruction = includeRemarks
+    ? 'Also fill "overall_remarks" with a 3-5 line summary of the student\'s overall performance.'
+    : 'Leave "overall_remarks" as an empty string.';
 
   const systemPrompt = `${baseRules}
 
 ${teacherConfigSection}
 
-${remarksAppendix}
+${remarksInstruction}
+`.trim();
 
-ONLY return pure JSON array as output. Do not include any comments or markdown.`;
+  const userPrompt = `${systemPrompt}
 
-  const userPrompt = `
-  Below are the student's answers to a task. You Must return JSON array like :
-
-  [
-    {
-      "question": "...",
-      "answer": "...",
-      "score": 0 to Max Marks ,
-      "maxMarks": ...,
-      "feedback": "..."
-    }
-  ]
-
-  Grade the following:
+Grade the following:
 ${formattedInput}
 `;
 
+  // Response schema: an object with a graded[] array + optional remarks so
+  // we don't have to peel a trailing object off a naked array like the old
+  // OpenAI path did.
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      graded: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING, description: "Echo of the input Question ID." },
+            question: { type: Type.STRING },
+            answer: { type: Type.STRING },
+            score: { type: Type.NUMBER },
+            maxMarks: { type: Type.NUMBER },
+            feedback: { type: Type.STRING, description: "1-2 sentences. Never blank." },
+          },
+          required: ["id", "score", "maxMarks", "feedback"],
+        },
+      },
+      overall_remarks: { type: Type.STRING },
+    },
+    required: ["graded"],
+  };
+
   let response;
   try {
-    response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    });
+    response = await withGeminiRetry(
+      () =>
+        ai.models.generateContent({
+          model: MODEL,
+          contents: userPrompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        }),
+      {
+        maxAttempts: 3,
+        baseDelayMs: 500,
+        maxDelayMs: 4000,
+        tag: "ai-grader",
+      }
+    );
   } catch (err) {
-    // Grader failed — most commonly a 4xx from OpenAI (bad key, wrong model,
-    // hijacked baseURL). Log the specific failure and DEGRADE GRACEFULLY:
-    // return the same empty-graded shape the JSON-parse failure path uses
-    // below. This lets submitAssignment persist the student's submission
-    // without a grade instead of hard-erroring the whole POST — a teacher
-    // (or a later re-grade) can still assign scores.
     console.error(
-      `ai-grader: OpenAI call failed (status=${err?.status ?? "n/a"}, baseURL=${openai.baseURL}, model=gpt-4o):`,
+      `ai-grader: Gemini call failed (status=${err?.status ?? "n/a"}, model=${MODEL}):`,
       err?.message || err,
     );
     return { graded: [], overall_remarks: "" };
   }
 
-  try {
-    const content = response.choices[0].message.content;
-
-    // Find the first "[" to locate the JSON array
-    const jsonStart = content.indexOf("[");
-    const jsonText = content.slice(jsonStart);
-
-    // Parse the JSON text
-    const parsed = JSON.parse(jsonText);
-
-    // If remarks were requested, try to peel off the last object
-    let overall_remarks = "";
-    let graded = parsed;
-
-    if (includeRemarks && Array.isArray(parsed) && parsed.length) {
-      const lastItem = parsed[parsed.length - 1];
-      if (
-        lastItem &&
-        typeof lastItem === "object" &&
-        "overall_remarks" in lastItem
-      ) {
-        overall_remarks = lastItem.overall_remarks || "";
-        graded = parsed.slice(0, -1);
-      }
-    }
-
-    return { graded, overall_remarks };
-  } catch (err) {
-    console.error("AI Parse Error:", err);
+  const parsed = parseFirstJsonObject(response?.text, { tag: "ai-grader" });
+  if (!parsed || !Array.isArray(parsed.graded)) {
+    console.error("ai-grader: no parseable graded array in response");
     return { graded: [], overall_remarks: "" };
   }
+  return {
+    graded: parsed.graded,
+    overall_remarks: parsed.overall_remarks || "",
+  };
 }

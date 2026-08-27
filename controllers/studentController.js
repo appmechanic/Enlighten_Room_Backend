@@ -469,27 +469,57 @@ export const submitAssignment = async (req, res) => {
         .json({ error: "Sub-assignment not found inside assignment." });
     }
 
-    // Step 3: Fetch questions and prepare for AI
+    // Step 3: Fetch questions and prepare for AI. Also carry `type` so the
+    // fallback below can rule-match objective formats (MCQ / fill-blanks)
+    // deterministically without needing the AI grader to return.
     const questionsWithAnswers = [];
+    // Blank submissions (no text picked or typed) never go to the AI —
+    // Gemini was rubber-stamping empty answers as "correct" and awarding
+    // full marks. Instead we short-circuit these to score 0 with an honest
+    // feedback line, and only send real attempts to the grader.
+    const emptyAnswerGrades = [];
 
     for (const { questionId, answer: studentAnswer } of answers) {
       const question = await Question.findById(questionId).lean();
       if (!question) continue;
 
+      const joined = Array.isArray(studentAnswer)
+        ? studentAnswer.join(", ")
+        : String(studentAnswer ?? "");
+      if (joined.trim() === "") {
+        emptyAnswerGrades.push({
+          questionId,
+          submittedAnswer: [],
+          correctAnswer: Array.isArray(question.correctAnswer)
+            ? question.correctAnswer.map((s) => String(s).trim())
+            : [],
+          isCorrect: false,
+          score: 0,
+          maxScore: subAssignment.maxMarks || 0,
+          feedback: "No answer submitted.",
+          subAssignmentId,
+        });
+        continue;
+      }
+
       questionsWithAnswers.push({
         question: question.questionText,
-        answer: studentAnswer.join(", "),
+        answer: joined,
         maxMarks: subAssignment.maxMarks,
         questionId,
+        type: question.type || question.format || "",
         correctAnswer: question.correctAnswer || [],
       });
     }
 
     // console.log("questionsWithAnswers prepared:", questionsWithAnswers);
-    // Step 4: Send to AI for grading
-    const aiResults = await gradeDynamic(questionsWithAnswers, {
-      teacherId: parentAssignment.teacherId,
-    });
+    // Step 4: Send to AI for grading (only for questions with real answers)
+    const aiResults =
+      questionsWithAnswers.length > 0
+        ? await gradeDynamic(questionsWithAnswers, {
+            teacherId: parentAssignment.teacherId,
+          })
+        : { graded: [], overall_remarks: "" };
 
     // Step 5: Build gradedAnswers from AI result
     let totalScore = 0;
@@ -499,15 +529,36 @@ export const submitAssignment = async (req, res) => {
     const gradedAnswers = [];
     // remarks =  || "";
 
-    for (const result of aiResults.graded) {
-      // Match using question text only (better: use questionId if AI returns it)
-      const original = questionsWithAnswers.find(
-        (q) => q.question?.trim() === result.question?.trim()
-      );
+    // Normalize question text so LaTeX / whitespace differences between the
+    // model's echo and the stored text don't drop matches. Strips escapes,
+    // collapses whitespace, and lowercases — enough to survive the common
+    // rewrites the model does when a question contains math markup.
+    const normText = (s) =>
+      String(s ?? "")
+        .replace(/\\+/g, " ")
+        .replace(/[`*_~]/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+
+    aiResults.graded.forEach((result, resultIdx) => {
+      // Prefer the stable id we asked the model to echo. Fall back to a
+      // normalized-text match, then to positional order. Positional is safe
+      // because we send the AI questions in the same order we iterate here.
+      const resultId = result.id != null ? String(result.id) : null;
+      let original =
+        (resultId &&
+          questionsWithAnswers.find(
+            (q) => String(q.questionId) === resultId,
+          )) ||
+        questionsWithAnswers.find(
+          (q) => normText(q.question) === normText(result.question),
+        ) ||
+        questionsWithAnswers[resultIdx];
 
       if (!original) {
         console.warn("No match found for result:", result.question);
-        continue;
+        return;
       }
 
       const submittedAnswerArray = result.answer
@@ -530,22 +581,31 @@ export const submitAssignment = async (req, res) => {
         isCorrect,
         score: result.score,
         maxScore: result.maxMarks,
-        feedback: result.feedback,
+        feedback: result.feedback || "",
         subAssignmentId,
       });
-    }
+    });
 
     // Fallback: if the AI grader returned nothing (network failure, parse
-    // failure, or 0 matches after the text-based join above), still persist
-    // the student's raw submission so their assignment shows up in reports.
-    // Without this the GradedAnswerModel doc would land with gradedAnswers=[]
-    // and report screens that filter on submissions would silently hide the
-    // student. Scores default to 0 with "Pending grading" so a teacher (or a
-    // rerun) can fill them in.
+    // failure, or 0 matches after the text-based join above), do our own
+    // rule-based scoring so submissions never land in "Pending grading"
+    // limbo. Objective formats (MCQ / fill-blanks) score deterministically
+    // against the stored correctAnswer; subjective formats
+    // (textbox / handwriting) still fall through to zero + a hint that
+    // manual review is required.
     if (gradedAnswers.length === 0 && questionsWithAnswers.length > 0) {
       console.warn(
-        `submitAssignment: AI grader returned no matches for student=${studentId} subAssignment=${subAssignmentId} — persisting ungraded submission.`,
+        `submitAssignment: AI grader returned no matches for student=${studentId} subAssignment=${subAssignmentId} — running rule-based fallback.`,
       );
+      // Normalize once — strip LaTeX delimiters, backticks and surrounding
+      // whitespace so "True" matches "`True`" and "\\(x\\)" matches "x".
+      const norm = (v) =>
+        String(v ?? "")
+          .replace(/\\[()[\]]/g, "")
+          .replace(/[`*_~]/g, "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
       for (const q of questionsWithAnswers) {
         const submittedAnswerArray = q.answer
           .split(",")
@@ -553,18 +613,53 @@ export const submitAssignment = async (req, res) => {
         const correctAnswerArray = Array.isArray(q.correctAnswer)
           ? q.correctAnswer.map((s) => s?.trim())
           : [];
+
+        let isCorrect = false;
+        let score = 0;
+        let feedback = "Awaiting teacher review.";
+
+        // Whenever a canonical correctAnswer exists — objective or not —
+        // try a normalized exact match so unambiguous answers like "True"
+        // still get scored when the AI grader is unavailable.
+        if (correctAnswerArray.length > 0) {
+          const normSubmitted = submittedAnswerArray.map(norm);
+          const normCorrect = correctAnswerArray.map(norm);
+          const allMatch =
+            normCorrect.length === 1
+              ? normSubmitted.some((s) => s === normCorrect[0])
+              : normCorrect.every(
+                  (c, i) => normSubmitted[i] !== undefined && normSubmitted[i] === c,
+                );
+          if (allMatch) {
+            isCorrect = true;
+            score = q.maxMarks || 0;
+            feedback = "Correct.";
+            correctCount++;
+          } else {
+            feedback = "Incorrect.";
+          }
+        }
+
+        totalScore += score;
         maxScore += q.maxMarks || 0;
         gradedAnswers.push({
           questionId: q.questionId,
           submittedAnswer: submittedAnswerArray,
           correctAnswer: correctAnswerArray,
-          isCorrect: false,
-          score: 0,
+          isCorrect,
+          score,
           maxScore: q.maxMarks || 0,
-          feedback: "Pending grading",
+          feedback,
           subAssignmentId,
         });
       }
+    }
+
+    // Fold in the blank-submission 0s that were held aside above so they
+    // count toward totalQuestions, incorrectCount, and maxScore.
+    for (const g of emptyAnswerGrades) {
+      maxScore += g.maxScore || 0;
+      gradedAnswers.push(g);
     }
 
     const totalQuestions = gradedAnswers.length;
@@ -628,11 +723,15 @@ export const submitAssignment = async (req, res) => {
 
     console.log("Graded submission saved:", populatedGradedDoc);
 
+    // AI (or the rule-based fallback above) has already produced a full
+    // GradedAnswerModel doc with per-question scores, percentage and letter
+    // grade — so flip the sub-assignment straight to "graded". Leaving it as
+    // "submitted" made the student panel render "grade pending" indefinitely.
     await Assignment.updateOne(
       { "assignments._id": subAssignmentId },
       {
         $set: {
-          "assignments.$.assignmentStatus": "submitted",
+          "assignments.$.assignmentStatus": "graded",
         },
       }
     );

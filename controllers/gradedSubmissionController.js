@@ -204,6 +204,12 @@ export const getReportByAssignmentId = async (req, res) => {
 
     const submission = await GradedAnswerModel.findById(id)
       .populate({
+        path: "gradedAnswers.questionId",
+        model: "Question",
+        select:
+          "course topic questionText type options correctAnswer solution hints",
+      })
+      .populate({
         path: "assignmentId",
         model: "Assignment",
         select: "assignments",
@@ -396,9 +402,12 @@ export const getAssignmentsReport = async (req, res) => {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    // 1. Fetch all submissions by student
+    // 1. Fetch all submissions by student. Include studentId in the select
+    // list so the populated student doc actually comes through — the prior
+    // include-mode of just "gradedAnswers overall_remarks" was silently
+    // dropping the populated path and leaving studentDetails empty.
     const submissions = await GradedAnswerModel.find({ studentId: userId })
-      .select("gradedAnswers overall_remarks")
+      .select("gradedAnswers overall_remarks studentId")
       .populate({
         path: "studentId",
         select: "firstName lastName email city userName parentId",
@@ -470,16 +479,26 @@ export const getAssignmentsReport = async (req, res) => {
       ? `${reportPrompt}\n\nYou are an academic assistant.`
       : "You are an academic assistant.";
 
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4",
-      messages: [
-        { role: "system", content: systemInstruction },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.3,
-    });
-
-    const summary = aiResponse.choices?.[0]?.message?.content;
+    // AI summary is a nice-to-have — a network/model failure here shouldn't
+    // 500 the whole overall-report endpoint. Degrade to an empty summary so
+    // the report still renders on both teacher and student side.
+    let summary = "";
+    try {
+      const aiResponse = await openai.chat.completions.create({
+        model: "gpt-4",
+        messages: [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.3,
+      });
+      summary = aiResponse?.choices?.[0]?.message?.content || "";
+    } catch (err) {
+      console.error(
+        `getAssignmentsReport: OpenAI summary failed (status=${err?.status ?? "n/a"}, baseURL=${openai.baseURL}, model=gpt-4):`,
+        err?.message || err,
+      );
+    }
 
     // 5. Return response
     return res.status(200).json({

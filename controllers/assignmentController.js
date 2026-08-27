@@ -503,13 +503,62 @@ export const getAssignmentsByClassroom = async (req, res) => {
     const assignments = await Assignment.find({ classroomId })
       .populate("classroomId")
       .populate("sessionId", "notes topic sessionDate sessionUrl")
-      .populate("teacherId", "firstName lastName email");
+      .populate("teacherId", "firstName lastName email")
+      .lean();
+
+    // Attach a `submissions` array to each sub-assignment so the classroom
+    // listing (AssignmentListingsTab flattens item.assignments and reads
+    // `assignment.submissions?.length`) shows the real submitted count.
+    // One batched query per Assignment doc — matches new docs by
+    // subAssignmentId and legacy docs by parent assignmentId, same
+    // convention as the other report endpoints. studentId is populated so
+    // the teacher's report table renders each student's actual name
+    // instead of "Unknown student".
+    const enriched = await Promise.all(
+      (assignments || []).map(async (doc) => {
+        const subIds = (doc.assignments || []).map((a) => a._id);
+        const submissions = subIds.length
+          ? await GradedAnswerModel.find({
+              $or: [
+                { subAssignmentId: { $in: subIds } },
+                { assignmentId: doc._id, subAssignmentId: { $exists: false } },
+              ],
+            })
+              .populate("studentId", "_id firstName lastName email userName")
+              .select(
+                "studentId subAssignmentId assignmentId percentage grade correctCount incorrectCount totalQuestions overall_remarks isAutoSubmitted gradedAt createdAt"
+              )
+              .lean()
+          : [];
+
+        const bySub = new Map();
+        for (const s of submissions) {
+          const key = s.subAssignmentId ? String(s.subAssignmentId) : null;
+          if (key) {
+            if (!bySub.has(key)) bySub.set(key, []);
+            bySub.get(key).push(s);
+          }
+        }
+        // Legacy docs (no subAssignmentId) attach to every sub-assignment
+        // in the parent so counts aren't lost. Precise attribution is
+        // impossible for those since the data was never stored.
+        const legacy = submissions.filter((s) => !s.subAssignmentId);
+
+        return {
+          ...doc,
+          assignments: (doc.assignments || []).map((a) => ({
+            ...a,
+            submissions: [...(bySub.get(String(a._id)) || []), ...legacy],
+          })),
+        };
+      }),
+    );
 
     // Return an empty array (200) instead of 404 so RTK Query treats it as a
     // successful cached response. A 404 error state doesn't get reconciled by
     // subsequent invalidations from createAssignmentWithAi, which meant the
     // Assignments tab stayed empty even after a new assignment was published.
-    res.status(200).json(assignments || []);
+    res.status(200).json(enriched);
   } catch (error) {
     console.error("Error fetching assignments by classroom:", error);
     res.status(500).json({ error: "Server error", message: error.message });
@@ -843,6 +892,25 @@ export const getStudentAssignmentsByClassroom = async (req, res) => {
       });
     }
 
+    // Pull this student's graded submissions for every sub-assignment in one
+    // shot so we can attach percentage / letter grade / submittedAt to each
+    // row below. Without this the panel had no score to display and would
+    // fall back to "grade pending" even though grading was already complete.
+    const allSubAssignmentIds = assignments.flatMap((doc) =>
+      doc.assignments.map((t) => t._id)
+    );
+    const gradedDocs = await GradedAnswerModel.find({
+      studentId,
+      subAssignmentId: { $in: allSubAssignmentIds },
+    })
+      .select(
+        "subAssignmentId percentage grade totalQuestions correctCount incorrectCount overall_remarks createdAt"
+      )
+      .lean();
+    const gradedBySubId = new Map(
+      gradedDocs.map((g) => [String(g.subAssignmentId), g])
+    );
+
     const studentAssignments = [];
 
     assignments.forEach((assignmentDoc) => {
@@ -855,6 +923,7 @@ export const getStudentAssignmentsByClassroom = async (req, res) => {
 
       assignmentDoc.assignments.forEach((task) => {
         if (task.studentIds.some((id) => id.toString() === studentId)) {
+          const graded = gradedBySubId.get(String(task._id));
           studentAssignments.push({
             assignmentId,
             subAssignmentId: task._id,
@@ -869,6 +938,11 @@ export const getStudentAssignmentsByClassroom = async (req, res) => {
             classroomId,
             sessionId,
             teacher: teacherId,
+            score: graded?.percentage ?? undefined,
+            grade: graded?.grade ?? undefined,
+            correctCount: graded?.correctCount ?? undefined,
+            totalQuestions: graded?.totalQuestions ?? undefined,
+            submittedAt: graded?.createdAt ?? undefined,
           });
         }
       });
