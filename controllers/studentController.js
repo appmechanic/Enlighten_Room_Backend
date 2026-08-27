@@ -535,6 +535,38 @@ export const submitAssignment = async (req, res) => {
       });
     }
 
+    // Fallback: if the AI grader returned nothing (network failure, parse
+    // failure, or 0 matches after the text-based join above), still persist
+    // the student's raw submission so their assignment shows up in reports.
+    // Without this the GradedAnswerModel doc would land with gradedAnswers=[]
+    // and report screens that filter on submissions would silently hide the
+    // student. Scores default to 0 with "Pending grading" so a teacher (or a
+    // rerun) can fill them in.
+    if (gradedAnswers.length === 0 && questionsWithAnswers.length > 0) {
+      console.warn(
+        `submitAssignment: AI grader returned no matches for student=${studentId} subAssignment=${subAssignmentId} — persisting ungraded submission.`,
+      );
+      for (const q of questionsWithAnswers) {
+        const submittedAnswerArray = q.answer
+          .split(",")
+          .map((s) => stripQuotes(s?.trim()));
+        const correctAnswerArray = Array.isArray(q.correctAnswer)
+          ? q.correctAnswer.map((s) => s?.trim())
+          : [];
+        maxScore += q.maxMarks || 0;
+        gradedAnswers.push({
+          questionId: q.questionId,
+          submittedAnswer: submittedAnswerArray,
+          correctAnswer: correctAnswerArray,
+          isCorrect: false,
+          score: 0,
+          maxScore: q.maxMarks || 0,
+          feedback: "Pending grading",
+          subAssignmentId,
+        });
+      }
+    }
+
     const totalQuestions = gradedAnswers.length;
     const incorrectCount = totalQuestions - correctCount;
 

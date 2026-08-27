@@ -247,7 +247,12 @@ export const getReportByAssignmentId = async (req, res) => {
         ],
       })
       .select(
-        "updatedAt createdAt gradedAt overall_remarks grade percentage incorrectCount correctCount totalQuestions "
+        // Populated paths (studentId, assignmentId, sessionId, classroomId)
+        // must be included here — the .select() above runs in include-mode,
+        // so any field not listed is stripped from the response, which
+        // silently drops the populated docs too. Omitting studentId here was
+        // the reason the report never showed which student had submitted.
+        "updatedAt createdAt gradedAt overall_remarks grade percentage incorrectCount correctCount totalQuestions studentId assignmentId sessionId classroomId gradedBy isAutoSubmitted gradedAnswers"
       )
       .lean();
 
