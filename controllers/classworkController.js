@@ -500,50 +500,63 @@ export const downloadAllAnswersCsvReport = async (req, res) => {
 export const sendClassworkReportToStudentsAndParents = async (req, res) => {
   try {
     const { roomId, emailIds, message } = req.body;
-    // emailIds: array of { id, email }
+    // emailIds: array of { studentId, email } — one entry per recipient.
+    // Each recipient receives a CSV filtered to only that studentId's rows,
+    // so a student/parent never sees other students' answers.
     if (!Array.isArray(emailIds) || !roomId) {
       return res.status(400).json({ message: 'roomId and emailIds[] required' });
     }
     const questions = await ClassworkModel.find({ roomId });
-    // Build the full CSV report once for all answers in the room
-    const rows = [];
-    questions.forEach((q, qIdx) => {
-      q.submitted.forEach((s, sIdx) => {
-        rows.push({
-          'Question No.': qIdx + 1,
-          'Question Text': q.question,
-          'Format': q.format || q.formatLabel || '',
-          'Student ID': s.studentId,
-          'Student Name': s.studentName,
-          'Answer': formatSubmittedAnswerText(s.answer),
-          'Is Correct': s.isCorrect ? 'Yes' : 'No',
-          'AI Score': s.aiScore,
-          'AI Used': s.aiUsed,
-          'Feedback': s.feedback,
-          'Correct Answer': Array.isArray(q.correctAnswer)
-            ? q.correctAnswer.filter((s) => String(s ?? '').trim()).join(' | ')
-            : q.correctAnswer ?? '',
+
+    const buildRowsForStudent = (studentId) => {
+      const rows = [];
+      questions.forEach((q, qIdx) => {
+        q.submitted.forEach((s) => {
+          if (String(s.studentId) !== String(studentId)) return;
+          rows.push({
+            'Question No.': qIdx + 1,
+            'Question Text': q.question,
+            'Format': q.format || q.formatLabel || '',
+            'Student ID': s.studentId,
+            'Student Name': s.studentName,
+            'Answer': formatSubmittedAnswerText(s.answer),
+            'Is Correct': s.isCorrect ? 'Yes' : 'No',
+            'AI Score': s.aiScore,
+            'AI Used': s.aiUsed,
+            'Feedback': s.feedback,
+            'Correct Answer': Array.isArray(q.correctAnswer)
+              ? q.correctAnswer.filter((v) => String(v ?? '').trim()).join(' | ')
+              : q.correctAnswer ?? '',
+          });
         });
       });
-    });
+      return rows;
+    };
+
     const fields = [
       'Question No.', 'Question Text', 'Format',
       'Student ID', 'Student Name', 'Answer', 'Is Correct', 'AI Score', 'AI Used', 'Feedback', 'Correct Answer'
     ];
     const parser = new Json2csvParser({ fields });
-    const csv = parser.parse(rows);
     const subject = `Classwork Report for Room ${roomId}`;
     const text = `Please find attached the detailed classwork report.\n \b Note \b ${message}`;
-    const filename = `classwork_report_${roomId}.csv`;
     let success = 0;
     let failed = [];
-    console.log(emailIds)
-    for (const email of emailIds) {
+    for (const entry of emailIds) {
+      const to = typeof entry === 'string' ? entry : entry?.email;
+      const studentId = typeof entry === 'object' ? entry?.studentId : null;
+      if (!to || !studentId) {
+        failed.push(entry);
+        continue;
+      }
       try {
-        await sendEmailWithAttachment({ to: email, subject, text, attachment: csv, filename });
+        const rows = buildRowsForStudent(studentId);
+        const csv = parser.parse(rows);
+        const filename = `classwork_report_${roomId}_${studentId}.csv`;
+        await sendEmailWithAttachment({ to, subject, text, attachment: csv, filename });
         success++;
       } catch (err) {
-        failed.push(email);
+        failed.push(to);
       }
     }
     res.status(200).json({ message: 'Reports sent', success, failed });
