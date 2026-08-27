@@ -23,6 +23,7 @@ import {
 import Lesson from "../models/LessonModel.js";
 import ClassworkModel from "../models/ClassworkModel.js";
 import ClassworkAiReport from "../models/ClassworkAiReportModel.js";
+import GradedAnswerModel from "../models/GradedAnswerModel.js";
 
 export const createAssignment = async (req, res) => {
   const {
@@ -416,7 +417,10 @@ export const getAssignmentById = async (req, res) => {
       return res.status(404).json({ error: "Assignment document not found" });
     }
 
-    // Step 2: For each assignment, populate its students and questions
+    // Step 2: For each assignment, populate its students, questions and
+    // graded submissions. Attaching `submissions` here is what makes the
+    // teacher's SingleAssignmentView show "X of Y submitted" and the list
+    // of submitted students — without it that section was always empty.
     const populatedAssignments = await Promise.all(
       assignmentDoc.assignments.map(async (a) => {
         const students = await User.find({
@@ -424,10 +428,24 @@ export const getAssignmentById = async (req, res) => {
           userRole: "student",
         }).select("_id firstName lastName email");
 
-        console.log("students", students);
         const questions = await Question.find({
           _id: { $in: a.questions },
         }).select("_id text type options correctAnswer");
+
+        // New-schema docs carry `subAssignmentId`; legacy docs only carry
+        // the parent `assignmentId` — match both. `assignmentDoc._id` is
+        // the parent, `a._id` is the sub-assignment id.
+        const submissions = await GradedAnswerModel.find({
+          $or: [
+            { subAssignmentId: a._id },
+            { assignmentId: assignmentDoc._id, subAssignmentId: { $exists: false } },
+          ],
+        })
+          .populate("studentId", "_id firstName lastName email userName")
+          .select(
+            "studentId gradedBy gradedAt totalQuestions correctCount incorrectCount percentage grade isAutoSubmitted overall_remarks createdAt updatedAt"
+          )
+          .lean();
 
         return {
           // ...a.toObject(),
@@ -440,6 +458,7 @@ export const getAssignmentById = async (req, res) => {
           duration: a.duration,
           students,
           questions,
+          submissions,
         };
       })
     );
@@ -697,6 +716,24 @@ export const getSubAssignmentById = async (req, res) => {
       "_id course topic questionText type correctAnswer solution belongsToStudentId blanks fineTuningInstructions language options hints answer metadata image maxAiHints aiHintCooldownSeconds assignmentId"
     );
 
+    // 5️⃣ Attach graded submissions for this sub-assignment. The teacher's
+    // SingleAssignmentView reads `subAssignment.submissions.length` for its
+    // "X of Y submitted" count and the list of submitted students — without
+    // this the field is undefined and the teacher always sees zero. New
+    // docs carry `subAssignmentId`; legacy docs only carry the parent
+    // `assignmentId`, so match both.
+    const submissions = await GradedAnswerModel.find({
+      $or: [
+        { subAssignmentId },
+        { assignmentId: assignment._id, subAssignmentId: { $exists: false } },
+      ],
+    })
+      .populate("studentId", "_id firstName lastName email userName")
+      .select(
+        "studentId gradedBy gradedAt totalQuestions correctCount incorrectCount percentage grade isAutoSubmitted overall_remarks createdAt updatedAt"
+      )
+      .lean();
+
     // 6️⃣ Return the populated sub-assignment. Include the parent Assignment
     // doc id so the PATCH-question route (which uses the parent id in its
     // URL) can be constructed on the client.
@@ -707,6 +744,7 @@ export const getSubAssignmentById = async (req, res) => {
         ...subAssignment,
         studentIds: students,
         questions: questions,
+        submissions,
       },
     });
   } catch (err) {
