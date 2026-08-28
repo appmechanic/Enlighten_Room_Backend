@@ -120,6 +120,16 @@ const TestTaskSchema = new mongoose.Schema({
     handwriting: { type: Boolean, default: false },
     textbox: { type: Boolean, default: false },
   },
+  // Marks assigned to each question of a given format. Stamped onto every
+  // generated Question's metadata.marks at creation time so the per-question
+  // grader has a clean integer to work with instead of falling back to
+  // maxMarks / questionCount (which produced 3.3333… reports on legacy tests).
+  perFormatMarks: {
+    mcq: { type: Number, default: 1, min: 0 },
+    "fill-blanks": { type: Number, default: 1, min: 0 },
+    handwriting: { type: Number, default: 1, min: 0 },
+    textbox: { type: Number, default: 1, min: 0 },
+  },
   // Snapshot of the prompts used at generation time — keeps the audit
   // trail intact even if the teacher edits their testPrompt later.
   generation: {

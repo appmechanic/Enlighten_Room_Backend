@@ -1383,7 +1383,9 @@ export function buildQuestionDoc({
   maxAiHints,
   aiHintCooldownSeconds,
   belongsToStudentId = null,
+  marks,
 }) {
+  const marksNum = Number(marks);
   return {
     classroomId,
     sessionId,
@@ -1404,7 +1406,7 @@ export function buildQuestionDoc({
     image: "",
     metadata: {
       difficulty: generated.difficulty || "medium",
-      marks: undefined,
+      marks: Number.isFinite(marksNum) && marksNum > 0 ? marksNum : undefined,
       tags: [topic].filter(Boolean),
       createdBy: "AI",
     },

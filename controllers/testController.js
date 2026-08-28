@@ -122,7 +122,8 @@ export const createTestWithAI = async (req, res) => {
     sessionRange = {}, // { start, end } ISO strings
     perFormatCounts = {},
     perFormatImages = {},
-    maxMarks = 10,
+    perFormatMarks = {},
+    maxMarks: maxMarksOverride,
     teacherPrompt: teacherPromptOverride,
     resources = [],
     course,
@@ -159,6 +160,33 @@ export const createTestWithAI = async (req, res) => {
       });
     }
   }
+
+  // Normalize perFormatMarks — any format with count > 0 needs a positive
+  // marks value. Formats the teacher skipped (count 0) are ignored.
+  const marksByFormat = {};
+  for (const [fmt, count] of Object.entries(perFormatCounts)) {
+    const c = Number(count) || 0;
+    if (c <= 0) continue;
+    const m = Number(perFormatMarks?.[fmt]);
+    if (!Number.isFinite(m) || m <= 0) {
+      return res.status(400).json({
+        error: `perFormatMarks.${fmt} must be a positive number when perFormatCounts.${fmt} > 0.`,
+      });
+    }
+    marksByFormat[fmt] = m;
+  }
+
+  // Derive maxMarks from Σ(count × marks) unless the caller sent an explicit
+  // override (kept for API back-compat).
+  const derivedMaxMarks = Object.entries(perFormatCounts).reduce(
+    (sum, [fmt, count]) =>
+      sum + (Number(count) || 0) * (Number(marksByFormat[fmt]) || 0),
+    0,
+  );
+  const maxMarks =
+    Number.isFinite(Number(maxMarksOverride)) && Number(maxMarksOverride) > 0
+      ? Number(maxMarksOverride)
+      : derivedMaxMarks || 10;
 
   const rangeStart = sessionRange?.start ? new Date(sessionRange.start) : null;
   const rangeEnd = sessionRange?.end ? new Date(sessionRange.end) : null;
@@ -273,6 +301,7 @@ export const createTestWithAI = async (req, res) => {
         topic: resolvedTopic,
         maxAiHints: 0,
         aiHintCooldownSeconds: 0,
+        marks: marksByFormat[q.format],
       }),
     );
     const savedQuestions = await Question.insertMany(baseDocs);
@@ -325,6 +354,7 @@ export const createTestWithAI = async (req, res) => {
       resources,
       perFormatCounts,
       perFormatImages,
+      perFormatMarks: marksByFormat,
       questions: savedQuestions.map((q) => q._id),
       generation,
     };
@@ -540,12 +570,19 @@ export const submitTestQuestion = async (req, res) => {
       return res.status(404).json({ error: "Question record missing." });
     }
 
-    // Per-question full marks default to task.maxMarks / total questions
-    // when nothing question-specific is stored. Keeps marksAwarded in a
-    // sensible band for the AI to fill.
+    // Per-question full marks: prefer the value stamped on the Question doc
+    // (set by createTestWithAI from perFormatMarks). Then fall back to the
+    // task's perFormatMarks map keyed by the question's format. Only then
+    // divide task.maxMarks across all questions — that last branch is what
+    // produced the 3.333… reports on legacy tests before per-format marks
+    // were introduced.
     const totalQs = (task.questions || []).length || 1;
+    const perFormatMarksMap = task.perFormatMarks || {};
     const perQFull =
-      questionDoc?.metadata?.marks || task.maxMarks / totalQs || 1;
+      questionDoc?.metadata?.marks ||
+      Number(perFormatMarksMap?.[questionDoc?.type]) ||
+      task.maxMarks / totalQs ||
+      1;
 
     let student = null;
     try {
