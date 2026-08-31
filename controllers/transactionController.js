@@ -817,6 +817,58 @@ export async function attachAndPay(req, res) {
       (pi && (pi.status === "succeeded" || pi.status === "requires_capture")) ||
       paidInvoice.status === "paid"
     ) {
+      // Persist the paid state immediately so the teacher's dashboard reads
+      // "subscribed" without waiting for Stripe's async webhook (or React's
+      // follow-up /billing/webhook call, which can be lost if the tab is
+      // closed / network flaps). The webhook, when it lands, is idempotent
+      // against these same fields.
+      try {
+        const firstLine = paidInvoice?.lines?.data?.[0];
+        const periodStart = firstLine?.period?.start
+          ? new Date(firstLine.period.start * 1000)
+          : undefined;
+        const periodEnd = firstLine?.period?.end
+          ? new Date(firstLine.period.end * 1000)
+          : undefined;
+
+        const subMeta = (sub && sub.metadata) || {};
+        const teacherId = subMeta.teacherId || subMeta.userId || null;
+        const chargeId =
+          pi?.charges?.data?.[0]?.id || paidInvoice?.charge || null;
+
+        const txnUpdate = {
+          status: "paid",
+          subscriptionStatus: "active",
+          "stripe.invoiceId": paidInvoice.id,
+          ...(pi?.id ? { "stripe.paymentIntentId": pi.id } : {}),
+          ...(chargeId ? { "stripe.chargeId": chargeId } : {}),
+          ...(periodStart ? { "stripe.periodStart": periodStart } : {}),
+          ...(periodEnd ? { "stripe.periodEnd": periodEnd } : {}),
+        };
+
+        await Transaction.findOneAndUpdate(
+          {
+            $or: [
+              { "stripe.subscriptionId": subscriptionId },
+              { "stripe.invoiceId": paidInvoice.id },
+            ],
+          },
+          { $set: txnUpdate },
+          { new: false }
+        );
+
+        if (teacherId) {
+          await User.findByIdAndUpdate(teacherId, { $set: { isPaid: true } });
+        }
+      } catch (dbErr) {
+        // Never block the payment response on the DB write — the webhook is
+        // still the authoritative backstop.
+        console.error(
+          "attachAndPay: post-pay DB update failed:",
+          dbErr?.message
+        );
+      }
+
       return res.json({
         ok: true,
         paid: true,
