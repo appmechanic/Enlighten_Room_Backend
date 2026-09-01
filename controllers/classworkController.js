@@ -1052,15 +1052,187 @@ export const getActiveLessonForRoom = async (req, res) => {
   }
 };
 
+// Bulk-reassign Classwork rows from one lessonName to another. Recovery
+// tool for the historical case where Classwork.lessonName drifted away
+// from any Lesson.name (e.g. client stamped "goldy" while the active
+// Lesson.name was auto-generated "2026-08-31 19:34").
+//
+// Accepts either a single mapping `{ from, to }` or a batch
+// `{ mappings: [{ from, to }, ...] }`. Both shapes queue the touched
+// destination Lesson docs for report regeneration so the teacher's next
+// report fetch has the summary ready. If no Lesson doc exists under a
+// given `to`, the reassignment still succeeds but no regen fires — the
+// caller should either create the Lesson doc first or use the
+// sync-orphan-lessons endpoint below.
+export const reassignClassworkLesson = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!roomId) {
+      return res.status(400).json({ message: 'roomId is required.' });
+    }
+    const body = req.body || {};
+    const rawMappings = Array.isArray(body.mappings)
+      ? body.mappings
+      : body.from !== undefined && body.to !== undefined
+        ? [{ from: body.from, to: body.to }]
+        : [];
+    if (rawMappings.length === 0) {
+      return res.status(400).json({
+        message:
+          'Provide either { from, to } or { mappings: [{ from, to }, ...] }.',
+      });
+    }
+    // Validate every entry up front so a bad row doesn't leave the batch
+    // half-applied. Empty `from` is allowed (targets staged classwork);
+    // `to` must be a non-empty string.
+    const normalized = [];
+    for (const m of rawMappings) {
+      if (!m || typeof m.from !== 'string' || typeof m.to !== 'string') {
+        return res.status(400).json({
+          message:
+            'Each mapping must be { from: string, to: string } — `from` may be empty, `to` must not.',
+        });
+      }
+      const toName = m.to.trim();
+      if (!toName) {
+        return res.status(400).json({ message: '`to` cannot be empty.' });
+      }
+      normalized.push({ from: m.from, to: toName });
+    }
+
+    const results = [];
+    const queuedLessonIds = new Set();
+    for (const { from, to } of normalized) {
+      const result = await ClassworkModel.updateMany(
+        { roomId, lessonName: from },
+        { $set: { lessonName: to } },
+      );
+      results.push({
+        from,
+        to,
+        matched: result?.matchedCount ?? 0,
+        modified: result?.modifiedCount ?? 0,
+      });
+      if ((result?.modifiedCount ?? 0) > 0) {
+        const destLesson = await Lesson.findOne({ roomId, name: to }).sort({
+          startedAt: -1,
+        });
+        if (destLesson && !queuedLessonIds.has(String(destLesson._id))) {
+          queuedLessonIds.add(String(destLesson._id));
+          generateAndStoreClassReport(destLesson).catch((err) => {
+            console.error(
+              `[reassignClassworkLesson] post-reassign regen failed for lesson ${destLesson._id} (${destLesson.name}):`,
+              err?.message || err,
+            );
+          });
+        }
+      }
+    }
+
+    const totalModified = results.reduce((n, r) => n + r.modified, 0);
+    return res.status(200).json({
+      message: `Reassigned ${totalModified} classwork row(s) across ${results.length} mapping(s).`,
+      results,
+      queuedLessonIds: Array.from(queuedLessonIds),
+    });
+  } catch (err) {
+    console.error('reassignClassworkLesson error:', err);
+    res.status(500).json({ message: 'Error reassigning classwork', error: err.message });
+  }
+};
+
+// One-shot recovery: any Classwork.lessonName that has NO matching Lesson
+// doc for this room gets its own Lesson doc created (status='ended',
+// endedAt=now), and each of those new Lessons is immediately queued for
+// report generation. This is the "fix all my orphan classwork in one
+// call" endpoint — handy when many stale names (goldy, mandeep, …)
+// accumulated before the addQuestion enforcement landed.
+//
+// Existing Lessons are left alone. Empty lessonName (staged classwork) is
+// skipped — those aren't lessons, they're drafts waiting for a real
+// start-lesson.
+export const syncOrphanLessons = async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    if (!roomId) {
+      return res.status(400).json({ message: 'roomId is required.' });
+    }
+
+    const [distinctNames, existingLessons] = await Promise.all([
+      ClassworkModel.distinct('lessonName', { roomId }),
+      Lesson.find({ roomId }).select('name').lean(),
+    ]);
+
+    const existingSet = new Set(
+      existingLessons.map((l) => String(l.name || '').trim()).filter(Boolean),
+    );
+    const orphanNames = distinctNames
+      .map((n) => String(n || '').trim())
+      .filter((n) => n && !existingSet.has(n));
+
+    if (orphanNames.length === 0) {
+      return res.status(200).json({
+        message: 'No orphan lesson names found — every Classwork.lessonName has a matching Lesson doc.',
+        created: [],
+        queuedLessonIds: [],
+      });
+    }
+
+    // Resolve Session/Classroom for this room so the synthesised Lesson
+    // docs carry the same linkage the normal start-lesson flow does —
+    // otherwise class-report generation can't find the classroom/teacher.
+    const ctx = await resolveSessionContext(roomId);
+
+    const created = [];
+    const queuedLessonIds = [];
+    for (const name of orphanNames) {
+      const lesson = await Lesson.create({
+        name,
+        roomId,
+        sessionId: ctx?.sessionId || null,
+        classroomId: ctx?.classroomId || null,
+        startedAt: new Date(),
+        endedAt: new Date(),
+        status: 'ended',
+      });
+      created.push({ lessonId: String(lesson._id), name });
+      queuedLessonIds.push(String(lesson._id));
+      generateAndStoreClassReport(lesson).catch((err) => {
+        console.error(
+          `[syncOrphanLessons] post-create regen failed for lesson ${lesson._id} (${name}):`,
+          err?.message || err,
+        );
+      });
+    }
+
+    return res.status(200).json({
+      message: `Created ${created.length} Lesson doc(s) for orphan classwork names and queued their reports.`,
+      created,
+      queuedLessonIds,
+    });
+  } catch (err) {
+    console.error('syncOrphanLessons error:', err);
+    res.status(500).json({ message: 'Error syncing orphan lessons', error: err.message });
+  }
+};
+
 // Gather a lesson's classwork + teacherId, run the AI summary, and persist
 // the result onto the Lesson document. Used both by the end-lesson hook
 // (fire-and-forget) and by the manual regenerate endpoint. Throws on
 // terminal failure so callers can log/respond appropriately.
 async function generateAndStoreClassReport(lessonDoc) {
   if (!lessonDoc) return null;
+  const normalizedLessonName = String(lessonDoc.name || '').trim();
+  // Match on trimmed lessonName so legacy rows that were saved with stray
+  // whitespace (before ClassworkModel got `trim: true`) still join to the
+  // Lesson doc. Anchored regex keeps the match exact — no partial hits.
+  const escapedLessonName = normalizedLessonName.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    '\\$&',
+  );
   const lessonQuestions = await ClassworkModel.find({
     roomId: lessonDoc.roomId,
-    lessonName: lessonDoc.name,
+    lessonName: { $regex: `^\\s*${escapedLessonName}\\s*$` },
   }).lean();
 
   const submissionCount = lessonQuestions.reduce(
@@ -1070,6 +1242,42 @@ async function generateAndStoreClassReport(lessonDoc) {
   console.log(
     `[ClassReport] lesson=${lessonDoc._id} name="${lessonDoc.name}" questions=${lessonQuestions.length} submissions=${submissionCount}`,
   );
+
+  // When the join returns 0 questions or 0 submissions, dump the actual
+  // distinct (lessonName, submissionCount) pairs on Classwork for this room
+  // — the mismatch (or genuine absence of submissions) becomes visible
+  // in the log without having to shell into Mongo.
+  if (lessonQuestions.length === 0 || submissionCount === 0) {
+    try {
+      const diagnostic = await ClassworkModel.aggregate([
+        { $match: { roomId: lessonDoc.roomId } },
+        {
+          $group: {
+            _id: '$lessonName',
+            questionCount: { $sum: 1 },
+            submissionCount: {
+              $sum: { $size: { $ifNull: ['$submitted', []] } },
+            },
+          },
+        },
+        { $sort: { submissionCount: -1, questionCount: -1 } },
+      ]);
+      const pretty = diagnostic
+        .map(
+          (row) =>
+            `  · lessonName=${JSON.stringify(row._id)} questions=${row.questionCount} submissions=${row.submissionCount}`,
+        )
+        .join('\n');
+      console.warn(
+        `[ClassReport] no-submissions diagnostic for lesson="${lessonDoc.name}" roomId=${lessonDoc.roomId}:\n${pretty || '  · no classwork rows for this room'}`,
+      );
+    } catch (err) {
+      console.warn(
+        '[ClassReport] failed to run no-submissions diagnostic:',
+        err?.message || err,
+      );
+    }
+  }
 
   const classroomDoc = lessonDoc.classroomId
     ? await Classroom.findById(lessonDoc.classroomId)
@@ -1127,26 +1335,28 @@ async function generateAndStoreClassReport(lessonDoc) {
 // modal or many students open their reports concurrently.
 const inFlightBackfills = new Set();
 
-// Self-healing hook: any ended lesson whose classReport.generatedAt is null
-// gets a background generateAndStoreClassReport call. The read that
-// triggered this returns the current (empty) state; the next read a few
-// seconds later picks up the completed report. Silent no-op on failure so
-// the read path stays fast.
+// Self-healing hook: any lesson whose classReport.generatedAt is null gets a
+// background generateAndStoreClassReport call. The read that triggered this
+// returns the current (empty) state; the next read a few seconds later picks
+// up the completed report. Silent no-op on failure so the read path stays
+// fast.
 //
-// This is the permanent counterweight to endLessonForRoom's fire-and-forget
-// generation: if the initial call errors out (Gemini 503, network blip,
-// retry exhaustion, server restart mid-flight), the very next time someone
-// opens the report, the missing report gets rebuilt.
+// Applies to BOTH ended and active lessons: teachers want to see the class
+// summary while a lesson is still running, not only after they hang up.
+// The rolling checkpoint (maybeScheduleReportCheckpoint) still handles
+// high-cadence mid-lesson regen; this path fills the gap for lessons that
+// have submissions but haven't crossed the checkpoint threshold yet.
 function scheduleMissingReportBackfills(lessonDocs) {
   if (!Array.isArray(lessonDocs)) return;
   for (const l of lessonDocs) {
-    if (!l || l.status !== 'ended') continue;
+    if (!l) continue;
+    if (l.status !== 'ended' && l.status !== 'active') continue;
     if (l.classReport && l.classReport.generatedAt) continue;
     const key = String(l._id);
     if (inFlightBackfills.has(key)) continue;
     inFlightBackfills.add(key);
     console.log(
-      `[ClassReport] backfill scheduled for ended lesson=${key} (roomId=${l.roomId}, name="${l.name}")`,
+      `[ClassReport] backfill scheduled for ${l.status} lesson=${key} (roomId=${l.roomId}, name="${l.name}")`,
     );
     // Reload the full lesson doc — the callers hand us lean subsets.
     Lesson.findById(l._id)
@@ -1168,7 +1378,7 @@ function scheduleMissingReportBackfills(lessonDocs) {
 
 // Manual regenerate endpoint. POST /api/classwork/class-report/:roomId/regenerate
 // Body may include { lessonName } to retry a single lesson; otherwise every
-// ended lesson in the room whose classReport is empty is retried.
+// lesson (active or ended) in the room whose classReport is empty is retried.
 // Each retry runs in the background — the response returns immediately with
 // the list of lessons that were queued.
 export const regenerateClassReportForRoom = async (req, res) => {
@@ -1179,11 +1389,13 @@ export const regenerateClassReportForRoom = async (req, res) => {
     }
     const { lessonName } = req.body || {};
 
-    const query = { roomId, status: 'ended' };
+    // Include active lessons too — teachers want to force a fresh summary
+    // mid-lesson without having to end the call first.
+    const query = { roomId };
     if (lessonName && typeof lessonName === 'string') {
       query.name = lessonName;
     }
-    const lessons = await Lesson.find(query).sort({ endedAt: -1 });
+    const lessons = await Lesson.find(query).sort({ endedAt: -1, startedAt: -1 });
 
     const queued = [];
     for (const lesson of lessons) {
@@ -1239,9 +1451,9 @@ export const getClassReportForRoom = async (req, res) => {
       .select('_id name roomId status startedAt endedAt classReport')
       .lean();
 
-    // Self-heal: any ended lesson missing a class report gets a background
-    // regen. The response returns immediately with the current state; the
-    // next visit picks up the completed report.
+    // Self-heal: any lesson (active or ended) missing a class report gets a
+    // background regen. The response returns immediately with the current
+    // state; the next visit picks up the completed report.
     scheduleMissingReportBackfills(lessons);
 
     return res.status(200).json({
@@ -1446,9 +1658,33 @@ export const addQuestion = async (req, res) => {
     // questions (legacy flow) default to released:true and get a releasedAt
     // stamp now so the expiry timer matches the createdAt window.
     const stagedAsDraft = question?.released === false;
+
+    // Authoritative lessonName resolution — the client used to stamp this
+    // from stale UI state (e.g. a previously-typed name like "goldy"), which
+    // drifted from the actual active Lesson.name and broke the report join.
+    // For released questions the active lesson always wins; only staged
+    // drafts (no active lesson yet, or explicitly deferred) may keep the
+    // client-supplied value.
+    let resolvedLessonName = String(question?.lessonName || '').trim();
+    if (!stagedAsDraft && roomId) {
+      const activeLesson = await Lesson.findOne({ roomId, status: 'active' })
+        .sort({ startedAt: -1 })
+        .select('name');
+      if (activeLesson?.name) {
+        const authoritative = String(activeLesson.name).trim();
+        if (authoritative && authoritative !== resolvedLessonName) {
+          console.log(
+            `[AddQuestion] Overriding client lessonName="${resolvedLessonName}" with active lesson name="${authoritative}" for roomId=${roomId}`,
+          );
+          resolvedLessonName = authoritative;
+        }
+      }
+    }
+
     const newQuestion = await ClassworkModel.create({
       ...question,
       roomId,
+      lessonName: resolvedLessonName,
       aiAllowed: resolvedAiAllowed,
       aiExpiryTime: resolvedAiAllowed ? resolvedAiExpiryTime : question?.expiryTime,
       released: !stagedAsDraft,
@@ -1495,15 +1731,27 @@ export const addQuestion = async (req, res) => {
 
 // Release a staged question. Flips released=true and stamps releasedAt so
 // the expiry timer starts from now, while createdAt stays as the original
-// staging time (preserves audit trail).
+// staging time (preserves audit trail). Also snaps the classwork's
+// lessonName onto whatever lesson is active right now, so a draft that was
+// staged before the lesson started (or during a different lesson) still
+// reports under the correct Lesson doc.
 export const releaseQuestion = async (req, res) => {
   try {
     const { questionId } = req.params;
     const { roomId } = req.body || {};
     const filter = roomId ? { id: questionId, roomId } : { id: questionId };
+    const patch = { released: true, releasedAt: new Date() };
+    if (roomId) {
+      const activeLesson = await Lesson.findOne({ roomId, status: 'active' })
+        .sort({ startedAt: -1 })
+        .select('name');
+      if (activeLesson?.name) {
+        patch.lessonName = String(activeLesson.name).trim();
+      }
+    }
     const question = await ClassworkModel.findOneAndUpdate(
       filter,
-      { $set: { released: true, releasedAt: new Date() } },
+      { $set: patch },
       { new: true }
     );
     if (!question) {

@@ -44,7 +44,7 @@ const AiFeedbackCacheSchema = new mongoose.Schema(
 const ClassworkSchema = new mongoose.Schema({
   id: { type: String, required: true },
   roomId: { type: String, required: true },
-  lessonName: { type: String, default: '' },
+  lessonName: { type: String, default: '', trim: true },
   label: { type: String, required: true },
   title: { type: String, required: true },
   question: { type: String, required: true },
