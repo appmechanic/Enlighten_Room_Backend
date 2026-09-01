@@ -4,6 +4,8 @@ import Classroom from "../models/classroomModel.js";
 import Student from "../models/studentModel.js";
 import Teacher from "../models/teacherModel.js";
 import Session from "../models/SessionModel.js";
+import Lesson from "../models/LessonModel.js";
+import ClassworkModel from "../models/ClassworkModel.js";
 import User from "../models/user.js";
 
 export const createClassroom = async (req, res) => {
@@ -673,6 +675,18 @@ export const updateSession = async (req, res) => {
   }
 
   try {
+    // Capture the previous topic BEFORE the update so we can cascade any
+    // rename to Lesson.name / Classwork.lessonName. Sessions carry the
+    // canonical user-facing title; Lesson/Classwork rows were stamped with
+    // whatever topic was set when the lesson started, and without this
+    // cascade a topic edit leaves the Session Report picker showing the new
+    // name while the underlying rows still key off the old one — the
+    // dropdown option matches no classwork and the report renders empty.
+    const previousSession = await Session.findById(sessionId).select("topic").lean();
+    if (!previousSession) {
+      return res.status(404).json({ error: "Session not found." });
+    }
+
     const updatedSession = await Session.findByIdAndUpdate(
       sessionId,
       updateData,
@@ -683,9 +697,40 @@ export const updateSession = async (req, res) => {
       return res.status(404).json({ error: "Session not found." });
     }
 
+    const oldTopic = typeof previousSession.topic === "string" ? previousSession.topic : "";
+    const newTopic = typeof updatedSession.topic === "string" ? updatedSession.topic : "";
+    const cascadeResult = { lessonsRenamed: 0, classworkRenamed: 0 };
+    if (newTopic && oldTopic && newTopic !== oldTopic) {
+      // Scope the rename to Lesson docs from THIS session that still carry
+      // the old topic as their name. Matching on sessionId + old name (not
+      // just sessionId) prevents clobbering historic lessons that were
+      // deliberately named differently at start time.
+      const affectedLessons = await Lesson.find({
+        sessionId,
+        name: oldTopic,
+      }).select("_id roomId").lean();
+      if (affectedLessons.length > 0) {
+        const lessonRes = await Lesson.updateMany(
+          { sessionId, name: oldTopic },
+          { $set: { name: newTopic } }
+        );
+        cascadeResult.lessonsRenamed = lessonRes?.modifiedCount ?? 0;
+        const roomIds = Array.from(
+          new Set(affectedLessons.map((l) => l.roomId).filter(Boolean))
+        );
+        if (roomIds.length > 0) {
+          const classworkRes = await ClassworkModel.updateMany(
+            { roomId: { $in: roomIds }, lessonName: oldTopic },
+            { $set: { lessonName: newTopic } }
+          );
+          cascadeResult.classworkRenamed = classworkRes?.modifiedCount ?? 0;
+        }
+      }
+    }
+
     res
       .status(200)
-      .json({ message: "Session updated", session: updatedSession });
+      .json({ message: "Session updated", session: updatedSession, cascade: cascadeResult });
   } catch (err) {
     if (err.name === "CastError") {
       return res.status(400).json({ error: "Invalid session ID format." });
