@@ -143,7 +143,7 @@ export const getGradedSubmissionBySubAssignmentId = async (req, res) => {
         path: "gradedAnswers.questionId",
         model: "Question",
         select:
-          "course topic questionText type options hints fineTuningInstructions createdAt updatedAt",
+          "course topic questionText type options hints fineTuningInstructions image createdAt updatedAt",
       })
       .populate({
         path: "assignmentId",
@@ -207,7 +207,7 @@ export const getReportByAssignmentId = async (req, res) => {
         path: "gradedAnswers.questionId",
         model: "Question",
         select:
-          "course topic questionText type options correctAnswer solution hints",
+          "course topic questionText type options correctAnswer solution hints image",
       })
       .populate({
         path: "assignmentId",

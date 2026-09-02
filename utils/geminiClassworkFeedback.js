@@ -759,54 +759,73 @@ export async function getClassworkAiFeedback({
     tag: `ClassworkFeedback:${reqId}`,
   });
 
-  const config = cacheResult.ok
-    ? {
-        cachedContent: cacheResult.name,
-        responseMimeType: "application/json",
-        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
-        thinkingConfig: { thinkingBudget },
-        maxOutputTokens: resolvedMaxOutputTokens,
-      }
-    : {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
-        thinkingConfig: { thinkingBudget },
-        maxOutputTokens: resolvedMaxOutputTokens,
-      };
-
-  // Fallback callable used both by the retry wrapper's regular-fallback slot
-  // AND locally on a `cachedContent`-specific error (deleted/expired cache
-  // in the window between our TTL bookkeeping and Gemini's own expiry).
-  const inlineConfig = {
-    systemInstruction,
-    responseMimeType: "application/json",
-    responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
-    thinkingConfig: { thinkingBudget },
-    maxOutputTokens: resolvedMaxOutputTokens,
+  // One-shot MAX_TOKENS retry: bilingual prompts + long thinking budgets can
+  // truncate the JSON right before its closing brace, and parseFirstJsonObject
+  // then returns null — the student sees "AI didn't return any hints." Re-issue
+  // the call once with 2× the output budget. Capped so a runaway prompt can't
+  // burn the full context window.
+  const MAX_TOKENS_HARD_CAP = 16000;
+  const callWithBudget = (tokens) => {
+    const thinking = resolveThinkingBudget(
+      tokens,
+      hasCachedSolution,
+      format,
+      feedbackTuning,
+    );
+    const commonCfg = {
+      responseMimeType: "application/json",
+      responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
+      thinkingConfig: { thinkingBudget: thinking },
+      maxOutputTokens: tokens,
+    };
+    const primaryCfg = cacheResult.ok
+      ? { cachedContent: cacheResult.name, ...commonCfg }
+      : { systemInstruction, ...commonCfg };
+    const fallbackCfg = { systemInstruction, ...commonCfg };
+    return withGeminiRetry(
+      () =>
+        ai.models.generateContent({ model: MODEL, contents, config: primaryCfg }),
+      {
+        maxAttempts: retryCfg.max,
+        baseDelayMs: retryCfg.baseMs,
+        maxDelayMs: retryCfg.capMs,
+        tag: `ClassworkFeedback:${reqId}`,
+        fallbackCallFn:
+          FALLBACK_MODEL && FALLBACK_MODEL !== MODEL
+            ? () =>
+                ai.models.generateContent({
+                  model: FALLBACK_MODEL,
+                  contents,
+                  config: fallbackCfg,
+                })
+            : undefined,
+      },
+    );
   };
 
   const apiStartMs = Date.now();
   console.log(
     `[ClassworkFeedback][req=${reqId}] AI hint API start: ${new Date(apiStartMs).toISOString()}`,
   );
-  const result = await withGeminiRetry(
-    () => ai.models.generateContent({ model: MODEL, contents, config }),
-    {
-      maxAttempts: retryCfg.max,
-      baseDelayMs: retryCfg.baseMs,
-      maxDelayMs: retryCfg.capMs,
-      tag: `ClassworkFeedback:${reqId}`,
-      fallbackCallFn: FALLBACK_MODEL && FALLBACK_MODEL !== MODEL
-        ? () =>
-            ai.models.generateContent({
-              model: FALLBACK_MODEL,
-              contents,
-              config: inlineConfig,
-            })
-        : undefined,
-    },
-  );
+  let result = await callWithBudget(resolvedMaxOutputTokens);
+  let finishReason = result?.candidates?.[0]?.finishReason;
+  if (
+    finishReason === "MAX_TOKENS" &&
+    resolvedMaxOutputTokens < MAX_TOKENS_HARD_CAP
+  ) {
+    const bumped = Math.min(resolvedMaxOutputTokens * 2, MAX_TOKENS_HARD_CAP);
+    console.warn(
+      `[ClassworkFeedback][req=${reqId}] MAX_TOKENS at ${resolvedMaxOutputTokens} → retrying once at ${bumped}`,
+    );
+    const retried = await callWithBudget(bumped);
+    const retriedFinish = retried?.candidates?.[0]?.finishReason;
+    // Only accept the retry if it didn't also truncate — otherwise keep the
+    // first result so downstream logging/shaping stays consistent.
+    if (retriedFinish !== "MAX_TOKENS") {
+      result = retried;
+      finishReason = retriedFinish;
+    }
+  }
   const apiEndMs = Date.now();
   console.log(
     `[ClassworkFeedback][req=${reqId}] AI hint API end: ${new Date(apiEndMs).toISOString()} (duration ${apiEndMs - apiStartMs}ms)`,
@@ -816,7 +835,7 @@ export async function getClassworkAiFeedback({
     reqId,
     result?.usageMetadata,
     "ClassworkFeedback",
-    result?.candidates?.[0]?.finishReason,
+    finishReason,
   );
 
   const responseText = result.text || "";
