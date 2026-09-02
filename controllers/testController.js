@@ -1197,7 +1197,7 @@ export const getStudentTestGradeDetails = async (req, res) => {
       .populate({
         path: "gradedAnswers.questionId",
         select:
-          "questionText type options correctAnswer solution course topic",
+          "questionText type options correctAnswer solution course topic image",
       })
       .populate("classroomId")
       .populate("sessionId", "_id topic sessionDate notes sessionUrl")
