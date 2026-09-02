@@ -620,48 +620,107 @@ export const submitTestQuestion = async (req, res) => {
       });
     }
 
-    // Compose feedback rollup on the submission doc. `feedback` is kept as a
-    // human-readable running log so the class-report generator can slice on
-    // it later without additional joins.
-    if (!submission) {
-      submission = {
-        studentId,
-        submittedAt: new Date(),
-        isCompleted: false,
-        questions: [],
-        marks: 0,
-        feedback: "",
-        fullscreenExits: [],
-      };
-      task.submissions.push(submission);
-      submission = task.submissions[task.submissions.length - 1];
-    }
-    submission.questions.push(questionId);
-    submission.marks = Math.round(
-      (Number(submission.marks) || 0) + feedback.marksAwarded,
-    );
-    const entry = [
-      `Q${submission.questions.length}: marks=${feedback.marksAwarded}/${perQFull}`,
+    // Compose the feedback log line once — used by every retry attempt.
+    // The `Q${n}:` prefix is populated from the fresh submission state on
+    // each attempt, so we build the tail here and prepend the counter
+    // inside the retry loop.
+    const feedbackTail = [
       `  correctBeforeStuck: ${feedback.correctBeforeStuck}`,
       `  stuckOn: ${feedback.stuckOn}`,
       `  practiceAdvice: ${feedback.practiceAdvice}`,
     ].join("\n");
-    submission.feedback = submission.feedback
-      ? `${submission.feedback}\n\n${entry}`
-      : entry;
-    submission.submittedAt = new Date();
-    // Mark completed when the student has submitted every question in the
-    // task. Downstream (class-report cron) can then treat this student as
-    // "final".
-    const justCompleted =
-      submission.questions.length >= (task.questions || []).length &&
-      !submission.isCompleted;
-    if (justCompleted) {
-      submission.isCompleted = true;
-      submission.completedAt = new Date();
-    }
+    const marksToAdd = Number(feedback.marksAwarded) || 0;
 
-    await testDoc.save();
+    // Retry loop: `testDoc.save()` uses Mongoose optimistic concurrency
+    // (`__v` filter), and Gemini's ~10s round-trip means two rapid
+    // submissions from the same student — or from different students on
+    // the same test — both read version N, both mutate in memory, and the
+    // second save fails with a VersionError because the first bumped the
+    // doc to N+1. Symptom seen in prod:
+    //   No matching document found for id "…" version 1
+    //   modifiedPaths "tests, tests.0, tests.0.submissions, …"
+    // Reload + reapply the mutation on each attempt. The AI call above is
+    // NOT retried — we only replay the cheap DB mutation.
+    let justCompleted = false;
+    const MAX_ATTEMPTS = 5;
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      try {
+        // First pass reuses the doc/task/submission we already loaded so
+        // the fast path pays no re-fetch cost. Subsequent attempts refetch
+        // because the stale doc's `__v` is what caused the conflict.
+        if (attempt > 1) {
+          const fresh = await Test.findById(testId);
+          if (!fresh) return res.status(404).json({ error: "Test not found." });
+          const freshTask = fresh.tests.id(taskId);
+          if (!freshTask)
+            return res.status(404).json({ error: "Test task not found." });
+          testDoc = fresh;
+          task = freshTask;
+          submission = task.submissions.find(
+            (s) => String(s.studentId) === studentId,
+          );
+          // A parallel handler may have raced this exact questionId in
+          // between attempts. Return 409 so the client renders the
+          // inactive state instead of retrying forever.
+          if (
+            submission &&
+            (submission.questions || []).some(
+              (id) => String(id) === String(questionId),
+            )
+          ) {
+            return res
+              .status(409)
+              .json({ error: "This question has already been submitted." });
+          }
+        }
+
+        if (!submission) {
+          submission = {
+            studentId,
+            submittedAt: new Date(),
+            isCompleted: false,
+            questions: [],
+            marks: 0,
+            feedback: "",
+            fullscreenExits: [],
+          };
+          task.submissions.push(submission);
+          submission = task.submissions[task.submissions.length - 1];
+        }
+        submission.questions.push(questionId);
+        submission.marks = Math.round(
+          (Number(submission.marks) || 0) + marksToAdd,
+        );
+        const entry = [
+          `Q${submission.questions.length}: marks=${marksToAdd}/${perQFull}`,
+          feedbackTail,
+        ].join("\n");
+        submission.feedback = submission.feedback
+          ? `${submission.feedback}\n\n${entry}`
+          : entry;
+        submission.submittedAt = new Date();
+        justCompleted =
+          submission.questions.length >= (task.questions || []).length &&
+          !submission.isCompleted;
+        if (justCompleted) {
+          submission.isCompleted = true;
+          submission.completedAt = new Date();
+        }
+
+        await testDoc.save();
+        break;
+      } catch (saveErr) {
+        const isVersionError =
+          saveErr?.name === "VersionError" ||
+          /No matching document found for id/i.test(saveErr?.message || "");
+        if (!isVersionError || attempt >= MAX_ATTEMPTS) throw saveErr;
+        // Short exponential-ish backoff so parallel submits don't
+        // thundering-herd the same version.
+        await new Promise((r) => setTimeout(r, 40 * attempt));
+      }
+    }
 
     // Persist a per-question grade row so the student panel + details page
     // can render score cards without parsing the human-readable feedback
