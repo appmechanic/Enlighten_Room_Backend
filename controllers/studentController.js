@@ -561,9 +561,19 @@ export const submitAssignment = async (req, res) => {
         return;
       }
 
-      const submittedAnswerArray = result.answer
-        .split(",")
-        .map((s) => stripQuotes(s?.trim()));
+      // Defensive coercion: the AI has occasionally omitted `answer` or
+      // returned it as an array/number, both of which used to crash
+      // `.split(",")` with "Cannot read properties of undefined (reading
+      // 'split')" and take the whole submission with them.
+      const rawAnswer = result.answer;
+      const answerStr = Array.isArray(rawAnswer)
+        ? rawAnswer.join(",")
+        : rawAnswer == null
+        ? ""
+        : String(rawAnswer);
+      const submittedAnswerArray = answerStr
+        ? answerStr.split(",").map((s) => stripQuotes(s?.trim()))
+        : [];
 
       const correctAnswerArray = Array.isArray(original.correctAnswer)
         ? original.correctAnswer.map((s) => s?.trim())
