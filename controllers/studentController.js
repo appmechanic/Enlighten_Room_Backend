@@ -561,18 +561,20 @@ export const submitAssignment = async (req, res) => {
         return;
       }
 
-      // Defensive coercion: the AI has occasionally omitted `answer` or
-      // returned it as an array/number, both of which used to crash
-      // `.split(",")` with "Cannot read properties of undefined (reading
-      // 'split')" and take the whole submission with them.
-      const rawAnswer = result.answer;
-      const answerStr = Array.isArray(rawAnswer)
-        ? rawAnswer.join(",")
-        : rawAnswer == null
+      // Persist what the STUDENT actually submitted, not the AI's echo.
+      // The grader was previously reading `result.answer`, which the model
+      // often paraphrases or omits entirely — that's how the teacher's
+      // drilldown ended up showing "No answer" even when the student got
+      // full marks. `original.answer` is the joined form we sent to the
+      // AI, i.e. the student's real input.
+      const rawStudent = original.answer;
+      const studentStr = Array.isArray(rawStudent)
+        ? rawStudent.join(",")
+        : rawStudent == null
         ? ""
-        : String(rawAnswer);
-      const submittedAnswerArray = answerStr
-        ? answerStr.split(",").map((s) => stripQuotes(s?.trim()))
+        : String(rawStudent);
+      const submittedAnswerArray = studentStr
+        ? studentStr.split(",").map((s) => stripQuotes(s?.trim()))
         : [];
 
       const correctAnswerArray = Array.isArray(original.correctAnswer)

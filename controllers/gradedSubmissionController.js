@@ -7,6 +7,7 @@ import GradeSetting from "../models/GradeSetting.js";
 import Assignment from "../models/AssignmentModel.js";
 import Classroom from "../models/classroomModel.js";
 import StandardPrompt from "../models/standardPromptModel.js";
+import AssignmentAiReport from "../models/AssignmentAiReportModel.js";
 
 // Pin baseURL explicitly — see ai-grader.js for the incident context.
 const openai = new OpenAI({
@@ -182,6 +183,56 @@ export const getGradedSubmissionBySubAssignmentId = async (req, res) => {
       });
     }
 
+    // Backfill empty `submittedAnswer` arrays from AssignmentAiReport —
+    // same reason as getReportByAssignmentId: historical records were saved
+    // with empty arrays because the controller stored the AI's paraphrase
+    // instead of the student's raw input. AssignmentAiReport.lastAnswer is
+    // the authoritative log written per (subAssignment, question, student)
+    // during hint attempts, so we hydrate empty entries from it here so
+    // the student sees "Your Answer: 15" instead of "No answer provided"
+    // on old submissions.
+    for (const submission of submissions) {
+      const studentIdForLookup =
+        submission.studentId?._id || submission.studentId;
+      const subAssignmentIdForLookup =
+        submission.subAssignmentId ||
+        submission.assignmentId?._id ||
+        submission.assignmentId;
+      const emptyQids = (submission.gradedAnswers || [])
+        .filter(
+          (g) =>
+            !Array.isArray(g.submittedAnswer) || g.submittedAnswer.length === 0,
+        )
+        .map((g) => g.questionId?._id || g.questionId)
+        .filter(Boolean);
+      if (!studentIdForLookup || !subAssignmentIdForLookup || !emptyQids.length) {
+        continue;
+      }
+      const reports = await AssignmentAiReport.find({
+        studentId: studentIdForLookup,
+        subAssignmentId: subAssignmentIdForLookup,
+        questionId: { $in: emptyQids },
+      })
+        .select("questionId lastAnswer")
+        .lean();
+      const answerByQid = new Map(
+        reports.map((r) => [String(r.questionId), r.lastAnswer]),
+      );
+      submission.gradedAnswers = (submission.gradedAnswers || []).map((g) => {
+        const empty =
+          !Array.isArray(g.submittedAnswer) || g.submittedAnswer.length === 0;
+        if (!empty) return g;
+        const qid = String(g.questionId?._id || g.questionId || "");
+        const raw = answerByQid.get(qid);
+        if (raw == null) return g;
+        const asArray = Array.isArray(raw)
+          ? raw.map((s) => String(s ?? "").trim()).filter(Boolean)
+          : [String(raw).trim()].filter(Boolean);
+        if (!asArray.length) return g;
+        return { ...g, submittedAnswer: asArray };
+      });
+    }
+
     res.status(200).json({ success: true, data: submissions });
   } catch (error) {
     console.error(
@@ -252,7 +303,7 @@ export const getReportByAssignmentId = async (req, res) => {
         // so any field not listed is stripped from the response, which
         // silently drops the populated docs too. Omitting studentId here was
         // the reason the report never showed which student had submitted.
-        "updatedAt createdAt gradedAt overall_remarks grade percentage incorrectCount correctCount totalQuestions studentId assignmentId sessionId classroomId gradedBy isAutoSubmitted gradedAnswers"
+        "updatedAt createdAt gradedAt overall_remarks grade percentage incorrectCount correctCount totalQuestions studentId assignmentId subAssignmentId sessionId classroomId gradedBy isAutoSubmitted gradedAnswers"
       )
       .lean();
 
@@ -261,6 +312,56 @@ export const getReportByAssignmentId = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Submission not found" });
     }
+
+    // Backfill missing `submittedAnswer` from AssignmentAiReport.lastAnswer.
+    // Historical submissions were saved with empty submittedAnswer arrays
+    // (a controller bug that stored the AI's echo instead of the student's
+    // real input — see studentController.js:564), so the teacher drilldown
+    // rendered "No answer" even when the student clearly answered. Look up
+    // the AI-report row for each (subAssignment, question, student) and
+    // hydrate the empty entries from `lastAnswer` — an authoritative log of
+    // the raw student input written per question when the student uses AI
+    // hints. Only overrides truly-empty arrays; real data is untouched.
+    const studentIdForLookup =
+      submission.studentId?._id || submission.studentId;
+    const subAssignmentIdForLookup =
+      submission.subAssignmentId || submission.assignmentId?._id;
+    const emptyQids = (submission.gradedAnswers || [])
+      .filter(
+        (g) => !Array.isArray(g.submittedAnswer) || g.submittedAnswer.length === 0,
+      )
+      .map((g) => g.questionId?._id || g.questionId)
+      .filter(Boolean);
+    if (
+      studentIdForLookup &&
+      subAssignmentIdForLookup &&
+      emptyQids.length
+    ) {
+      const reports = await AssignmentAiReport.find({
+        studentId: studentIdForLookup,
+        subAssignmentId: subAssignmentIdForLookup,
+        questionId: { $in: emptyQids },
+      })
+        .select("questionId lastAnswer")
+        .lean();
+      const answerByQid = new Map(
+        reports.map((r) => [String(r.questionId), r.lastAnswer]),
+      );
+      submission.gradedAnswers = (submission.gradedAnswers || []).map((g) => {
+        const empty =
+          !Array.isArray(g.submittedAnswer) || g.submittedAnswer.length === 0;
+        if (!empty) return g;
+        const qid = String(g.questionId?._id || g.questionId || "");
+        const raw = answerByQid.get(qid);
+        if (raw == null) return g;
+        const asArray = Array.isArray(raw)
+          ? raw.map((s) => String(s ?? "").trim()).filter(Boolean)
+          : [String(raw).trim()].filter(Boolean);
+        if (!asArray.length) return g;
+        return { ...g, submittedAnswer: asArray };
+      });
+    }
+
     const rawSubAssignment = submission.assignmentId?.assignments[0];
 
     const subAssignment = rawSubAssignment
