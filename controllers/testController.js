@@ -514,9 +514,14 @@ export const submitTestQuestion = async (req, res) => {
   }
 
   try {
-    const testDoc = await Test.findById(testId);
+    // `let` because the version-conflict retry loop below reassigns these
+    // to a freshly loaded copy on each attempt (see `testDoc = fresh` inside
+    // the while loop). Declaring them `const` here crashed every concurrent
+    // submit past the first with TypeError, silently dropping most of the
+    // student's answers.
+    let testDoc = await Test.findById(testId);
     if (!testDoc) return res.status(404).json({ error: "Test not found." });
-    const task = testDoc.tests.id(taskId);
+    let task = testDoc.tests.id(taskId);
     if (!task) return res.status(404).json({ error: "Test task not found." });
 
     const now = Date.now();
@@ -1033,6 +1038,43 @@ export const getTestsByClassroom = async (req, res) => {
       .sort({ createdAt: -1 })
       .populate({ path: "tests.questions" })
       .lean();
+
+    // Enrich each submission with authoritative per-question grades from
+    // GradedTestAnswer. `Test.tests[].submissions[].questions` can drift
+    // from what actually landed when several submits race the version
+    // check; GradedTestAnswer is a per-question atomic $push so it's the
+    // canonical record. Frontend prefers `submission.gradedAnswers`
+    // when present.
+    const allTaskIds = tests.flatMap((doc) =>
+      (doc.tests || []).map((t) => t._id),
+    );
+    if (allTaskIds.length) {
+      const graded = await GradedTestAnswerModel.find({
+        taskId: { $in: allTaskIds },
+      })
+        .select(
+          "studentId taskId gradedAnswers percentage grade correctCount incorrectCount totalQuestions",
+        )
+        .lean();
+      const gradedByKey = new Map(
+        graded.map((g) => [`${g.taskId}:${g.studentId}`, g]),
+      );
+      tests.forEach((doc) => {
+        (doc.tests || []).forEach((task) => {
+          (task.submissions || []).forEach((s) => {
+            const g = gradedByKey.get(`${task._id}:${s.studentId}`);
+            if (!g) return;
+            s.gradedAnswers = g.gradedAnswers || [];
+            s.percentage = g.percentage;
+            s.grade = g.grade;
+            s.correctCount = g.correctCount;
+            s.incorrectCount = g.incorrectCount;
+            s.totalQuestions = g.totalQuestions;
+          });
+        });
+      });
+    }
+
     return res.json({ ok: true, tests });
   } catch (err) {
     console.error("getTestsByClassroom error:", err);
@@ -1211,8 +1253,18 @@ export const getStudentTestGradeDetails = async (req, res) => {
       });
     }
 
+    // Include the full question list so the student report can show every
+    // question with an "Answered" / "Not answered" badge — matches the
+    // teacher's submission drilldown and stops the report from silently
+    // hiding questions the student skipped.
     const testDoc = await Test.findById(graded.testId)
-      .select("tests._id tests.title tests.description tests.expiredDate tests.duration tests.resources tests.maxMarks tests.testStatus")
+      .select(
+        "tests._id tests.title tests.description tests.expiredDate tests.duration tests.resources tests.maxMarks tests.testStatus tests.questions",
+      )
+      .populate({
+        path: "tests.questions",
+        select: "questionText type options image",
+      })
       .lean();
     const task = testDoc?.tests?.find(
       (t) => String(t._id) === String(taskId),
