@@ -72,9 +72,11 @@ export async function createContactMessage(req, res) {
       doc.message,
     ].join("\n");
 
-    console.log("process . env ", process.env.CONTACT_TO);
-    // Use YOUR mailer
-    const CONTACT_TO = process.env.CONTACT_TO || process.env.NODEMAILER_EMAIL;
+    // Product spec: every Contact Us submission (contact page + demo page)
+    // must reach info@enlightenroom.com. CONTACT_TO env override kept so a
+    // deployment can point staging elsewhere without touching source.
+    const CONTACT_TO = process.env.CONTACT_TO || "info@enlightenroom.com";
+    console.log("[contact] destination:", CONTACT_TO);
     const html = `
       <h2>New Contact Message</h2>
       <p><b>Name:</b> ${escapeHtml(doc.firstName)} ${escapeHtml(
@@ -89,8 +91,9 @@ export async function createContactMessage(req, res) {
       )}</pre>
     `;
 
-    // fire-and-forget (don't block response)
-    sendEmail({ to: CONTACT_TO, subject, html }).catch((e) =>
+    // fire-and-forget (don't block response). replyTo=submitter so hitting
+    // Reply in the support inbox goes straight back to the person who wrote in.
+    sendEmail({ to: CONTACT_TO, subject, html, replyTo: doc.email }).catch((e) =>
       console.error("[contact] email error:", e.message)
     );
 
