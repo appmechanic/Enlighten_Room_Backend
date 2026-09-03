@@ -24,6 +24,126 @@ import Lesson from "../models/LessonModel.js";
 import ClassworkModel from "../models/ClassworkModel.js";
 import ClassworkAiReport from "../models/ClassworkAiReportModel.js";
 import GradedAnswerModel from "../models/GradedAnswerModel.js";
+import { generateClassReportSummary } from "../utils/geminiClassReportSummary.js";
+
+// Generates the class general report for a sub-assignment once it has expired.
+// Same prompt / schema / attachment shape as the classwork Class Report — we
+// literally call generateClassReportSummary and pass the sub-assignment's
+// questions + student submissions in the classwork snapshot shape.
+//
+// Idempotent guard: if task.classReport.generatedAt is already set, returns
+// without calling Gemini. Called from two places today: (1) autoSubmitAssignments
+// after the per-student sweep (cron), (2) getAssignmentsByClassroom teacher-view
+// background trigger. Either firing first is fine because of the guard.
+export async function ensureAssignmentClassReport(parentAssignment, subAssignmentId) {
+  if (!parentAssignment || !subAssignmentId) return null;
+  // Accept either a Mongoose doc or a lean object; we need the Mongoose doc to
+  // mutate + save. If a lean object was passed, re-fetch as a Mongoose doc.
+  const parentDoc = typeof parentAssignment.save === "function"
+    ? parentAssignment
+    : await Assignment.findById(parentAssignment._id);
+  if (!parentDoc) return null;
+
+  const task = parentDoc.assignments.id(subAssignmentId);
+  if (!task) return null;
+  if (task.classReport?.generatedAt) return task.classReport;
+
+  const dueMs = task.dueDate ? new Date(task.dueDate).getTime() : 0;
+  if (!dueMs || Date.now() < dueMs) return null;
+
+  // Gather per-question evidence: the question text + reference answer, plus
+  // every student's submitted answer for it, reshaped into the same snapshot
+  // shape that generateClassReportSummary already understands.
+  const questionIds = (task.questions || []).map((q) => q?._id || q).filter(Boolean);
+  if (questionIds.length === 0) return null;
+
+  const [questionDocs, gradedDocs] = await Promise.all([
+    Question.find({ _id: { $in: questionIds } })
+      .select("_id questionText type correctAnswer blanks")
+      .lean(),
+    GradedAnswerModel.find({ subAssignmentId })
+      .populate("studentId", "firstName lastName userName")
+      .select("studentId gradedAnswers")
+      .lean(),
+  ]);
+
+  const questionsById = new Map(questionDocs.map((q) => [String(q._id), q]));
+  const submissionsByQuestion = new Map();
+  for (const g of gradedDocs) {
+    const s = g.studentId || {};
+    const studentName =
+      [s.firstName, s.lastName].filter(Boolean).join(" ").trim() ||
+      s.userName ||
+      "";
+    for (const ga of g.gradedAnswers || []) {
+      const key = String(ga.questionId);
+      if (!submissionsByQuestion.has(key)) submissionsByQuestion.set(key, []);
+      submissionsByQuestion.get(key).push({
+        studentId: String(s._id || ""),
+        studentName,
+        answer: Array.isArray(ga.submittedAnswer)
+          ? ga.submittedAnswer.join(", ")
+          : String(ga.submittedAnswer ?? ""),
+      });
+    }
+  }
+
+  const questions = questionIds
+    .map((qid) => {
+      const q = questionsById.get(String(qid));
+      if (!q) return null;
+      const submitted = submissionsByQuestion.get(String(qid)) || [];
+      return {
+        question: q.questionText || "",
+        format: q.type || "",
+        correctAnswer: q.correctAnswer,
+        submitted,
+      };
+    })
+    .filter(Boolean);
+
+  const totalSubmissions = questions.reduce(
+    (n, q) => n + (q.submitted?.length || 0),
+    0,
+  );
+  if (totalSubmissions === 0) {
+    // Nobody submitted before expiry — record an empty report so we don't
+    // re-fire Gemini on every subsequent read. Mirrors ensureTestClassReport.
+    task.classReport = {
+      studentDifficulties: [],
+      nextLessonStrategy: [],
+      targetedHomework: [],
+      generatedAt: new Date(),
+      model: "",
+    };
+    await parentDoc.save();
+    return task.classReport;
+  }
+
+  const uniqueStudentIds = new Set();
+  for (const list of submissionsByQuestion.values()) {
+    for (const s of list) if (s.studentId) uniqueStudentIds.add(s.studentId);
+  }
+
+  const summary = await generateClassReportSummary({
+    lessonName: task.title || "Assignment",
+    questions,
+    teacherId: parentDoc.teacherId,
+    studentCount: uniqueStudentIds.size,
+    sessionId: parentDoc.sessionId,
+  });
+  if (!summary) return null;
+
+  task.classReport = {
+    studentDifficulties: summary.studentDifficulties || [],
+    nextLessonStrategy: summary.nextLessonStrategy || [],
+    targetedHomework: summary.targetedHomework || [],
+    generatedAt: summary.generatedAt || new Date(),
+    model: summary.model || "",
+  };
+  await parentDoc.save();
+  return task.classReport;
+}
 
 export const createAssignment = async (req, res) => {
   const {
@@ -499,6 +619,28 @@ export const getAssignmentsByClassroom = async (req, res) => {
     if (!classroomId) {
       return res.status(400).json({ error: "classroomId is required" });
     }
+
+    // Background-fire the class general report for any expired sub-assignment
+    // that doesn't have one yet. Same pattern as ensureTestClassReport /
+    // getTestsByClassroom — idempotent, doesn't block the list response.
+    Assignment.find({ classroomId })
+      .then((docs) => {
+        const now = Date.now();
+        for (const doc of docs) {
+          for (const task of doc.assignments || []) {
+            if (!task?.dueDate) continue;
+            if (new Date(task.dueDate).getTime() >= now) continue;
+            if (task?.classReport?.generatedAt) continue;
+            ensureAssignmentClassReport(doc, task._id).catch((err) =>
+              console.warn(
+                `[AssignmentClassReport] background gen failed for ${doc._id}:${task._id}`,
+                err?.message || err,
+              ),
+            );
+          }
+        }
+      })
+      .catch(() => {});
 
     const assignments = await Assignment.find({ classroomId })
       .populate("classroomId")

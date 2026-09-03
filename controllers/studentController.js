@@ -17,6 +17,7 @@ import { getGradeFromPercentage } from "../utils/gradeHelper.js";
 import { notifyAssignmentReport } from "../utils/notify.js";
 // import { notifyAssignmentReport } from "../utils/notification.helper.js";
 import { gradeDynamic } from "./Ai-tasks/ai-grader.js";
+import { ensureAssignmentClassReport } from "./assignmentController.js";
 
 function stripQuotes(str) {
   return str?.replace(/^['"]|['"]$/g, "").trim();
@@ -844,6 +845,29 @@ export const autoSubmitAssignments = async (req, res) => {
       assignment.score = 0;
       assignment.feedback = "Auto-submitted due to timeout";
       await assignment.save();
+    }
+
+    // After the per-student sweep, generate the class general report for every
+    // sub-assignment that has now expired. Idempotent — ensureAssignmentClassReport
+    // is a no-op if the report was already generated (e.g. by the teacher-view
+    // trigger). Fire-and-forget so a long Gemini call doesn't hold the cron
+    // response; errors log and don't fail the endpoint.
+    const expiredParents = await Assignment.find({
+      "assignments.dueDate": { $lt: now },
+    })
+      .select("_id assignments")
+      .lean();
+    for (const parent of expiredParents) {
+      for (const task of parent.assignments || []) {
+        if (!task?.dueDate || new Date(task.dueDate) >= now) continue;
+        if (task?.classReport?.generatedAt) continue;
+        ensureAssignmentClassReport(parent, task._id).catch((err) =>
+          console.warn(
+            `[AssignmentClassReport] cron gen failed for ${parent._id}:${task._id}`,
+            err?.message || err,
+          ),
+        );
+      }
     }
 
     res.status(200).json({

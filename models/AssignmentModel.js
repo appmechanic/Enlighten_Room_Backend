@@ -166,6 +166,50 @@ const AssignmentTaskSchema = new mongoose.Schema({
       ref: "Question",
     },
   ],
+  // AI class-general report generated once the sub-assignment expires.
+  // Same shape as Lesson.classReport / the classwork Class Report — filled
+  // by ensureAssignmentClassReport (idempotent on body existence). Never
+  // updated after first successful generation unless an admin deletes it.
+  classReport: {
+    studentDifficulties: {
+      type: [
+        new mongoose.Schema(
+          {
+            difficulty: { type: String, default: "" },
+            affectedStudents: { type: [String], default: [] },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    nextLessonStrategy: {
+      type: [
+        new mongoose.Schema(
+          {
+            difficulty: { type: String, default: "" },
+            teachingStrategy: { type: String, default: "" },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    targetedHomework: {
+      type: [
+        new mongoose.Schema(
+          {
+            kindsOfTraining: { type: String, default: "" },
+            link: { type: String, default: "" },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    generatedAt: { type: Date },
+    model: { type: String, default: "" },
+  },
   // submissions: [SubmissionSchema],
   createdAt: {
     type: Date,
