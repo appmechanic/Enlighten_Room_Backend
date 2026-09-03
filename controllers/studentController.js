@@ -22,6 +22,20 @@ function stripQuotes(str) {
   return str?.replace(/^['"]|['"]$/g, "").trim();
 }
 
+// Splits a raw student-answer string into the per-blank array we persist.
+// The naive `str.split(",")` destroys handwriting answers, whose value is a
+// `data:image/png;base64,iVBORw...` data URL that contains a single comma
+// between the mimeType marker and the payload — splitting produces
+// `["data:image/png;base64", "iVBORw..."]`, neither of which the report
+// renderer recognises as an image, so the base64 blob shows up as plain text.
+// Treat any data URL as a single indivisible answer.
+function answerStringToArray(str) {
+  const raw = str == null ? "" : String(str);
+  if (!raw) return [];
+  if (/^data:image\//i.test(raw.trim())) return [raw.trim()];
+  return raw.split(",").map((s) => stripQuotes(s?.trim()));
+}
+
 const generateUniqueUserName = async (firstName, lastName) => {
   let base = `${firstName}${lastName}`.toLowerCase().replace(/\s/g, "");
   let userName;
@@ -573,9 +587,7 @@ export const submitAssignment = async (req, res) => {
         : rawStudent == null
         ? ""
         : String(rawStudent);
-      const submittedAnswerArray = studentStr
-        ? studentStr.split(",").map((s) => stripQuotes(s?.trim()))
-        : [];
+      const submittedAnswerArray = answerStringToArray(studentStr);
 
       const correctAnswerArray = Array.isArray(original.correctAnswer)
         ? original.correctAnswer.map((s) => s?.trim())
@@ -619,9 +631,7 @@ export const submitAssignment = async (req, res) => {
           .trim()
           .toLowerCase();
       for (const q of questionsWithAnswers) {
-        const submittedAnswerArray = q.answer
-          .split(",")
-          .map((s) => stripQuotes(s?.trim()));
+        const submittedAnswerArray = answerStringToArray(q.answer);
         const correctAnswerArray = Array.isArray(q.correctAnswer)
           ? q.correctAnswer.map((s) => s?.trim())
           : [];
@@ -735,17 +745,24 @@ export const submitAssignment = async (req, res) => {
 
     console.log("Graded submission saved:", populatedGradedDoc);
 
-    // AI (or the rule-based fallback above) has already produced a full
-    // GradedAnswerModel doc with per-question scores, percentage and letter
-    // grade — so flip the sub-assignment straight to "graded". Leaving it as
-    // "submitted" made the student panel render "grade pending" indefinitely.
-    await Assignment.updateOne(
-      { "assignments._id": subAssignmentId },
+    // Mark THIS student's per-student status as completed. Previously we
+    // updated the shared `assignments.$.assignmentStatus` on the sub-assignment
+    // doc, which flipped the field to "graded" for every student in the
+    // sub-assignment — so once one student submitted, every other student
+    // saw the assignment as graded and couldn't open their own copy.
+    // Per-student progress belongs on StudentAssignmentStatus (the model
+    // startAssignment / autoSubmitAssignments already use).
+    await StudentAssignmentStatus.updateOne(
+      { studentId, assignmentId: subAssignmentId },
       {
         $set: {
-          "assignments.$.assignmentStatus": "graded",
+          isCompleted: true,
+          isAutoSubmitted,
+          endTime: new Date(),
+          score: typeof percentage === "number" ? percentage : 0,
         },
-      }
+      },
+      { upsert: true }
     );
 
     // Check if classroom settings allow sending report
@@ -1009,6 +1026,37 @@ export const getStudentDashboard = async (req, res) => {
       //   "course topic questionText type options hints "
       // )
       .lean();
+
+    // Per-student status lookup: prior versions read the shared
+    // `assignments.$.assignmentStatus` field, which the submit handler was
+    // updating globally — so once one student submitted, every classmate saw
+    // the sub-assignment as "graded" and couldn't open it. Derive completion
+    // per requesting student from whichever signal we can find:
+    //   1. A GradedAnswerModel doc keyed on (studentId, subAssignmentId) —
+    //      this covers BOTH new submissions and legacy submissions that
+    //      pre-date the StudentAssignmentStatus fix.
+    //   2. StudentAssignmentStatus.isCompleted — auto-submit path uses this.
+    const [gradedSubAssignmentIds, perStudentStatuses] = await Promise.all([
+      GradedAnswerModel.find({ studentId })
+        .select("subAssignmentId")
+        .lean(),
+      StudentAssignmentStatus.find({ studentId })
+        .select("assignmentId isCompleted")
+        .lean(),
+    ]);
+    const completedSubAssignmentIds = new Set();
+    for (const g of gradedSubAssignmentIds) {
+      if (g?.subAssignmentId) completedSubAssignmentIds.add(String(g.subAssignmentId));
+    }
+    for (const s of perStudentStatuses) {
+      if (s?.isCompleted && s?.assignmentId) {
+        completedSubAssignmentIds.add(String(s.assignmentId));
+      }
+    }
+    const resolveStatusForStudent = (task) => {
+      if (completedSubAssignmentIds.has(String(task?._id))) return "graded";
+      return null;
+    };
 
     const uniqueStudentIds = new Set();
     for (const grp of allAssignments || []) {
@@ -1323,7 +1371,7 @@ export const getStudentDashboard = async (req, res) => {
             classroom: cls,
 
             description: task?.description,
-            assignmentStatus: task?.assignmentStatus,
+            assignmentStatus: resolveStatusForStudent(task),
 
             session: group.sessionId,
             // session:
@@ -1379,7 +1427,7 @@ export const getStudentDashboard = async (req, res) => {
           id: t?._id || `${group?._id}:${dueKey}`,
           title: t?.title || "Assignment Deadline",
           description: t?.description,
-          assignmentStatus: t?.assignmentStatus,
+          assignmentStatus: resolveStatusForStudent(t),
           dueAt: new Date(t.dueDate).toISOString(),
           allDay: true,
           classroom: cls,

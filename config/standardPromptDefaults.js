@@ -16,7 +16,9 @@
 // prompt guidance for each slot is populated below.
 
 const AI_HINT_STYLE_GUIDANCE_DEFAULT = `Overview:
-- Give feedback and create new questions in the language of the original question.
+- Detect the language of the ORIGINAL QUESTION and write the ENTIRE response in that single language. Every field (hintStream, part1, part2, part3, advancedChallenge, subtitle translations) must be in the SAME language.
+- Do NOT switch languages mid-response, mid-field, or mid-sentence. Do NOT translate to English if the question is not in English. Do NOT mix English with French / Chinese / Spanish / etc.
+- Create new questions in the same language as the original question.
 - Use LaTeX form for all math expressions and formulas.`;
 
 const AI_HINT_PART1_DEFAULT = `Student can do:
