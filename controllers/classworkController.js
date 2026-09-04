@@ -496,6 +496,62 @@ export const downloadAllAnswersCsvReport = async (req, res) => {
   }
 };
 
+// Build the multi-line "Feedback" cell for a parent report from the student's
+// LAST attempt on a question. Reads the latest interaction from
+// ClassworkAiReportModel (which retains the full part1/part2/part3 arrays even
+// after later attempts overwrite ClassworkModel.submitted[].feedback) and,
+// when the final attempt was correct, appends the congratulation + advanced
+// challenge question. Falls back to the plain hintStream if no AI report
+// exists yet (e.g. legacy submissions or aiExpired questions).
+function formatLastAttemptFeedback(reportDoc, fallbackFeedback) {
+  const interactions = Array.isArray(reportDoc?.interactions)
+    ? reportDoc.interactions
+    : [];
+  const last = interactions[interactions.length - 1];
+  if (!last) {
+    return String(fallbackFeedback || '').trim();
+  }
+
+  const lines = [];
+  const part1 = Array.isArray(last.part1) ? last.part1.filter(Boolean) : [];
+  const part2 = Array.isArray(last.part2) ? last.part2.filter(Boolean) : [];
+  const part3 = Array.isArray(last.part3) ? last.part3.filter(Boolean) : [];
+
+  if (part1.length) {
+    lines.push('Part 1:');
+    part1.forEach((line) => lines.push(`- ${line}`));
+  }
+  if (part2.length) {
+    if (lines.length) lines.push('');
+    lines.push('Part 2:');
+    part2.forEach((line) => lines.push(`- ${line}`));
+  }
+  if (part3.length) {
+    if (lines.length) lines.push('');
+    lines.push('Part 3:');
+    part3.forEach((line) => lines.push(`- ${line}`));
+  }
+
+  if (last.correct) {
+    const ac = last.advancedChallenge || {};
+    const congrats = String(ac.congratulations || '').trim();
+    const advQ = String(ac.question || '').trim();
+    if (congrats || advQ) {
+      if (lines.length) lines.push('');
+      if (congrats) lines.push(congrats);
+      if (advQ) lines.push(`Advanced Challenge: ${advQ}`);
+    }
+  }
+
+  if (!lines.length) {
+    // No structured parts on the last interaction — fall back to the hint
+    // string so the report is never empty.
+    return String(last.hintStream || fallbackFeedback || '').trim();
+  }
+
+  return lines.join('\n');
+}
+
 // Send classwork report to a list of students and their parents (simulated)
 export const sendClassworkReportToStudentsAndParents = async (req, res) => {
   try {
@@ -508,11 +564,26 @@ export const sendClassworkReportToStudentsAndParents = async (req, res) => {
     }
     const questions = await ClassworkModel.find({ roomId });
 
+    // Load every AI report for this room in one pass so we can look up the
+    // last attempt's structured feedback per (questionId, studentId) without
+    // hitting Mongo inside the row-building loop.
+    const aiReports = await ClassworkAiReport.find({ roomId }).lean();
+    const aiReportByStudentQuestion = new Map();
+    for (const rep of aiReports) {
+      aiReportByStudentQuestion.set(
+        `${String(rep.studentId)}::${String(rep.questionId)}`,
+        rep
+      );
+    }
+
     const buildRowsForStudent = (studentId) => {
       const rows = [];
       questions.forEach((q, qIdx) => {
         q.submitted.forEach((s) => {
           if (String(s.studentId) !== String(studentId)) return;
+          const rep = aiReportByStudentQuestion.get(
+            `${String(studentId)}::${String(q.id)}`
+          );
           rows.push({
             'Question No.': qIdx + 1,
             'Question Text': q.question,
@@ -523,7 +594,7 @@ export const sendClassworkReportToStudentsAndParents = async (req, res) => {
             'Is Correct': s.isCorrect ? 'Yes' : 'No',
             'AI Score': s.aiScore,
             'AI Used': s.aiUsed,
-            'Feedback': s.feedback,
+            'Feedback': formatLastAttemptFeedback(rep, s.feedback),
             'Correct Answer': Array.isArray(q.correctAnswer)
               ? q.correctAnswer.filter((v) => String(v ?? '').trim()).join(' | ')
               : q.correctAnswer ?? '',

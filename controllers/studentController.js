@@ -99,12 +99,53 @@ export const createStudent = async (req, res) => {
     // console.log("parent", parent);
     // console.log("teacher", teacher);
 
-    // Check if email already exists in User
+    // Resolve which teacher is making this request. Prefer the explicit
+    // teacherId in the body (existing frontend behaviour) but fall back to the
+    // authenticated user so the teacherIds association is never silently lost.
+    const associatingTeacherId = teacherId || LoggedUser || null;
+
+    // Check if email already exists in User. Historically we rejected with
+    // 409 here, which blocked a second teacher from adding a student that
+    // another teacher had already created. A student email is one User doc
+    // but can belong to many teachers — record the association via the
+    // `teacherIds` array and return the existing user so the caller can go
+    // on to add them to a classroom. Non-student collisions (e.g. an email
+    // registered as a teacher/parent) still fail with 409.
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res
-        .status(409)
-        .json({ error: "User with this email already registered" });
+      if (existingUser.userRole !== "student") {
+        return res
+          .status(409)
+          .json({ error: "User with this email already registered" });
+      }
+
+      if (associatingTeacherId) {
+        await User.updateOne(
+          { _id: existingUser._id },
+          { $addToSet: { teacherIds: associatingTeacherId } }
+        );
+      }
+
+      const populatedUser = await User.findOne({ _id: existingUser._id })
+        .populate("parentId", "firstName lastName email")
+        .populate("teacherId", "firstName lastName email")
+        .populate("referedBy", "firstName lastName email");
+
+      res.status(200).json({ populatedUser, reused: true });
+
+      // Notify the student that another teacher has added them, so they can
+      // report a mistaken add to support. Fire-and-forget.
+      const noticeHtml = `
+        <h3>You've been added to a class on Enlighten Room</h3>
+        <p>A teacher has just added your account (<strong>${email}</strong>) to one of their classes.</p>
+        <p>If you were not expecting this, please email
+          <a href="mailto:support@enlightenroom.com">support@enlightenroom.com</a>
+          and we'll remove you from the classroom.</p>
+      `;
+      addSendEmail(email, "You've been added to a class on Enlighten Room", noticeHtml).catch(
+        (err) => console.error("Error sending classroom-add notice email:", err)
+      );
+      return;
     }
 
     // Generate unique userName
@@ -122,7 +163,8 @@ export const createStudent = async (req, res) => {
       firstName,
       lastName,
       parentId,
-      teacherId,
+      teacherId: associatingTeacherId,
+      teacherIds: associatingTeacherId ? [associatingTeacherId] : [],
       date_of_birth,
       age,
       city,
@@ -148,11 +190,14 @@ export const createStudent = async (req, res) => {
     // ✅ Send Email
     const html = `
       <h3>Welcome to Enlighten Room!</h3>
-      <p>Your account has been created.</p>
+      <p>Your account has been created by your teacher.</p>
       <p><strong>Email:</strong> ${email}</p>
       <p><strong>Password:</strong> ${password}</p>
       <p><strong>Username:</strong> ${userName}</p>
       <p>You can now log in and start using the platform.</p>
+      <p>If you are not in this class, please email
+        <a href="mailto:support@enlightenroom.com">support@enlightenroom.com</a>
+        and we'll remove your name from the classroom.</p>
     `;
 
     try {
@@ -356,9 +401,13 @@ export const getStudentsByTeacherId = async (req, res) => {
   try {
     const { teacherId } = req.params;
 
+    // A student may be associated with more than one teacher: `teacherId` is
+    // the original creator, `teacherIds` records every teacher who has added
+    // this student since. Match either so the requesting teacher's picker
+    // shows students they've re-added via createStudent.
     const students = await User.find({
       userRole: "student",
-      teacherId: teacherId,
+      $or: [{ teacherId: teacherId }, { teacherIds: teacherId }],
     })
       .populate("teacherId", "firstName lastName email")
       .populate("parentId", "firstName lastName email")
@@ -1120,10 +1169,18 @@ export const getStudentDashboard = async (req, res) => {
 
         const dueStr = new Date(task.dueDate).toISOString().split("T")[0];
 
+        // Override the SHARED `task.assignmentStatus` (see
+        // [[assignment_per_student_status]]) with this student's derived
+        // status so the panel doesn't show "pending" after they submit —
+        // or "graded" for classmates just because ANY student submitted.
+        const perStudentStatus =
+          resolveStatusForStudent(task) || task.assignmentStatus || null;
+        const enriched = { ...task, assignmentStatus: perStudentStatus };
+
         if (dueStr === todayStr) {
-          todayAssignments.push(task);
+          todayAssignments.push(enriched);
         } else {
-          thisWeekAssignments.push(task);
+          thisWeekAssignments.push(enriched);
         }
       });
     });

@@ -85,6 +85,12 @@ const userSchema = new mongoose.Schema(
     // Student specific
     parentId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     teacherId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    // Multi-teacher membership: a single student email may be added by more
+    // than one teacher. `teacherId` above is kept for legacy reads and points
+    // at the original creator; `teacherIds` is the authoritative list of every
+    // teacher who has associated this student with themselves (via createStudent
+    // reuse or addStudentsToClassroom).
+    teacherIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     settings: {
       screenLocked: { type: Boolean, default: false },
       sendReport: { type: Boolean, default: false },

@@ -24,6 +24,7 @@ import Lesson from "../models/LessonModel.js";
 import ClassworkModel from "../models/ClassworkModel.js";
 import ClassworkAiReport from "../models/ClassworkAiReportModel.js";
 import GradedAnswerModel from "../models/GradedAnswerModel.js";
+import StudentAssignmentStatus from "../models/StudentAssignmentStatus.js";
 import { generateClassReportSummary } from "../utils/geminiClassReportSummary.js";
 
 // Generates the class general report for a sub-assignment once it has expired.
@@ -1053,6 +1054,29 @@ export const getStudentAssignmentsByClassroom = async (req, res) => {
       gradedDocs.map((g) => [String(g.subAssignmentId), g])
     );
 
+    // Per-student completion set. `assignments.$.assignmentStatus` on the
+    // sub-doc is SHARED across every student in the sub-assignment (see
+    // [[assignment_per_student_status]]) — reading it here made the panel
+    // show "pending" for classmates the moment ONE student submitted, or
+    // never flipped to graded for the student who actually submitted.
+    // Union the two per-student signals so both submit-path and
+    // auto-submit-path submissions register.
+    const studentStatusDocs = await StudentAssignmentStatus.find({
+      studentId,
+      assignmentId: { $in: allSubAssignmentIds },
+    })
+      .select("assignmentId isCompleted")
+      .lean();
+    const completedSubAssignmentIds = new Set();
+    for (const g of gradedDocs) {
+      if (g?.subAssignmentId) completedSubAssignmentIds.add(String(g.subAssignmentId));
+    }
+    for (const s of studentStatusDocs) {
+      if (s?.isCompleted && s?.assignmentId) {
+        completedSubAssignmentIds.add(String(s.assignmentId));
+      }
+    }
+
     const studentAssignments = [];
 
     assignments.forEach((assignmentDoc) => {
@@ -1066,10 +1090,13 @@ export const getStudentAssignmentsByClassroom = async (req, res) => {
       assignmentDoc.assignments.forEach((task) => {
         if (task.studentIds.some((id) => id.toString() === studentId)) {
           const graded = gradedBySubId.get(String(task._id));
+          const perStudentStatus = completedSubAssignmentIds.has(String(task._id))
+            ? "graded"
+            : task.assignmentStatus;
           studentAssignments.push({
             assignmentId,
             subAssignmentId: task._id,
-            assignmentStatus: task.assignmentStatus,
+            assignmentStatus: perStudentStatus,
             title: task.title,
             description: task.description,
             dueDate: task.dueDate,
