@@ -9,34 +9,20 @@ import {
   logAiUsage,
   recordAiCallLog,
 } from "./aiTokenUsage.js";
-import { getAiModel, getAiRetry, getAiDirective } from "./aiConfig.js";
-import { getOrCreateClassworkFeedbackCache } from "./classworkGeminiCache.js";
 import {
-  AI_HINT_PROMPT_SECTION_DEFAULTS,
-  DIRECTIVE_DEFAULTS,
-} from "../config/standardPromptDefaults.js";
+  getAiModel,
+  getAiRetry,
+  getAiDirective,
+  getAiStandardHintPrompt,
+} from "./aiConfig.js";
+import { getOrCreateClassworkFeedbackCache } from "./classworkGeminiCache.js";
 
-// Classwork feedback runs on a fully hard-coded standard prompt + response
-// schema. The DB-backed StandardPrompt / directives are still edited via the
-// admin UI, but this call intentionally bypasses them so behaviour is
-// reproducible from the source tree alone. Text is imported from
-// standardPromptDefaults.js so there's a single canonical source; flip the
-// imports below to inline literals if the config module ever needs to diverge.
-const HARDCODED_STANDARD_PROMPT_TEXT = AI_HINT_PROMPT_SECTION_DEFAULTS
-  .filter((s) => typeof s === "string" && s.length > 0)
-  .join("\n\n");
-const HARDCODED_STANDARD_PROMPT_HASH = crypto
-  .createHash("sha1")
-  .update(HARDCODED_STANDARD_PROMPT_TEXT)
-  .digest("hex");
-const HARDCODED_SOLUTION_COMPUTE = DIRECTIVE_DEFAULTS["classwork.solutionCompute"];
-const HARDCODED_SOLUTION_SKIP = DIRECTIVE_DEFAULTS["classwork.solutionSkip"];
-const HARDCODED_MISTAKE_COMPUTE = DIRECTIVE_DEFAULTS["classwork.mistakeCompute"];
-const HARDCODED_MISTAKE_SKIP = DIRECTIVE_DEFAULTS["classwork.mistakeSkip"];
-const HARDCODED_HINT_STREAM = DIRECTIVE_DEFAULTS["classwork.hintStream"];
-const HARDCODED_MATH_EQUIVALENCE = DIRECTIVE_DEFAULTS["classwork.mathEquivalence"];
-const HARDCODED_ASK_MODE = DIRECTIVE_DEFAULTS["classwork.askMode"];
-const HARDCODED_TELL_MODE = DIRECTIVE_DEFAULTS["classwork.tellMode"];
+// Classwork feedback resolves its standard prompt + directives from the
+// admin-edited StandardPrompt via aiConfig (60s in-memory cache). Both fall
+// back to the canonical defaults in config/standardPromptDefaults.js if the
+// DB is unseeded or unreachable, so behaviour degrades gracefully. To pin
+// back to the source-tree copy in an emergency, replace the getters below
+// with the AI_HINT_PROMPT_SECTION_DEFAULTS / DIRECTIVE_DEFAULTS constants.
 
 // Feedback-tuning knobs hard-coded so the waiting-time-oriented values
 // actually take effect regardless of what's seeded in Mongo. Same rationale
@@ -428,19 +414,37 @@ async function buildGeminiRequest({
   computeStandardSolution,
   computeCommonMistake,
 }) {
-  // Standard prompt + all classwork directives are hard-coded (see top of
-  // file). Only the per-teacher prompt is still DB-backed.
-  const standardText = HARDCODED_STANDARD_PROMPT_TEXT;
-  const standardPromptHash = HARDCODED_STANDARD_PROMPT_HASH;
-  const STANDARD_SOLUTION_COMPUTE_INSTRUCTION = HARDCODED_SOLUTION_COMPUTE;
-  const STANDARD_SOLUTION_SKIP_INSTRUCTION = HARDCODED_SOLUTION_SKIP;
-  const COMMON_MISTAKE_COMPUTE_INSTRUCTION = HARDCODED_MISTAKE_COMPUTE;
-  const COMMON_MISTAKE_SKIP_INSTRUCTION = HARDCODED_MISTAKE_SKIP;
-  const HINT_STREAM_INSTRUCTION = HARDCODED_HINT_STREAM;
-  const MATH_EQUIVALENCE_INSTRUCTION = HARDCODED_MATH_EQUIVALENCE;
-  const ASK_MODE_INSTRUCTION = HARDCODED_ASK_MODE;
-  const TELL_MODE_INSTRUCTION = HARDCODED_TELL_MODE;
-  const teacherPrompt = await getTeacherPromptCached(teacherId);
+  // Standard prompt + all classwork directives come from the admin-edited
+  // StandardPrompt (aiConfig's 60s cache means no per-submission DB hit).
+  // Hash is recomputed from the actual text so an admin edit busts the
+  // Gemini prompt cache correctly.
+  const [
+    teacherPrompt,
+    standardText,
+    STANDARD_SOLUTION_COMPUTE_INSTRUCTION,
+    STANDARD_SOLUTION_SKIP_INSTRUCTION,
+    COMMON_MISTAKE_COMPUTE_INSTRUCTION,
+    COMMON_MISTAKE_SKIP_INSTRUCTION,
+    HINT_STREAM_INSTRUCTION,
+    MATH_EQUIVALENCE_INSTRUCTION,
+    ASK_MODE_INSTRUCTION,
+    TELL_MODE_INSTRUCTION,
+  ] = await Promise.all([
+    getTeacherPromptCached(teacherId),
+    getAiStandardHintPrompt(),
+    getAiDirective("classwork.solutionCompute"),
+    getAiDirective("classwork.solutionSkip"),
+    getAiDirective("classwork.mistakeCompute"),
+    getAiDirective("classwork.mistakeSkip"),
+    getAiDirective("classwork.hintStream"),
+    getAiDirective("classwork.mathEquivalence"),
+    getAiDirective("classwork.askMode"),
+    getAiDirective("classwork.tellMode"),
+  ]);
+  const standardPromptHash = crypto
+    .createHash("sha1")
+    .update(standardText)
+    .digest("hex");
 
   const cachedSolution =
     typeof cachedContext?.standardSolution === "string"
@@ -1681,19 +1685,16 @@ export async function warmClassworkFeedbackCache({
 }) {
   try {
     if (!questionId) return { ok: false, reason: "no-question" };
-    const [MODEL, teacherPrompt] = await Promise.all([
+    const [MODEL, teacherPrompt, standardText] = await Promise.all([
       getAiModel(),
       getTeacherPromptCached(teacherId),
+      getAiStandardHintPrompt(),
     ]);
     const cachedSolution = (standardSolution || "").trim();
     const solutionBlock = cachedSolution
       ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
       : "";
-    const systemInstruction = [
-      HARDCODED_STANDARD_PROMPT_TEXT,
-      teacherPrompt,
-      solutionBlock,
-    ]
+    const systemInstruction = [standardText, teacherPrompt, solutionBlock]
       .filter(Boolean)
       .join("\n\n");
     const result = await getOrCreateClassworkFeedbackCache({

@@ -4,6 +4,7 @@ import {
   RETRY_DEFAULTS,
   TUNING_DEFAULTS,
   DIRECTIVE_DEFAULTS,
+  AI_HINT_PROMPT_SECTION_DEFAULTS,
   buildSeedPatch,
 } from "../config/standardPromptDefaults.js";
 
@@ -84,6 +85,18 @@ async function loadFromDb() {
           .map(([k, v]) => [k, v.trim()])
       ),
     },
+    // Admin-editable AI hint standard prompt. Prefer the joined `aiHintPrompt`
+    // written by the controller on save; fall back to reassembling from the
+    // sections array; finally fall back to the canonical defaults so an
+    // unseeded DB still produces a usable prompt.
+    aiHintPrompt:
+      (typeof doc?.aiHintPrompt === "string" && doc.aiHintPrompt.trim()) ||
+      (Array.isArray(doc?.aiHintPromptSections)
+        ? doc.aiHintPromptSections.filter((s) => typeof s === "string" && s.trim()).join("\n\n")
+        : "") ||
+      AI_HINT_PROMPT_SECTION_DEFAULTS
+        .filter((s) => typeof s === "string" && s.length > 0)
+        .join("\n\n"),
   };
 }
 
@@ -98,6 +111,9 @@ async function refresh() {
         retry: RETRY_DEFAULTS,
         tuning: TUNING_DEFAULTS,
         directives: { ...DIRECTIVE_DEFAULTS },
+        aiHintPrompt: AI_HINT_PROMPT_SECTION_DEFAULTS
+          .filter((s) => typeof s === "string" && s.length > 0)
+          .join("\n\n"),
       };
     }
   }
@@ -152,9 +168,15 @@ export async function getAiDirective(key) {
   return DIRECTIVE_DEFAULTS[key] || "";
 }
 
-// Force-invalidate the cache (call from admin save handler so edits take
-// effect within one request instead of waiting up to 60s).
-export function invalidateAiConfigCache() {
-  cache = null;
-  cacheExpiresAt = 0;
+// Admin-editable AI Hint Standard Prompt. Same 60s cache as every other
+// getter; falls back to the canonical AI_HINT_PROMPT_SECTION_DEFAULTS text
+// when the DB is unseeded / unreachable.
+export async function getAiStandardHintPrompt() {
+  const cfg = await getConfig();
+  const value = cfg?.aiHintPrompt;
+  if (typeof value === "string" && value.trim()) return value;
+  return AI_HINT_PROMPT_SECTION_DEFAULTS
+    .filter((s) => typeof s === "string" && s.length > 0)
+    .join("\n\n");
 }
+
