@@ -194,3 +194,10 @@ export async function getAiStandardHintPrompt() {
     .join("\n\n");
 }
 
+// Force-invalidate the cache (call from admin save handler so edits take
+// effect within one request instead of waiting up to 60s).
+export function invalidateAiConfigCache() {
+  cache = null;
+  cacheExpiresAt = 0;
+}
+
