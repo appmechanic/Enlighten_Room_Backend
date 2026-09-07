@@ -48,7 +48,7 @@ function deepMergeStrings(fallback, override) {
 
 async function loadFromDb() {
   let doc = await StandardPrompt.findOne({ key: "global" })
-    .select("models retry tuning directives aiHintPromptSections reportPromptSections creatingAssignmentPrompt emailPrompt")
+    .select("models retry tuning directives aiHintPrompt aiHintPromptSections reportPromptSections creatingAssignmentPrompt emailPrompt")
     .lean();
 
   // Auto-seed on cache-miss when the DB is missing any canonical default.
@@ -61,7 +61,7 @@ async function loadFromDb() {
         patch,
         { new: true, upsert: true, setDefaultsOnInsert: true }
       )
-        .select("models retry tuning directives aiHintPromptSections reportPromptSections creatingAssignmentPrompt emailPrompt")
+        .select("models retry tuning directives aiHintPrompt aiHintPromptSections reportPromptSections creatingAssignmentPrompt emailPrompt")
         .lean();
     } catch (err) {
       console.error("[aiConfig] Failed to auto-seed StandardPrompt:", err);
@@ -89,15 +89,29 @@ async function loadFromDb() {
     // written by the controller on save; fall back to reassembling from the
     // sections array; finally fall back to the canonical defaults so an
     // unseeded DB still produces a usable prompt.
-    aiHintPrompt:
-      (typeof doc?.aiHintPrompt === "string" && doc.aiHintPrompt.trim()) ||
-      (Array.isArray(doc?.aiHintPromptSections)
-        ? doc.aiHintPromptSections.filter((s) => typeof s === "string" && s.trim()).join("\n\n")
-        : "") ||
-      AI_HINT_PROMPT_SECTION_DEFAULTS
-        .filter((s) => typeof s === "string" && s.length > 0)
-        .join("\n\n"),
+    aiHintPrompt: resolveHintPrompt(doc),
   };
+}
+
+function resolveHintPrompt(doc) {
+  if (typeof doc?.aiHintPrompt === "string" && doc.aiHintPrompt.trim()) {
+    console.log(`[aiConfig] hint prompt source=db.aiHintPrompt (${doc.aiHintPrompt.length} chars)`);
+    return doc.aiHintPrompt;
+  }
+  if (Array.isArray(doc?.aiHintPromptSections)) {
+    const joined = doc.aiHintPromptSections
+      .filter((s) => typeof s === "string" && s.trim())
+      .join("\n\n");
+    if (joined) {
+      console.log(`[aiConfig] hint prompt source=db.aiHintPromptSections (${joined.length} chars)`);
+      return joined;
+    }
+  }
+  const fallback = AI_HINT_PROMPT_SECTION_DEFAULTS
+    .filter((s) => typeof s === "string" && s.length > 0)
+    .join("\n\n");
+  console.log(`[aiConfig] hint prompt source=code-defaults FALLBACK (${fallback.length} chars) — DB has no admin edits yet`);
+  return fallback;
 }
 
 async function refresh() {
