@@ -144,8 +144,16 @@ The following is my teacher's personalized prompt. Please follow his/her advice 
 export const EMAIL_PROMPT_DEFAULT = "";
 
 // ---------- models ----------
+// All text AI calls (classwork feedback, precompute, class report, assignment
+// generation, test paths, whiteboard, ai-grader) resolve their model via
+// getAiModel() → StandardPrompt.models.default. Kept on gemini-2.5-flash-lite
+// so per-token cost is uniform across every feature — makes plan-price math
+// straightforward. The fallback slot is used ONCE when the primary returns a
+// 503/overload; leaving it on flash-lite too so overload retries don't jump
+// the cost bracket. Bump `default` back to gemini-2.5-flash here if quality
+// regressions show up on the classwork feedback path.
 export const MODEL_DEFAULTS = {
-  default: "gemini-2.5-flash",
+  default: "gemini-2.5-flash-lite",
   fallback: "gemini-2.5-flash-lite",
   image: "gemini-3-pro-image-preview",
 };

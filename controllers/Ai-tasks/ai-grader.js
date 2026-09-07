@@ -9,7 +9,7 @@ import TeacherAIConfig from "../../models/teacherAiConfigModel.js";
 // project already uses (classwork feedback, assignment questions, hints).
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-2.5-flash-lite";
 
 export async function gradeDynamic(
   questionsWithAnswers = [],
