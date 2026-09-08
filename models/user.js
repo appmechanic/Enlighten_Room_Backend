@@ -173,6 +173,19 @@ const userSchema = new mongoose.Schema(
       default: false,
     },
     googleDrive: { type: GoogleDriveSchema, default: () => ({}) },
+
+    // Per-teacher usage caps. Enforced by requireUsageBudget middleware and
+    // shown as used/limit on the admin Teachers page + the teacher dashboard.
+    // These override any plan-level default; edit via PATCH /api/admin/teachers/:id/limits.
+    // aiTokensPerMonth is compared in *billed* units (raw Gemini tokens × 1.3).
+    // storageBytes is cumulative, not monthly.
+    limits: {
+      meetingMinutesPerMonth: { type: Number, default: 3300 },
+      screenLockMinutesPerMonth: { type: Number, default: 600 },
+      lessonReportsPerMonth: { type: Number, default: 10 },
+      aiTokensPerMonth: { type: Number, default: 500000 },
+      storageBytes: { type: Number, default: 50 * 1024 * 1024 },
+    },
   },
   { timestamps: true }
 );

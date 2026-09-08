@@ -663,7 +663,7 @@ async function resolveSessionContext(roomId) {
 // hook in addQuestion (which needs teacher context to load the teacher's
 // prompt) — separate from the submit-path resolver so it can run without
 // waiting for a Lesson row to exist for staged questions.
-async function resolveTeacherIdForRoom(roomId) {
+export async function resolveTeacherIdForRoom(roomId) {
   if (!roomId) return null;
   try {
     const escapedRoomId = String(roomId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

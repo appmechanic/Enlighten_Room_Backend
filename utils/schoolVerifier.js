@@ -4,7 +4,7 @@ import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const MODEL = "gemini-2.5-flash-lite";
+const MODEL = "gemini-3.5-flash-lite";
 
 const emailDomain = (email) => {
   const raw = String(email || "").trim().toLowerCase();

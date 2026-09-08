@@ -77,8 +77,8 @@ const StandardPromptSchema = new mongoose.Schema(
     // the default model returns an overload error. `image` is a different
     // modality (text-to-image) and needs its own slot.
     models: {
-      default: { type: String, trim: true, default: "gemini-2.5-flash-lite" },
-      fallback: { type: String, trim: true, default: "gemini-2.5-flash-lite" },
+      default: { type: String, trim: true, default: "gemini-3.5-flash-lite" },
+      fallback: { type: String, trim: true, default: "gemini-3.5-flash-lite" },
       image: { type: String, trim: true, default: "gemini-3-pro-image-preview" },
     },
     // Per-caller retry/backoff policy. Callers with a bigger budget
