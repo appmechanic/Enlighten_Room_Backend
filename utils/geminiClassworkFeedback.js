@@ -531,10 +531,10 @@ async function buildGeminiRequest({
   const displayedAttempt = isValidAttempt ? Math.min(rawAttemptNo, 5) : rawAttemptNo;
   const askTellInstruction = isValidAttempt
     ? [
-        "STEP 1 — JUDGE CORRECTNESS FIRST: Compare the student answer to the reference using the MATHEMATICAL EQUIVALENCE rules below. Judge by mathematical value, not string form.",
-        "STEP 2 — IF EQUIVALENT: Set correct=true, write a warm congratulation in hintStream, and fill advancedChallenge. SKIP the pedagogy mode entirely — do NOT generate 🛑/✅/🔨 hints.",
-        "STEP 3 — IF NOT EQUIVALENT: Apply the pedagogy mode below.",
-        `Submission attempt #${displayedAttempt} for this student on this question.`,
+        "STEP 1 — JUDGE CORRECTNESS by MATH EQUIVALENCE (rules in systemInstruction), by value not string.",
+        "STEP 2 — IF EQUIVALENT: correct=true; warm hintStream; fill advancedChallenge; NO 🛑/✅/🔨.",
+        "STEP 3 — IF NOT EQUIVALENT: apply pedagogy mode below.",
+        `Attempt #${displayedAttempt}.`,
         rawAttemptNo % 2 === 1 ? ASK_MODE_INSTRUCTION : TELL_MODE_INSTRUCTION,
       ].join("\n")
     : null;
@@ -547,10 +547,8 @@ async function buildGeminiRequest({
   const serverSideMatch = serverSideEquivalenceMatches(answer, correctAnswer, format);
   const serverEquivalenceOverride = serverSideMatch
     ? [
-        "SERVER-SIDE EQUIVALENCE PRE-CHECK: PASSED.",
-        "The student's answer has been normalized by the backend (whitespace stripped, LaTeX backslashes on function names removed, implicit-vs-explicit function-argument parentheses collapsed) and is IDENTICAL to the reference answer.",
-        "This match is AUTHORITATIVE. You MUST set correct=true. Do NOT generate 🛑/✅/🔨 hints. Write a warm hintStream congratulating the student by first name, put a brief acknowledgment in part1, leave part2 as an empty array, and fill advancedChallenge with a harder question in the language of the original question.",
-        "Ignore any pedagogy mode directive below.",
+        "SERVER-SIDE PRE-CHECK PASSED — student answer normalizes IDENTICAL to reference. AUTHORITATIVE.",
+        "MUST: correct=true; warm hintStream greeting first name; brief part1 ack; part2=[]; fill advancedChallenge (harder, same language). NO 🛑/✅/🔨. Ignore pedagogy mode below.",
       ].join("\n")
     : null;
 
