@@ -2494,7 +2494,7 @@ function writeSseEvent(res, event, data) {
 // event whose payload matches the non-stream /submit response body
 // exactly — client renderers stay identical after the stream ends.
 export const submitAnswerStream = async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   // Nginx-style buffers can starve short SSE messages; the header is a

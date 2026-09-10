@@ -454,17 +454,36 @@ async function buildGeminiRequest({
     ? cachedContext.commonMistakes
     : [];
 
-  // Cache-friendly stable prefix: standard prompt + teacher prompt +
+  // Cache-friendly stable prefix: standard prompt + globally-stable rubric
+  // directives (math equivalence, hint-stream rules) + teacher prompt +
   // precomputed canonical solution. Every submission for this question gets
-  // exactly this systemInstruction, so Gemini's implicit prefix cache can
-  // hit across submissions. Common mistakes are DELIBERATELY excluded —
-  // they change as new mistakes accumulate and would invalidate the cache.
+  // exactly this systemInstruction, so Gemini's explicit prompt cache can
+  // hit across submissions. The two rubric directives used to live in the
+  // per-submission user prompt; moving them into the cached prefix grows
+  // the prefill savings by their full length without changing behaviour.
+  // Common mistakes are DELIBERATELY excluded — they change as new
+  // mistakes accumulate and would invalidate the cache.
   const solutionBlock = cachedSolution
     ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
     : "";
-  const systemInstruction = [standardText, teacherPrompt, solutionBlock]
+  const systemInstruction = [
+    standardText,
+    MATH_EQUIVALENCE_INSTRUCTION,
+    HINT_STREAM_INSTRUCTION,
+    teacherPrompt,
+    solutionBlock,
+  ]
     .filter(Boolean)
     .join("\n\n");
+
+  // Size sanity: classworkGeminiCache requires >=400 chars to attempt a
+  // Gemini explicit-cache create, and gemini-2.5-flash won't accept a
+  // cache under ~1024 tokens (~4096 chars). Logging the assembled length
+  // + per-slot breakdown so staging can spot a shrunken live prompt
+  // that would silently drop the cache benefit.
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] systemInstruction len=${systemInstruction.length} ~tokens=${Math.round(systemInstruction.length / 4)} slots={std=${standardText?.length || 0},mathEq=${MATH_EQUIVALENCE_INSTRUCTION?.length || 0},hintStream=${HINT_STREAM_INSTRUCTION?.length || 0},teacher=${teacherPrompt?.length || 0},solution=${solutionBlock?.length || 0}}`,
+  );
 
   const normalizedAnswerText = normalizeAnswerText(answer);
   const referenceAnswer = formatCorrectAnswerForPrompt(correctAnswer);
@@ -557,8 +576,9 @@ async function buildGeminiRequest({
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
     askTellInstruction,
-    MATH_EQUIVALENCE_INSTRUCTION,
-    HINT_STREAM_INSTRUCTION,
+    // MATH_EQUIVALENCE_INSTRUCTION and HINT_STREAM_INSTRUCTION are now
+    // baked into systemInstruction so they land inside the explicit cache
+    // instead of being resent per submission.
     computeStandardSolution
       ? STANDARD_SOLUTION_COMPUTE_INSTRUCTION
       : STANDARD_SOLUTION_SKIP_INSTRUCTION,
@@ -1027,10 +1047,22 @@ export function createHintStreamScanner({ onDelta, onClose }) {
   }
 
   // Deliver everything decoded during this push() as a single chunk.
-  function flush() {
+  // When more data may still arrive (`final=false`), hold back a trailing
+  // high-surrogate so it stays paired with the low-surrogate that arrives
+  // in the next push(); splitting a supplementary-plane code point across
+  // two onDelta calls corrupts emoji like 🛑 / 🔨 / 🔍 on the wire.
+  function flush(final = false) {
     if (!pending) return;
-    const chunk = pending;
+    let chunk = pending;
     pending = "";
+    if (!final) {
+      const lastCode = chunk.charCodeAt(chunk.length - 1);
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+        pending = chunk[chunk.length - 1];
+        chunk = chunk.slice(0, -1);
+        if (!chunk) return;
+      }
+    }
     try {
       onDelta(chunk);
     } catch (err) {
@@ -1117,7 +1149,9 @@ export function createHintStreamScanner({ onDelta, onClose }) {
       } finally {
         // Emit whatever this chunk decoded, even when scan() bailed
         // early (split escape, key straddling chunks, string ended).
-        flush();
+        // At DONE the closing '"' has been consumed, so release any
+        // held-back surrogate too.
+        flush(state === "DONE");
       }
       if (sawStringEnd && !onCloseFired && typeof onClose === "function") {
         onCloseFired = true;
@@ -1168,10 +1202,22 @@ export function createArrayStreamScanner({ fieldName, onDelta, onItemClose, onAr
     }
   };
 
-  const flushDelta = () => {
+  // Hold back a trailing high-surrogate unless `final=true`, so a
+  // supplementary-plane code point (🛑/🔨/🔍…) never straddles two
+  // onDelta calls. Item-close and array-close pass final=true so the
+  // sum of deltas still equals currentDecoded.
+  const flushDelta = (final = false) => {
     if (!currentPending || currentIndex < 0) return;
-    const chunk = currentPending;
+    let chunk = currentPending;
     currentPending = "";
+    if (!final) {
+      const lastCode = chunk.charCodeAt(chunk.length - 1);
+      if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+        currentPending = chunk[chunk.length - 1];
+        chunk = chunk.slice(0, -1);
+        if (!chunk) return;
+      }
+    }
     safeFire("onDelta", onDelta, currentIndex, chunk);
   };
 
@@ -1272,8 +1318,9 @@ export function createArrayStreamScanner({ fieldName, onDelta, onItemClose, onAr
           // Close of current item — flush any pending delta first so
           // onItemClose fires strictly after the last onDelta for this
           // index. Then continue scanning; the array may close in the
-          // same push().
-          flushDelta();
+          // same push(). `final=true` releases a lone trailing high
+          // surrogate so the delta stream matches currentDecoded.
+          flushDelta(true);
           safeFire("onItemClose", onItemClose, currentIndex, currentDecoded);
           state = "BETWEEN_ITEMS";
           continue;
@@ -1290,7 +1337,9 @@ export function createArrayStreamScanner({ fieldName, onDelta, onItemClose, onAr
       try {
         scan();
       } finally {
-        flushDelta();
+        // Once the array has closed no more chunks can arrive, so
+        // release any trailing high surrogate rather than pinning it.
+        flushDelta(state === "DONE");
       }
     },
     isDone() {
@@ -1685,18 +1734,41 @@ export async function warmClassworkFeedbackCache({
 }) {
   try {
     if (!questionId) return { ok: false, reason: "no-question" };
-    const [MODEL, teacherPrompt, standardText] = await Promise.all([
+    const [
+      MODEL,
+      teacherPrompt,
+      standardText,
+      MATH_EQUIVALENCE_INSTRUCTION,
+      HINT_STREAM_INSTRUCTION,
+    ] = await Promise.all([
       getAiModel(),
       getTeacherPromptCached(teacherId),
       getAiStandardHintPrompt(),
+      getAiDirective("classwork.mathEquivalence"),
+      getAiDirective("classwork.hintStream"),
     ]);
     const cachedSolution = (standardSolution || "").trim();
     const solutionBlock = cachedSolution
       ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
       : "";
-    const systemInstruction = [standardText, teacherPrompt, solutionBlock]
+    // Order MUST match buildGeminiRequest's systemInstruction assembly —
+    // any drift changes the digest and the on-submit path would create a
+    // second cache entry instead of reusing this one.
+    const systemInstruction = [
+      standardText,
+      MATH_EQUIVALENCE_INSTRUCTION,
+      HINT_STREAM_INSTRUCTION,
+      teacherPrompt,
+      solutionBlock,
+    ]
       .filter(Boolean)
       .join("\n\n");
+    // Mirrors the buildGeminiRequest size log so staging can compare
+    // warm-vs-submit assembly and confirm both paths produce the same
+    // length (a prerequisite for the sha1 digests matching).
+    console.log(
+      `[ClassworkFeedback][warm][q=${questionId}] systemInstruction len=${systemInstruction.length} ~tokens=${Math.round(systemInstruction.length / 4)} slots={std=${standardText?.length || 0},mathEq=${MATH_EQUIVALENCE_INSTRUCTION?.length || 0},hintStream=${HINT_STREAM_INSTRUCTION?.length || 0},teacher=${teacherPrompt?.length || 0},solution=${solutionBlock?.length || 0}}`,
+    );
     const result = await getOrCreateClassworkFeedbackCache({
       model: MODEL,
       teacherId,
