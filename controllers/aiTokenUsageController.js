@@ -3,6 +3,8 @@ import asyncHandler from "express-async-handler";
 import AiTokenUsage from "../models/AiTokenUsageModel.js";
 import AiCallLog from "../models/AiCallLogModel.js";
 import Session from "../models/SessionModel.js";
+import User from "../models/user.js";
+import { getTeacherMonthUsage, currentMonthKey } from "../utils/teacherUsage.js";
 
 // Per-classroom breakdown of AI token usage grouped by (session, month).
 // Returned rows are sorted newest-month-first, then by topic. Sessions with
@@ -225,5 +227,249 @@ export const getAiCallLogs = asyncHandler(async (req, res) => {
       limit,
       skip,
     },
+  });
+});
+
+// GET /api/admin/ai-cache-stats?days=30
+// Cache hit-rate summary from AiCallLog. A "hit" is a call where any
+// portion of the input was served from the Gemini explicit cache
+// (cachedContentTokenCount > 0). Also surfaces the internal preCheck /
+// response-cache tags because those short-circuit Gemini entirely.
+export const getAiCacheStats = asyncHandler(async (req, res) => {
+  const days = Math.max(1, Math.min(90, Number(req.query.days) || 30));
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const [row] = await AiCallLog.aggregate([
+    { $match: { createdAt: { $gte: since } } },
+    {
+      $group: {
+        _id: null,
+        totalCalls: { $sum: 1 },
+        cachedCalls: {
+          $sum: {
+            $cond: [{ $gt: ["$cachedContentTokenCount", 0] }, 1, 0],
+          },
+        },
+        preCheckCalls: {
+          $sum: {
+            $cond: [
+              {
+                $in: [
+                  "$tag",
+                  [
+                    "ClassworkFeedback:preCheck",
+                    "ClassworkFeedback:stream:preCheck",
+                  ],
+                ],
+              },
+              1,
+              0,
+            ],
+          },
+        },
+        totalInputTokens: { $sum: { $ifNull: ["$promptTokenCount", 0] } },
+        totalCachedTokens: {
+          $sum: { $ifNull: ["$cachedContentTokenCount", 0] },
+        },
+        totalOutputTokens: {
+          $sum: { $ifNull: ["$candidatesTokenCount", 0] },
+        },
+      },
+    },
+  ]);
+
+  const totalCalls = row?.totalCalls || 0;
+  const cachedCalls = row?.cachedCalls || 0;
+  const preCheckCalls = row?.preCheckCalls || 0;
+  const totalInputTokens = row?.totalInputTokens || 0;
+  const totalCachedTokens = row?.totalCachedTokens || 0;
+  const totalOutputTokens = row?.totalOutputTokens || 0;
+
+  const hitRate = totalCalls > 0 ? cachedCalls / totalCalls : 0;
+  const preCheckRate = totalCalls > 0 ? preCheckCalls / totalCalls : 0;
+  const cachedTokenShare =
+    totalInputTokens > 0 ? totalCachedTokens / totalInputTokens : 0;
+
+  return res.json({
+    ok: true,
+    data: {
+      days,
+      totalCalls,
+      cachedCalls,
+      preCheckCalls,
+      totalInputTokens,
+      totalCachedTokens,
+      totalOutputTokens,
+      hitRate,
+      preCheckRate,
+      cachedTokenShare,
+    },
+  });
+});
+
+// GET /api/admin/ai-token-usage-by-teacher?monthKey=YYYY-MM
+// Per-teacher rollup for one month. Groups AiTokenUsage rows through
+// session → classroom → teacher, then joins User for name/email + the
+// teacher's aiTokensPerMonth limit so the UI can render used-vs-quota.
+export const getAiTokenUsageByTeacher = asyncHandler(async (req, res) => {
+  const monthKey = String(req.query.monthKey || currentMonthKey());
+
+  const rows = await AiTokenUsage.aggregate([
+    { $match: { monthKey, sessionId: { $ne: null } } },
+    {
+      $lookup: {
+        from: "sessions",
+        localField: "sessionId",
+        foreignField: "_id",
+        as: "session",
+      },
+    },
+    { $unwind: "$session" },
+    {
+      $lookup: {
+        from: "classrooms",
+        localField: "session.classroomId",
+        foreignField: "_id",
+        as: "classroom",
+      },
+    },
+    { $unwind: "$classroom" },
+    {
+      $group: {
+        _id: "$classroom.teacherId",
+        promptTokenCount: {
+          $sum: { $ifNull: ["$promptTokenCount", 0] },
+        },
+        candidatesTokenCount: {
+          $sum: { $ifNull: ["$candidatesTokenCount", 0] },
+        },
+        cachedContentTokenCount: {
+          $sum: { $ifNull: ["$cachedContentTokenCount", 0] },
+        },
+        totalThoughtTokens: {
+          $sum: { $ifNull: ["$totalThoughtTokens", 0] },
+        },
+        sessions: { $addToSet: "$sessionId" },
+      },
+    },
+    {
+      $lookup: {
+        from: "users",
+        localField: "_id",
+        foreignField: "_id",
+        as: "teacher",
+      },
+    },
+    { $unwind: { path: "$teacher", preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        _id: 0,
+        teacherId: "$_id",
+        teacherName: {
+          $trim: {
+            input: {
+              $concat: [
+                { $ifNull: ["$teacher.firstName", ""] },
+                " ",
+                { $ifNull: ["$teacher.lastName", ""] },
+              ],
+            },
+          },
+        },
+        teacherEmail: "$teacher.email",
+        aiTokensPerMonth: "$teacher.limits.aiTokensPerMonth",
+        isPaid: "$teacher.isPaid",
+        promptTokenCount: 1,
+        candidatesTokenCount: 1,
+        cachedContentTokenCount: 1,
+        totalThoughtTokens: 1,
+        sessionCount: { $size: "$sessions" },
+        rawTotal: {
+          $add: [
+            "$promptTokenCount",
+            "$candidatesTokenCount",
+            "$totalThoughtTokens",
+          ],
+        },
+      },
+    },
+    { $sort: { rawTotal: -1 } },
+  ]);
+
+  return res.json({ ok: true, data: { monthKey, rows } });
+});
+
+// GET /api/teacher/usage?monthKey=YYYY-MM
+// Teacher self-service — returns their own quota snapshot for one month
+// across all five categories. Reuses getTeacherMonthUsage so the numbers
+// match the enforcement middleware.
+export const getMyUsage = asyncHandler(async (req, res) => {
+  const teacherId = req.user?._id;
+  if (!teacherId) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  const monthKey = req.query.monthKey ? String(req.query.monthKey) : undefined;
+  const usage = await getTeacherMonthUsage(teacherId, monthKey);
+  return res.json({ ok: true, data: usage });
+});
+
+// GET /api/teacher/ai-call-logs?limit=&skip=&tag=
+// Teacher self-service — same shape as the admin endpoint but always
+// filtered to req.user._id. teacherId query param is ignored.
+export const getMyAiCallLogs = asyncHandler(async (req, res) => {
+  const teacherId = req.user?._id;
+  if (!teacherId) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  const { limit: rawLimit, skip: rawSkip, tag, sessionId } = req.query || {};
+  const limit = Math.max(1, Math.min(200, Number(rawLimit) || 50));
+  const skip = Math.max(0, Number(rawSkip) || 0);
+
+  const filter = { teacherId: new mongoose.Types.ObjectId(String(teacherId)) };
+  if (tag) filter.tag = String(tag);
+  if (sessionId && mongoose.Types.ObjectId.isValid(sessionId)) {
+    filter.sessionId = new mongoose.Types.ObjectId(sessionId);
+  }
+
+  const [rows, total] = await Promise.all([
+    AiCallLog.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate("studentId", "firstName lastName email")
+      .populate("sessionId", "topic sessionDate")
+      .lean(),
+    AiCallLog.countDocuments(filter),
+  ]);
+
+  const shaped = rows.map((r) => ({
+    _id: String(r._id),
+    reqId: r.reqId || "",
+    tag: r.tag,
+    model: r.model || "",
+    createdAt: r.createdAt,
+    studentName:
+      r.studentName ||
+      [r.studentId?.firstName, r.studentId?.lastName]
+        .filter(Boolean)
+        .join(" ") ||
+      "",
+    sessionTopic: r.sessionId?.topic || "",
+    sessionDate: r.sessionId?.sessionDate || null,
+    questionText: r.questionText || "",
+    studentAnswer: r.studentAnswer || "",
+    aiResponseSummary: r.aiResponseSummary || "",
+    promptTokenCount: r.promptTokenCount || 0,
+    candidatesTokenCount: r.candidatesTokenCount || 0,
+    cachedContentTokenCount: r.cachedContentTokenCount || 0,
+    totalThoughtTokens: r.totalThoughtTokens || 0,
+    totalTokens: r.totalTokens || 0,
+    error: r.error || "",
+  }));
+
+  return res.json({
+    ok: true,
+    data: { rows: shaped, total, limit, skip },
   });
 });

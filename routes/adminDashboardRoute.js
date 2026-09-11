@@ -14,7 +14,13 @@ import {
 import {
   getAiTokenUsage,
   getAiCallLogs,
+  getAiCacheStats,
+  getAiTokenUsageByTeacher,
 } from "../controllers/aiTokenUsageController.js";
+import {
+  listTeachersWithLimits,
+  updateTeacherLimits,
+} from "../controllers/adminTeacherLimitsController.js";
 import auth_admin from "../middleware/auth_admin.js";
 import auth_key_header from "../middleware/auth_key_header.js";
 import { requireFeatureFlag } from "../middleware/requirePlan.js";
@@ -88,6 +94,39 @@ router.get(
   auth_admin,
   auth_key_header,
   getAiCallLogs
+);
+
+// Cache hit-rate summary over the last N days (default 30). Powers the
+// "Cache performance" card on the admin AI Token Usage page.
+router.get(
+  "/ai-cache-stats",
+  auth_admin,
+  auth_key_header,
+  getAiCacheStats
+);
+
+// Per-teacher token rollup for one month. Joins teacher name + their
+// aiTokensPerMonth quota so the UI can show used-vs-limit per teacher.
+router.get(
+  "/ai-token-usage-by-teacher",
+  auth_admin,
+  auth_key_header,
+  getAiTokenUsageByTeacher
+);
+
+// Admin subscription management: list teachers with limits + current-month
+// usage, PATCH to update any teacher's limits / isPaid / isSuspended.
+router.get(
+  "/teachers/limits",
+  auth_admin,
+  auth_key_header,
+  listTeachersWithLimits
+);
+router.patch(
+  "/teachers/:id/limits",
+  auth_admin,
+  auth_key_header,
+  updateTeacherLimits
 );
 
 export default router;

@@ -17,6 +17,10 @@ import {
   getMyAIConfig,
   upsertMyAIConfig,
 } from "../controllers/teacherAIConfigController.js";
+import {
+  getMyUsage,
+  getMyAiCallLogs,
+} from "../controllers/aiTokenUsageController.js";
 
 const router = express.Router();
 
@@ -58,6 +62,29 @@ router.delete(
   allowTeacherOrAdmin,
   deleteMyAIConfig
 ); // DELETE
+
+// Teacher self-service usage. Returns the requesting teacher's own quota +
+// current-month usage across all five categories (AI tokens, meeting
+// minutes, screen-lock minutes, lesson reports, storage). Powers the
+// teacher-side "Usage & Subscription" page.
+router.get(
+  "/me/usage",
+  auth_key_header,
+  auth_token,
+  allowTeacherOrAdmin,
+  getMyUsage
+);
+
+// Teacher self-service AI call log — same shape as the admin endpoint but
+// always filtered to req.user._id so a teacher only ever sees their own
+// calls.
+router.get(
+  "/me/ai-call-logs",
+  auth_key_header,
+  auth_token,
+  allowTeacherOrAdmin,
+  getMyAiCallLogs
+);
 
 router.get("/", auth_key_header, getAllTeachers);
 router.get("/dashboard/:teacherId", getTeacherDashboard);
