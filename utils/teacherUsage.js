@@ -5,6 +5,7 @@ import ScreenLockInterval from "../models/ScreenLockIntervalModel.js";
 import LessonReportSent from "../models/LessonReportSentModel.js";
 import UploadedFile from "../models/UploadedFileModel.js";
 import AiTokenUsage from "../models/AiTokenUsageModel.js";
+import AiCallLog from "../models/AiCallLogModel.js";
 import User from "../models/user.js";
 
 // Keep in sync with COST_OVERHEAD_MULTIPLIER in AdminAiTokenUsage.jsx and
@@ -115,34 +116,22 @@ async function countLessonReports(teacherId, monthKey) {
   });
 }
 
-// AiTokenUsage rows don't carry teacherId directly — they join through
-// session → classroom → teacher, matching getAiTokenUsage() in
-// aiTokenUsageController. Sessionless calls (no sessionId) can't be
-// attributed to a teacher and are excluded from per-teacher totals.
+// Sums raw Gemini tokens across every AiCallLog row where teacherId matches
+// this teacher. AiCallLog is written on every call (teacher-initiated
+// assignment gen + every student submission in one of the teacher's
+// classrooms), so this captures the teacher's spend AND their students'
+// spend — matching what the teacher sees in their own AI call log.
 async function sumAiTokensBilled(teacherId, monthKey) {
   const teacherOid = toObjectId(teacherId);
   if (!teacherOid) return 0;
-  const [row] = await AiTokenUsage.aggregate([
-    { $match: { monthKey, sessionId: { $ne: null } } },
+  const { start, end } = monthBounds(monthKey);
+  const [row] = await AiCallLog.aggregate([
     {
-      $lookup: {
-        from: "sessions",
-        localField: "sessionId",
-        foreignField: "_id",
-        as: "session",
+      $match: {
+        teacherId: teacherOid,
+        createdAt: { $gte: start, $lt: end },
       },
     },
-    { $unwind: "$session" },
-    {
-      $lookup: {
-        from: "classrooms",
-        localField: "session.classroomId",
-        foreignField: "_id",
-        as: "classroom",
-      },
-    },
-    { $unwind: "$classroom" },
-    { $match: { "classroom.teacherId": teacherOid } },
     {
       $group: {
         _id: null,
@@ -160,6 +149,20 @@ async function sumAiTokensBilled(teacherId, monthKey) {
   ]);
   const raw = row?.rawTotal || 0;
   return Math.ceil(raw * AI_COST_OVERHEAD_MULTIPLIER);
+}
+
+// Count of AI calls (rows in AiCallLog) attributed to this teacher for the
+// month — includes the teacher's own calls plus every AI call triggered by
+// their students. This is the "number of times AI was used" figure shown
+// on the teacher's own subscription view.
+async function countAiCalls(teacherId, monthKey) {
+  const teacherOid = toObjectId(teacherId);
+  if (!teacherOid) return 0;
+  const { start, end } = monthBounds(monthKey);
+  return AiCallLog.countDocuments({
+    teacherId: teacherOid,
+    createdAt: { $gte: start, $lt: end },
+  });
 }
 
 // Cumulative — storage doesn't reset each month.
@@ -184,12 +187,14 @@ export async function getTeacherMonthUsage(teacherId, monthKey) {
     screenLockMinutes,
     lessonReports,
     aiTokens,
+    aiCalls,
     storageBytes,
   ] = await Promise.all([
     sumMeetingMinutes(teacherId, mk),
     sumScreenLockMinutes(teacherId, mk),
     countLessonReports(teacherId, mk),
     sumAiTokensBilled(teacherId, mk),
+    countAiCalls(teacherId, mk),
     sumStorageBytes(teacherId),
   ]);
 
@@ -211,6 +216,10 @@ export async function getTeacherMonthUsage(teacherId, monthKey) {
     aiTokens: {
       used: aiTokens,
       limit: limits.aiTokensPerMonth ?? 0,
+    },
+    aiCalls: {
+      used: aiCalls,
+      limit: 0,
     },
     storageBytes: {
       used: storageBytes,
