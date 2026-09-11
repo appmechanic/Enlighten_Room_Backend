@@ -1570,14 +1570,77 @@ export const regenerateClassReportForRoom = async (req, res) => {
       return res.status(400).json({ message: 'roomId is required.' });
     }
     const { lessonName } = req.body || {};
+    const trimmedLessonName =
+      lessonName && typeof lessonName === 'string' ? lessonName.trim() : '';
 
     // Include active lessons too — teachers want to force a fresh summary
     // mid-lesson without having to end the call first.
-    const query = { roomId };
-    if (lessonName && typeof lessonName === 'string') {
-      query.name = lessonName;
+    let lessons;
+    if (trimmedLessonName) {
+      // Accept the passed name as EITHER Lesson.name OR
+      // Classwork.lessonName. Teachers see the classwork's lessonName
+      // label on their UI, not the Lesson doc's timestamped .name, so
+      // typing "testreport" here has to match either side. When only the
+      // classwork side matches (name drift), we resolve the owning Lesson
+      // by picking the one whose active window contains those submissions.
+      const nameMatched = await Lesson.find({
+        roomId,
+        name: trimmedLessonName,
+      }).sort({ endedAt: -1, startedAt: -1 });
+
+      if (nameMatched.length > 0) {
+        lessons = nameMatched;
+      } else {
+        const classworkRows = await ClassworkModel.find({
+          roomId,
+          lessonName: trimmedLessonName,
+        })
+          .select('submitted')
+          .lean();
+
+        const submissionTimes = [];
+        for (const q of classworkRows) {
+          for (const s of q.submitted || []) {
+            if (!s.submittedAt) continue;
+            const t = new Date(s.submittedAt).getTime();
+            if (!Number.isNaN(t)) submissionTimes.push(t);
+          }
+        }
+
+        if (submissionTimes.length === 0) {
+          // Classwork exists but no submissions → no window to match on.
+          // Fall back to *every* lesson in the room whose report is empty.
+          lessons = await Lesson.find({ roomId }).sort({
+            endedAt: -1,
+            startedAt: -1,
+          });
+        } else {
+          const minT = Math.min(...submissionTimes);
+          const maxT = Math.max(...submissionTimes);
+          lessons = await Lesson.find({
+            roomId,
+            startedAt: { $lte: new Date(maxT) },
+            $or: [
+              { endedAt: null },
+              { endedAt: { $gte: new Date(minT) } },
+            ],
+          }).sort({ endedAt: -1, startedAt: -1 });
+          if (lessons.length === 0) {
+            // Nothing matched the window either — surface the miss so the
+            // teacher isn't left staring at a silent no-op.
+            return res.status(404).json({
+              message: `No lesson found for lessonName="${trimmedLessonName}" in room ${roomId} (classwork exists but no Lesson doc contains its submission window).`,
+              queued: [],
+            });
+          }
+        }
+      }
+    } else {
+      lessons = await Lesson.find({ roomId }).sort({
+        endedAt: -1,
+        startedAt: -1,
+      });
     }
-    const lessons = await Lesson.find(query).sort({ endedAt: -1, startedAt: -1 });
 
     const queued = [];
     for (const lesson of lessons) {
@@ -1587,7 +1650,7 @@ export const regenerateClassReportForRoom = async (req, res) => {
         ((Array.isArray(cr.studentDifficulties) && cr.studentDifficulties.length > 0) ||
           (Array.isArray(cr.nextLessonStrategy) && cr.nextLessonStrategy.length > 0) ||
           (Array.isArray(cr.targetedHomework) && cr.targetedHomework.length > 0));
-      if (!lessonName && alreadyGenerated) {
+      if (!trimmedLessonName && alreadyGenerated) {
         // Already has a report — skip unless explicitly named.
         continue;
       }
@@ -1904,6 +1967,12 @@ export const addQuestion = async (req, res) => {
     // For released questions the active lesson always wins; only staged
     // drafts (no active lesson yet, or explicitly deferred) may keep the
     // client-supplied value.
+    //
+    // PERMANENT ORPHAN FIX: if a released question comes in for a room with
+    // no active Lesson, auto-create a Lesson doc up-front so the classwork
+    // is never written with a lessonName that has no owning Lesson. This
+    // eliminates the class-summary "no lesson found" bug at the source
+    // instead of relying on post-hoc /sync-orphan-lessons cleanup.
     let resolvedLessonName = String(question?.lessonName || '').trim();
     if (!stagedAsDraft && roomId) {
       const activeLesson = await Lesson.findOne({ roomId, status: 'active' })
@@ -1917,6 +1986,45 @@ export const addQuestion = async (req, res) => {
           );
           resolvedLessonName = authoritative;
         }
+      } else {
+        // No active lesson AND released question → orphan-in-waiting. Prefer
+        // the client-supplied name; fall back to a timestamp so the Lesson
+        // always has a stable identifier.
+        const fallbackName =
+          resolvedLessonName ||
+          new Date()
+            .toISOString()
+            .replace('T', ' ')
+            .slice(0, 16);
+
+        // Reuse an ended Lesson doc if one already carries this name in
+        // this room — avoids creating a duplicate every time a teacher
+        // adds a question after ending a lesson but before starting a new
+        // one. The report path will happily re-run on the existing doc.
+        let ownerLesson = await Lesson.findOne({
+          roomId,
+          name: fallbackName,
+        })
+          .sort({ startedAt: -1 })
+          .select('_id name');
+
+        if (!ownerLesson) {
+          const ctx = await resolveSessionContext(roomId);
+          const now = new Date();
+          ownerLesson = await Lesson.create({
+            name: fallbackName,
+            roomId,
+            sessionId: ctx?.sessionId || null,
+            classroomId: ctx?.classroomId || null,
+            startedAt: now,
+            endedAt: now,
+            status: 'ended',
+          });
+          console.log(
+            `[AddQuestion] Auto-created Lesson doc "${fallbackName}" (id=${ownerLesson._id}) for roomId=${roomId} — no active lesson existed.`,
+          );
+        }
+        resolvedLessonName = String(ownerLesson.name).trim();
       }
     }
 
