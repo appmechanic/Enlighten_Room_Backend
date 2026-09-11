@@ -2094,6 +2094,41 @@ export const releaseQuestion = async (req, res) => {
         .select('name');
       if (activeLesson?.name) {
         patch.lessonName = String(activeLesson.name).trim();
+      } else {
+        // No active lesson but this question is going live to students —
+        // same orphan-prevention as addQuestion. Prefer the classwork's
+        // current lessonName (whatever the client stamped at stage time),
+        // else the client-supplied one from the release body, else a UTC
+        // timestamp. Reuse an existing Lesson with that name if one exists.
+        const existing = await ClassworkModel.findOne(filter)
+          .select('lessonName')
+          .lean();
+        const fallbackName =
+          String(existing?.lessonName || req.body?.lessonName || '').trim() ||
+          new Date().toISOString().replace('T', ' ').slice(0, 16);
+        let ownerLesson = await Lesson.findOne({
+          roomId,
+          name: fallbackName,
+        })
+          .sort({ startedAt: -1 })
+          .select('_id name');
+        if (!ownerLesson) {
+          const ctx = await resolveSessionContext(roomId);
+          const now = new Date();
+          ownerLesson = await Lesson.create({
+            name: fallbackName,
+            roomId,
+            sessionId: ctx?.sessionId || null,
+            classroomId: ctx?.classroomId || null,
+            startedAt: now,
+            endedAt: now,
+            status: 'ended',
+          });
+          console.log(
+            `[ReleaseQuestion] Auto-created Lesson doc "${fallbackName}" (id=${ownerLesson._id}) for roomId=${roomId} — no active lesson existed.`,
+          );
+        }
+        patch.lessonName = String(ownerLesson.name).trim();
       }
     }
     const question = await ClassworkModel.findOneAndUpdate(
