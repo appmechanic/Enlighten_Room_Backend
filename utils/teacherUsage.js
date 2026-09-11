@@ -7,6 +7,8 @@ import UploadedFile from "../models/UploadedFileModel.js";
 import AiTokenUsage from "../models/AiTokenUsageModel.js";
 import AiCallLog from "../models/AiCallLogModel.js";
 import User from "../models/user.js";
+import Subscription from "../models/SubscriptionModel.js";
+import Session from "../models/SessionModel.js";
 
 // Keep in sync with COST_OVERHEAD_MULTIPLIER in AdminAiTokenUsage.jsx and
 // AiTokenUsageCard.jsx. Raw Gemini tokens are multiplied by this factor to
@@ -257,4 +259,158 @@ export async function checkUsageBudget(teacherId, category, monthKey) {
       return { ok: true, used: 0, limit: 0 };
   }
   return { ok: used < limit, used, limit };
+}
+
+// Count current AI calls this month (dedicated helper — reused by both the
+// self-service view and any future middleware gate against maxAiCallsPerMonth).
+async function countAiCallsInternal(teacherOid, start, end) {
+  return AiCallLog.countDocuments({
+    teacherId: teacherOid,
+    createdAt: { $gte: start, $lt: end },
+  });
+}
+
+async function countSessionsThisMonth(teacherOid, start, end) {
+  const classroomIds = await Classroom.find({ teacherId: teacherOid })
+    .distinct("_id");
+  if (classroomIds.length === 0) return 0;
+  return Session.countDocuments({
+    classroomId: { $in: classroomIds },
+    sessionDate: { $gte: start, $lt: end },
+  });
+}
+
+async function countClassrooms(teacherOid) {
+  return Classroom.countDocuments({ teacherId: teacherOid });
+}
+
+async function countStudents(teacherOid) {
+  return User.countDocuments({
+    userRole: "student",
+    teacherIds: teacherOid,
+  });
+}
+
+async function countTeachers(teacherOid) {
+  // "Teachers under this account" only applies to school-admin owners. For a
+  // solo teacher this is always 1 (themselves). Leaving here so a school
+  // plan can display it meaningfully.
+  return User.countDocuments({
+    userRole: "teacher",
+    $or: [{ _id: teacherOid }, { schoolAdminId: teacherOid }],
+  });
+}
+
+// Loads the teacher's active subscription plan and returns a normalized
+// {plan, categories[], featureFlags} snapshot with current usage vs each
+// Plan.limits dimension. null/undefined limit == unlimited (per Plan
+// schema comment). The teacher self-service page renders straight off
+// this shape so what's on screen matches exactly what their plan sells.
+export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
+  const teacherOid = toObjectId(teacherId);
+  if (!teacherOid) return null;
+  const mk = monthKey || currentMonthKey();
+  const { start, end } = monthBounds(mk);
+
+  const subscription = await Subscription.findOne({
+    userId: teacherOid,
+    status: "active",
+  })
+    .populate("planType")
+    .lean();
+
+  const plan = subscription?.planType || null;
+  const limits = plan?.limits || {};
+  const featureFlags = plan?.featureFlags || {};
+
+  const [
+    aiCalls,
+    sessions,
+    sessionMinutes,
+    classrooms,
+    students,
+    teachers,
+  ] = await Promise.all([
+    countAiCallsInternal(teacherOid, start, end),
+    countSessionsThisMonth(teacherOid, start, end),
+    sumMeetingMinutes(teacherOid, mk),
+    countClassrooms(teacherOid),
+    countStudents(teacherOid),
+    countTeachers(teacherOid),
+  ]);
+
+  const categories = [
+    {
+      key: "aiCalls",
+      label: "AI calls",
+      unit: "calls",
+      used: aiCalls,
+      limit: limits.maxAiCallsPerMonth,
+      period: "month",
+    },
+    {
+      key: "sessions",
+      label: "Sessions",
+      unit: "sessions",
+      used: sessions,
+      limit: limits.maxSessionsPerMonth,
+      period: "month",
+    },
+    {
+      key: "sessionMinutes",
+      label: "Session minutes",
+      unit: "min",
+      used: sessionMinutes,
+      limit: limits.maxSessionMinutesPerMonth,
+      period: "month",
+    },
+    {
+      key: "classrooms",
+      label: "Classrooms",
+      unit: "classrooms",
+      used: classrooms,
+      limit: limits.maxClassrooms,
+      period: "cumulative",
+    },
+    {
+      key: "students",
+      label: "Students",
+      unit: "students",
+      used: students,
+      limit: limits.maxStudents,
+      period: "cumulative",
+    },
+    {
+      key: "teachers",
+      label: "Teachers",
+      unit: "teachers",
+      used: teachers,
+      limit: limits.maxTeachers,
+      period: "cumulative",
+    },
+  ];
+
+  return {
+    monthKey: mk,
+    plan: plan
+      ? {
+          _id: String(plan._id),
+          name: plan.name,
+          planType: plan.planType,
+          planCategory: plan.planCategory,
+          subtitle: plan.subtitle || "",
+        }
+      : null,
+    subscription: subscription
+      ? {
+          status: subscription.status,
+          frequency: subscription.frequency,
+          currency: subscription.currency,
+          provider: subscription.provider || "",
+          createdAt: subscription.createdAt,
+        }
+      : null,
+    categories,
+    featureFlags,
+  };
 }

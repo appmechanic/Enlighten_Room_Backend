@@ -1319,18 +1319,111 @@ async function generateAndStoreClassReport(lessonDoc) {
     /[.*+?^${}()|[\]\\]/g,
     '\\$&',
   );
-  const lessonQuestions = await ClassworkModel.find({
-    roomId: lessonDoc.roomId,
-    lessonName: { $regex: `^\\s*${escapedLessonName}\\s*$` },
-  }).lean();
+  let lessonQuestions = normalizedLessonName
+    ? await ClassworkModel.find({
+        roomId: lessonDoc.roomId,
+        lessonName: { $regex: `^\\s*${escapedLessonName}\\s*$` },
+      }).lean()
+    : [];
+
+  let recoveredFromLessonName = null;
+
+  // Name-based join failed (Lesson.name and Classwork.lessonName drifted, or
+  // the lesson was created via the orphan-sync path with an empty name).
+  // Recover by picking the classwork bucket for this roomId that has ANY
+  // submissions inside the lesson's active window. If exactly one such
+  // bucket exists, use it and log the recovery so admins can see the drift.
+  if (lessonQuestions.length === 0 && lessonDoc.roomId) {
+    const buckets = await ClassworkModel.aggregate([
+      { $match: { roomId: lessonDoc.roomId } },
+      {
+        $addFields: {
+          submissionsInWindow: {
+            $size: {
+              $filter: {
+                input: { $ifNull: ['$submitted', []] },
+                as: 's',
+                cond: {
+                  $and: [
+                    { $ne: ['$$s.submittedAt', null] },
+                    lessonDoc.startedAt
+                      ? { $gte: ['$$s.submittedAt', lessonDoc.startedAt] }
+                      : { $literal: true },
+                    lessonDoc.endedAt
+                      ? { $lte: ['$$s.submittedAt', lessonDoc.endedAt] }
+                      : { $literal: true },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        $group: {
+          _id: '$lessonName',
+          questionCount: { $sum: 1 },
+          windowSubmissions: { $sum: '$submissionsInWindow' },
+          totalSubmissions: {
+            $sum: { $size: { $ifNull: ['$submitted', []] } },
+          },
+        },
+      },
+      { $sort: { windowSubmissions: -1, totalSubmissions: -1 } },
+    ]);
+
+    const eligible = buckets.filter((b) => (b.windowSubmissions || 0) > 0);
+    if (eligible.length === 1) {
+      recoveredFromLessonName = eligible[0]._id;
+    } else if (
+      eligible.length === 0 &&
+      buckets.length === 1 &&
+      (buckets[0].totalSubmissions || 0) > 0
+    ) {
+      // No window info (missing startedAt/endedAt) but exactly one bucket
+      // for the room — safe to assume it belongs to this lesson.
+      recoveredFromLessonName = buckets[0]._id;
+    }
+
+    if (recoveredFromLessonName != null) {
+      console.warn(
+        `[ClassReport] lesson.name="${lessonDoc.name}" did not match any Classwork.lessonName; ` +
+          `recovering with lessonName=${JSON.stringify(recoveredFromLessonName)} for lesson=${lessonDoc._id}`,
+      );
+      lessonQuestions = await ClassworkModel.find({
+        roomId: lessonDoc.roomId,
+        lessonName: recoveredFromLessonName,
+      }).lean();
+    }
+  }
 
   const submissionCount = lessonQuestions.reduce(
     (n, q) => n + (Array.isArray(q.submitted) ? q.submitted.length : 0),
     0,
   );
   console.log(
-    `[ClassReport] lesson=${lessonDoc._id} name="${lessonDoc.name}" questions=${lessonQuestions.length} submissions=${submissionCount}`,
+    `[ClassReport] lesson=${lessonDoc._id} name="${lessonDoc.name}" questions=${lessonQuestions.length} submissions=${submissionCount}` +
+      (recoveredFromLessonName != null
+        ? ` (via name-drift recovery -> "${recoveredFromLessonName}")`
+        : ''),
   );
+
+  // If we recovered a lessonName, backfill Lesson.name so future runs hit
+  // the fast path and admin views show the same title the students saw.
+  if (recoveredFromLessonName && normalizedLessonName !== String(recoveredFromLessonName)) {
+    try {
+      await Lesson.updateOne(
+        { _id: lessonDoc._id },
+        { $set: { name: String(recoveredFromLessonName) } },
+      );
+      lessonDoc.name = String(recoveredFromLessonName);
+    } catch (err) {
+      console.warn(
+        `[ClassReport] failed to backfill lesson.name after recovery for lesson=${lessonDoc._id}:`,
+        err?.message || err,
+      );
+    }
+  }
 
   // When the join returns 0 questions or 0 submissions, dump the actual
   // distinct (lessonName, submissionCount) pairs on Classwork for this room
@@ -1628,40 +1721,97 @@ export const getStudentLessonReport = async (req, res) => {
     };
 
     // Group questions by lessonName so we can emit one report block per lesson.
+    // Track the raw classwork rows too so we can do drift-recovery below —
+    // when Lesson.name and Classwork.lessonName have gone out of sync we need
+    // to fall back to a time-window match, not just the string key.
     const byLessonName = new Map();
+    const rawByLessonName = new Map();
     questions.forEach((q) => {
       const key = q.lessonName || '';
       if (!key) return; // staged drafts (no lesson yet) are skipped
       if (!byLessonName.has(key)) byLessonName.set(key, []);
+      if (!rawByLessonName.has(key)) rawByLessonName.set(key, []);
       byLessonName.get(key).push(projectQuestion(q));
+      rawByLessonName.get(key).push(q);
     });
 
-    const data = lessons.map((l) => ({
-      name: l.name,
-      status: l.status,
-      startedAt: l.startedAt,
-      endedAt: l.endedAt,
-      // Lesson-level AI summary. Null unless generation actually ran and
-      // stamped generatedAt — otherwise Mongoose returns the default empty
-      // subdoc, which the student UI should treat as "not generated yet".
-      classReport:
-        l.classReport && l.classReport.generatedAt
-          ? {
-              studentDifficulties: Array.isArray(l.classReport.studentDifficulties)
-                ? l.classReport.studentDifficulties
-                : [],
-              nextLessonStrategy: Array.isArray(l.classReport.nextLessonStrategy)
-                ? l.classReport.nextLessonStrategy
-                : [],
-              targetedHomework: Array.isArray(l.classReport.targetedHomework)
-                ? l.classReport.targetedHomework
-                : [],
-              generatedAt: l.classReport.generatedAt,
-              model: l.classReport.model || '',
-            }
-          : null,
-      questions: byLessonName.get(l.name) || [],
-    }));
+    // Drift recovery: if Lesson.name doesn't match any Classwork.lessonName
+    // bucket, find the bucket whose submissions fall inside [startedAt,
+    // endedAt] for THIS lesson. Same approach as generateAndStoreClassReport.
+    // Without this, name drift silently hides the lesson on the student UI
+    // (the frontend filter drops rows with an empty questions array).
+    const recoverBucket = (lesson) => {
+      const started = lesson.startedAt
+        ? new Date(lesson.startedAt).getTime()
+        : null;
+      const ended = lesson.endedAt
+        ? new Date(lesson.endedAt).getTime()
+        : null;
+      const eligible = [];
+      for (const [key, rows] of rawByLessonName.entries()) {
+        let windowSubs = 0;
+        let totalSubs = 0;
+        for (const q of rows) {
+          for (const s of q.submitted || []) {
+            totalSubs += 1;
+            if (!s.submittedAt) continue;
+            const t = new Date(s.submittedAt).getTime();
+            if (Number.isNaN(t)) continue;
+            if (started != null && t < started) continue;
+            if (ended != null && t > ended) continue;
+            windowSubs += 1;
+          }
+        }
+        if (windowSubs > 0) eligible.push({ key, windowSubs, totalSubs });
+      }
+      eligible.sort((a, b) => b.windowSubs - a.windowSubs);
+      if (eligible.length === 1) return eligible[0].key;
+      // Fallback: single-bucket room with no window info (missing
+      // startedAt/endedAt) — safe to attribute to this lesson.
+      if (
+        eligible.length === 0 &&
+        rawByLessonName.size === 1 &&
+        started == null &&
+        ended == null
+      ) {
+        return rawByLessonName.keys().next().value;
+      }
+      return null;
+    };
+
+    const data = lessons.map((l) => {
+      let qs = byLessonName.get(l.name) || [];
+      if (qs.length === 0) {
+        const recoveredKey = recoverBucket(l);
+        if (recoveredKey != null) qs = byLessonName.get(recoveredKey) || [];
+      }
+      return {
+        name: l.name,
+        status: l.status,
+        startedAt: l.startedAt,
+        endedAt: l.endedAt,
+        // Lesson-level AI summary. Null unless generation actually ran and
+        // stamped generatedAt — otherwise Mongoose returns the default empty
+        // subdoc, which the student UI should treat as "not generated yet".
+        classReport:
+          l.classReport && l.classReport.generatedAt
+            ? {
+                studentDifficulties: Array.isArray(l.classReport.studentDifficulties)
+                  ? l.classReport.studentDifficulties
+                  : [],
+                nextLessonStrategy: Array.isArray(l.classReport.nextLessonStrategy)
+                  ? l.classReport.nextLessonStrategy
+                  : [],
+                targetedHomework: Array.isArray(l.classReport.targetedHomework)
+                  ? l.classReport.targetedHomework
+                  : [],
+                generatedAt: l.classReport.generatedAt,
+                model: l.classReport.model || '',
+              }
+            : null,
+        questions: qs,
+      };
+    });
 
     return res.status(200).json({ lessons: data });
   } catch (err) {

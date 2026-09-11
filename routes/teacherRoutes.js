@@ -20,6 +20,7 @@ import {
 import {
   getMyUsage,
   getMyAiCallLogs,
+  getMyAiCallLogById,
 } from "../controllers/aiTokenUsageController.js";
 
 const router = express.Router();
@@ -84,6 +85,13 @@ router.get(
   auth_token,
   allowTeacherOrAdmin,
   getMyAiCallLogs
+);
+router.get(
+  "/me/ai-call-logs/:id",
+  auth_key_header,
+  auth_token,
+  allowTeacherOrAdmin,
+  getMyAiCallLogById
 );
 
 router.get("/", auth_key_header, getAllTeachers);

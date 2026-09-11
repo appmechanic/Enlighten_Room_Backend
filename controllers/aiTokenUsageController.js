@@ -4,7 +4,11 @@ import AiTokenUsage from "../models/AiTokenUsageModel.js";
 import AiCallLog from "../models/AiCallLogModel.js";
 import Session from "../models/SessionModel.js";
 import User from "../models/user.js";
-import { getTeacherMonthUsage, currentMonthKey } from "../utils/teacherUsage.js";
+import {
+  getTeacherMonthUsage,
+  getTeacherSubscriptionUsage,
+  currentMonthKey,
+} from "../utils/teacherUsage.js";
 
 // Per-classroom breakdown of AI token usage grouped by (session, month).
 // Returned rows are sorted newest-month-first, then by topic. Sessions with
@@ -400,17 +404,73 @@ export const getAiTokenUsageByTeacher = asyncHandler(async (req, res) => {
 });
 
 // GET /api/teacher/usage?monthKey=YYYY-MM
-// Teacher self-service — returns their own quota snapshot for one month
-// across all five categories. Reuses getTeacherMonthUsage so the numbers
-// match the enforcement middleware.
+// Teacher self-service — returns the plan-driven subscription snapshot for
+// one month. Includes the active Plan doc, current usage per Plan.limits
+// dimension, and the plan's feature flags. Falls back to a null-plan
+// response (with usage still populated) when the teacher has no active
+// subscription so the UI can prompt "Choose a plan".
 export const getMyUsage = asyncHandler(async (req, res) => {
   const teacherId = req.user?._id;
   if (!teacherId) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   const monthKey = req.query.monthKey ? String(req.query.monthKey) : undefined;
-  const usage = await getTeacherMonthUsage(teacherId, monthKey);
+  const usage = await getTeacherSubscriptionUsage(teacherId, monthKey);
   return res.json({ ok: true, data: usage });
+});
+
+// GET /api/teacher/ai-call-logs/:id
+// Per-call detail — the token breakdown, full prompts, question / answer /
+// AI response text. Always restricted to the teacher's own calls.
+export const getMyAiCallLogById = asyncHandler(async (req, res) => {
+  const teacherId = req.user?._id;
+  if (!teacherId) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({ ok: false, error: "Invalid id" });
+  }
+
+  const row = await AiCallLog.findOne({
+    _id: id,
+    teacherId: new mongoose.Types.ObjectId(String(teacherId)),
+  })
+    .populate("studentId", "firstName lastName email")
+    .populate("sessionId", "topic sessionDate")
+    .lean();
+
+  if (!row) {
+    return res.status(404).json({ ok: false, error: "Call not found" });
+  }
+
+  return res.json({
+    ok: true,
+    data: {
+      _id: String(row._id),
+      reqId: row.reqId || "",
+      tag: row.tag,
+      model: row.model || "",
+      createdAt: row.createdAt,
+      studentName:
+        row.studentName ||
+        [row.studentId?.firstName, row.studentId?.lastName]
+          .filter(Boolean)
+          .join(" ") ||
+        "",
+      sessionTopic: row.sessionId?.topic || "",
+      sessionDate: row.sessionId?.sessionDate || null,
+      questionText: row.questionText || "",
+      studentAnswer: row.studentAnswer || "",
+      aiResponseSummary: row.aiResponseSummary || "",
+      promptTokenCount: row.promptTokenCount || 0,
+      candidatesTokenCount: row.candidatesTokenCount || 0,
+      cachedContentTokenCount: row.cachedContentTokenCount || 0,
+      totalThoughtTokens: row.totalThoughtTokens || 0,
+      totalTokens: row.totalTokens || 0,
+      error: row.error || "",
+    },
+  });
 });
 
 // GET /api/teacher/ai-call-logs?limit=&skip=&tag=
