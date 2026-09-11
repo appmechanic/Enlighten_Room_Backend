@@ -757,11 +757,39 @@ function scheduleFeedbackWarmup(question) {
   });
 }
 
-// Fires the standard-solution precompute in the background so the
-// question-create HTTP response returns immediately. Persists the result on
-// the ClassworkModel doc when it succeeds; silent no-op on failure so
-// per-submission feedback stays on its slower fallback path.
+// Fires two background flows so the question-create HTTP response returns
+// immediately:
+//   1) Eager cache warm — kicks off IMMEDIATELY (no setImmediate wait) so
+//      the createPromise is in the registry before the first student can
+//      possibly submit. Because systemInstruction is now standard + teacher
+//      only, the warm no longer depends on the precomputed solution and can
+//      run fully in parallel with (2).
+//   2) Standard-solution precompute — writes solution + finalAnswer +
+//      opener onto the Classwork doc when Gemini finishes.
+// Both are silent no-ops on failure so per-submission feedback keeps
+// working on its slower fallback path.
 function schedulePrecomputes(newQuestion, { correctAnswer }) {
+  // (1) Eager cache warm — starts synchronously, no setImmediate.
+  (async () => {
+    try {
+      const teacherId = await resolveTeacherIdForRoom(newQuestion.roomId);
+      if (teacherId && newQuestion.id) {
+        await warmClassworkFeedbackCache({
+          teacherId,
+          questionId: newQuestion.id,
+          standardSolution: "",
+        });
+      }
+    } catch (err) {
+      // The warmer swallows its own failures; this catch is belt-and-braces.
+      console.warn(
+        "[Classwork] eager cache warm failed:",
+        err?.message || err,
+      );
+    }
+  })();
+
+  // (2) Solution precompute — deferred so the HTTP response ships first.
   setImmediate(async () => {
     try {
       const [sessionId, teacherId] = await Promise.all([
@@ -795,16 +823,6 @@ function schedulePrecomputes(newQuestion, { correctAnswer }) {
             { $set: update },
           );
         }
-        // Warm Gemini's explicit prompt cache with the (standard + teacher +
-        // solution) prefix so the first student's submit doesn't pay the
-        // cache-creation round-trip. Fire-and-forget: any failure is logged
-        // by the warmer and the submit path silently falls through to inline
-        // systemInstruction as before.
-        warmClassworkFeedbackCache({
-          teacherId,
-          questionId: newQuestion.id,
-          standardSolution: solution || "",
-        }).catch(() => {});
       }
     } catch (err) {
       console.error(

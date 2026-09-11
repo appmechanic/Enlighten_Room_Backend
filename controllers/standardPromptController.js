@@ -1,6 +1,9 @@
 import asyncHandler from "express-async-handler";
 import StandardPrompt from "../models/standardPromptModel.js";
+import ClassworkModel from "../models/ClassworkModel.js";
 import { invalidateAiConfigCache } from "../utils/aiConfig.js";
+import { warmClassworkFeedbackCache } from "../utils/geminiClassworkFeedback.js";
+import { resolveTeacherIdForRoom } from "./classworkController.js";
 import {
   buildSeedPatch,
   getStandardPromptDefaults,
@@ -28,6 +31,56 @@ function normalizeSections(input, count) {
 
 function joinSections(sections) {
   return sections.filter((s) => s.length > 0).join(JOIN_SEPARATOR);
+}
+
+// After an admin prompt edit every Gemini explicit-cache entry becomes
+// unreachable because its systemInstruction digest no longer matches.
+// Proactively re-warm the caches for questions created in the last 24h so
+// the first student submission after the edit doesn't pay the
+// caches.create round-trip. Fire-and-forget; the warmer swallows failures.
+async function rewarmRecentClassworkCaches() {
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const recent = await ClassworkModel.find(
+      { createdAt: { $gte: since } },
+      { id: 1, roomId: 1 },
+    )
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+    if (recent.length === 0) {
+      console.log("[StandardPrompt] rewarm: no recent classwork questions");
+      return;
+    }
+    // Dedup teacherId lookup by roomId — all questions in a session share it.
+    const roomIds = [...new Set(recent.map((q) => q.roomId).filter(Boolean))];
+    const teacherByRoom = new Map();
+    await Promise.all(
+      roomIds.map(async (roomId) => {
+        const teacherId = await resolveTeacherIdForRoom(roomId);
+        if (teacherId) teacherByRoom.set(roomId, String(teacherId));
+      }),
+    );
+    let fired = 0;
+    for (const q of recent) {
+      const teacherId = teacherByRoom.get(q.roomId);
+      if (!teacherId || !q.id) continue;
+      warmClassworkFeedbackCache({
+        teacherId,
+        questionId: q.id,
+        standardSolution: "",
+      }).catch(() => {});
+      fired++;
+    }
+    console.log(
+      `[StandardPrompt] rewarm: fired ${fired}/${recent.length} warm calls (${roomIds.length} rooms)`,
+    );
+  } catch (err) {
+    console.warn(
+      "[StandardPrompt] rewarm after prompt edit failed:",
+      err?.message || err,
+    );
+  }
 }
 
 // Idempotently backfill any empty StandardPrompt field with its default. Runs
@@ -147,6 +200,11 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
   ).lean();
 
   invalidateAiConfigCache();
+  // Fire-and-forget: the admin's response ships instantly; recent classwork
+  // questions get their Gemini explicit-cache entries pre-warmed under the
+  // new digest so the first submission after this edit doesn't pay the
+  // caches.create round-trip.
+  rewarmRecentClassworkCaches();
 
   return res.json({
     ok: true,

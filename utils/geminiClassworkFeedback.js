@@ -12,10 +12,14 @@ import {
 import {
   getAiModel,
   getAiRetry,
-  getAiDirective,
   getAiStandardHintPrompt,
 } from "./aiConfig.js";
 import { getOrCreateClassworkFeedbackCache } from "./classworkGeminiCache.js";
+import {
+  classworkResponseCacheKey,
+  getCachedClassworkResponse,
+  setCachedClassworkResponse,
+} from "./classworkResponseCache.js";
 
 // Classwork feedback resolves its standard prompt + directives from the
 // admin-edited StandardPrompt via aiConfig (60s in-memory cache). Both fall
@@ -88,11 +92,11 @@ function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, forma
   return Math.min(equivFloor, tuning.maxThinkingBudget);
 }
 
-// Every prompt directive attached below is resolved per call via
-// getAiDirective(key). The canonical text lives in
-// config/standardPromptDefaults.js and is seeded into StandardPrompt on
-// first read; admin edits in the AdminAiPrompts UI override the seed value.
-// See utils/aiConfig.js for the DB-read + 60s cache.
+// The hint prompt is now assembled from just two admin-editable inputs:
+// getAiStandardHintPrompt() (the joined aiHintPromptSections) and
+// getTeacherPromptCached(teacherId) (per-teacher customization). Any rules
+// the model must follow (equivalence, ask/tell, compute flags, etc.) live
+// inside those sections in the AdminAiPrompts UI — no separate directives.
 
 // Property order matters: Gemini emits structured-JSON fields in the
 // order they appear in the schema.
@@ -414,75 +418,30 @@ async function buildGeminiRequest({
   computeStandardSolution,
   computeCommonMistake,
 }) {
-  // Standard prompt + all classwork directives come from the admin-edited
-  // StandardPrompt (aiConfig's 60s cache means no per-submission DB hit).
-  // Hash is recomputed from the actual text so an admin edit busts the
-  // Gemini prompt cache correctly.
-  const [
-    teacherPrompt,
-    standardText,
-    STANDARD_SOLUTION_COMPUTE_INSTRUCTION,
-    STANDARD_SOLUTION_SKIP_INSTRUCTION,
-    COMMON_MISTAKE_COMPUTE_INSTRUCTION,
-    COMMON_MISTAKE_SKIP_INSTRUCTION,
-    HINT_STREAM_INSTRUCTION,
-    MATH_EQUIVALENCE_INSTRUCTION,
-    ASK_MODE_INSTRUCTION,
-    TELL_MODE_INSTRUCTION,
-  ] = await Promise.all([
+  // Only two admin-editable inputs feed the Gemini hint call now: the
+  // global standardPrompt (aiHintPromptSections joined) and the per-teacher
+  // teacherPrompt. All previous runtime-injected directives (math
+  // equivalence, hint-stream rules, ask/tell pedagogy, compute/skip
+  // solution+mistake, server pre-check override) and the cached canonical
+  // solution / mistakes bank were removed — any rules the admin wants the
+  // model to follow must live inside the aiHintPromptSections themselves.
+  const [teacherPrompt, standardText] = await Promise.all([
     getTeacherPromptCached(teacherId),
     getAiStandardHintPrompt(),
-    getAiDirective("classwork.solutionCompute"),
-    getAiDirective("classwork.solutionSkip"),
-    getAiDirective("classwork.mistakeCompute"),
-    getAiDirective("classwork.mistakeSkip"),
-    getAiDirective("classwork.hintStream"),
-    getAiDirective("classwork.mathEquivalence"),
-    getAiDirective("classwork.askMode"),
-    getAiDirective("classwork.tellMode"),
   ]);
   const standardPromptHash = crypto
     .createHash("sha1")
     .update(standardText)
     .digest("hex");
 
-  const cachedSolution =
-    typeof cachedContext?.standardSolution === "string"
-      ? cachedContext.standardSolution.trim()
-      : "";
-  const cachedMistakes = Array.isArray(cachedContext?.commonMistakes)
-    ? cachedContext.commonMistakes
-    : [];
-
-  // Cache-friendly stable prefix: standard prompt + globally-stable rubric
-  // directives (math equivalence, hint-stream rules) + teacher prompt +
-  // precomputed canonical solution. Every submission for this question gets
-  // exactly this systemInstruction, so Gemini's explicit prompt cache can
-  // hit across submissions. The two rubric directives used to live in the
-  // per-submission user prompt; moving them into the cached prefix grows
-  // the prefill savings by their full length without changing behaviour.
-  // Common mistakes are DELIBERATELY excluded — they change as new
-  // mistakes accumulate and would invalidate the cache.
-  const solutionBlock = cachedSolution
-    ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
-    : "";
-  const systemInstruction = [
-    standardText,
-    MATH_EQUIVALENCE_INSTRUCTION,
-    HINT_STREAM_INSTRUCTION,
-    teacherPrompt,
-    solutionBlock,
-  ]
+  const systemInstruction = [standardText, teacherPrompt]
     .filter(Boolean)
     .join("\n\n");
 
-  // Size sanity: classworkGeminiCache requires >=400 chars to attempt a
-  // Gemini explicit-cache create, and gemini-2.5-flash won't accept a
-  // cache under ~1024 tokens (~4096 chars). Logging the assembled length
-  // + per-slot breakdown so staging can spot a shrunken live prompt
-  // that would silently drop the cache benefit.
+  // Size sanity: classworkGeminiCache requires >=400 chars and Gemini itself
+  // requires ~1024 tokens (~4096 chars) before caches.create will succeed.
   console.log(
-    `[ClassworkFeedback][req=${reqId}] systemInstruction len=${systemInstruction.length} ~tokens=${Math.round(systemInstruction.length / 4)} slots={std=${standardText?.length || 0},mathEq=${MATH_EQUIVALENCE_INSTRUCTION?.length || 0},hintStream=${HINT_STREAM_INSTRUCTION?.length || 0},teacher=${teacherPrompt?.length || 0},solution=${solutionBlock?.length || 0}}`,
+    `[ClassworkFeedback][req=${reqId}] systemInstruction len=${systemInstruction.length} ~tokens=${Math.round(systemInstruction.length / 4)} slots={std=${standardText?.length || 0},teacher=${teacherPrompt?.length || 0}}`,
   );
 
   const normalizedAnswerText = normalizeAnswerText(answer);
@@ -509,51 +468,7 @@ async function buildGeminiRequest({
   const effectiveQuestionText = questionText || "";
   const includeRawQuestionImage = Boolean(questionImage);
 
-  // Ask/Tell pedagogy directive, derived from the runtime attempt number.
-  // Odd -> ASK (coach recall), even -> TELL (explain). Skipped entirely when
-  // no valid number was supplied so older callers behave as before.
-  //
-  // Wrapped in an explicit STEP 1 / 2 / 3 gate so the correctness judgment
-  // happens BEFORE the pedagogy directive frames the response as a hint.
-  // Previously the "if correct, ignore" caveat was a single line stapled at
-  // the END of the block; the model would read the ASK/TELL directive
-  // first, commit to a hint framing, then rationalise correct=false to
-  // justify the hint it was already writing. Putting the correctness gate
-  // at the top forces evaluation before framing.
-  //
-  // The displayed attempt number is capped: very high counts (a student
-  // stuck in a loop, often because the AI kept mis-judging correctness)
-  // telegraphed "this student can't get it" and biased the correctness
-  // judgment toward false. Parity for ASK/TELL still comes from the raw
-  // number so the mode still alternates.
-  const rawAttemptNo = Number(submissionNumber);
-  const isValidAttempt = Number.isInteger(rawAttemptNo) && rawAttemptNo > 0;
-  const displayedAttempt = isValidAttempt ? Math.min(rawAttemptNo, 5) : rawAttemptNo;
-  const askTellInstruction = isValidAttempt
-    ? [
-        "STEP 1 — JUDGE CORRECTNESS by MATH EQUIVALENCE (rules in systemInstruction), by value not string.",
-        "STEP 2 — IF EQUIVALENT: correct=true; warm hintStream; fill advancedChallenge; NO 🛑/✅/🔨.",
-        "STEP 3 — IF NOT EQUIVALENT: apply pedagogy mode below.",
-        `Attempt #${displayedAttempt}.`,
-        rawAttemptNo % 2 === 1 ? ASK_MODE_INSTRUCTION : TELL_MODE_INSTRUCTION,
-      ].join("\n")
-    : null;
-
-  // Deterministic server-side equivalence pre-check. When it fires we KNOW
-  // the student is correct (the normalizer is narrow enough that a match
-  // is authoritative). Injected at the TOP of the user prompt as an
-  // override so the model can't rationalise it away — everything else in
-  // the prompt is subordinate.
-  const serverSideMatch = serverSideEquivalenceMatches(answer, correctAnswer, format);
-  const serverEquivalenceOverride = serverSideMatch
-    ? [
-        "SERVER-SIDE PRE-CHECK PASSED — student answer normalizes IDENTICAL to reference. AUTHORITATIVE.",
-        "MUST: correct=true; warm hintStream greeting first name; brief part1 ack; part2=[]; fill advancedChallenge (harder, same language). NO 🛑/✅/🔨. Ignore pedagogy mode below.",
-      ].join("\n")
-    : null;
-
   const promptLines = [
-    serverEquivalenceOverride,
     interactionId ? `interaction_id: ${interactionId}` : null,
     previousInteractionId
       ? `previous_interaction_id: ${previousInteractionId}`
@@ -566,43 +481,14 @@ async function buildGeminiRequest({
         ? `Acceptable correct answers (any one counts as correct):\n${referenceAnswer}`
         : `Reference / Correct Answer: ${referenceAnswer}`
       : derivedReferenceAnswer
-        ? `Reference / Correct Answer (AI-derived at question-create time from the canonical solution — use as ground truth unless the solution above contradicts it): ${derivedReferenceAnswer}`
+        ? `Reference / Correct Answer (AI-derived from the canonical solution): ${derivedReferenceAnswer}`
         : null,
     `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
     includeRawQuestionImage ? "A question image is attached." : null,
     answerImageSource
       ? "A student answer image is attached. Inspect the handwriting/image carefully."
       : null,
-    askTellInstruction,
-    // MATH_EQUIVALENCE_INSTRUCTION and HINT_STREAM_INSTRUCTION are now
-    // baked into systemInstruction so they land inside the explicit cache
-    // instead of being resent per submission.
-    computeStandardSolution
-      ? STANDARD_SOLUTION_COMPUTE_INSTRUCTION
-      : STANDARD_SOLUTION_SKIP_INSTRUCTION,
-    computeCommonMistake
-      ? COMMON_MISTAKE_COMPUTE_INSTRUCTION
-      : COMMON_MISTAKE_SKIP_INSTRUCTION,
   ].filter(Boolean);
-
-
-  // Common mistakes rendered as their own attachment part AFTER the main
-  // prompt. Kept out of both systemInstruction and the shared user prompt
-  // so accumulating new mistakes doesn't bust the implicit cache prefix.
-  const mistakeLines = [];
-  if (cachedMistakes.length > 0) {
-    mistakeLines.push(
-      "Reference bank of common mistakes previously seen for this question (use to shape feedback but do NOT copy verbatim):",
-    );
-    cachedMistakes.forEach((m, index) => {
-      const title = String(m?.title || "").trim() || `Mistake ${index + 1}`;
-      const answerText = String(m?.answerLatex || m?.studentAnswer || "").trim();
-      const fb = String(m?.feedback || "").trim();
-      mistakeLines.push(`${index + 1}. ${title}`);
-      if (answerText) mistakeLines.push(`   Student answer: ${answerText}`);
-      if (fb) mistakeLines.push(`   Feedback: ${fb}`);
-    });
-  }
 
   const parts = [];
 
@@ -635,18 +521,7 @@ async function buildGeminiRequest({
 
   parts.push({ text: promptLines.join("\n") });
 
-  if (mistakeLines.length > 0) {
-    parts.push({ text: mistakeLines.join("\n") });
-  }
-
-  // Full text of the user-side prompt so the admin call log can persist
-  // exactly what was sent (question + runtime directives + mistake bank).
-  const userPromptText = [
-    promptLines.join("\n"),
-    mistakeLines.length > 0 ? mistakeLines.join("\n") : null,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const userPromptText = promptLines.join("\n");
 
   return {
     systemInstruction,
@@ -655,7 +530,7 @@ async function buildGeminiRequest({
     standardPromptText: standardText,
     teacherPromptText: teacherPrompt,
     userPromptText,
-    hasCachedSolution: Boolean(cachedSolution),
+    hasCachedSolution: false,
   };
 }
 
@@ -696,6 +571,27 @@ function shapeFeedback(parsed, responseText) {
   };
 }
 
+// Shape of the feedback we return when serverSideEquivalenceMatches says
+// the student is definitively correct — the normalizer here is narrow
+// enough that a match is authoritative and Gemini can't rationalise it
+// away. The hint is deliberately generic (we don't have the model's
+// question-language detection); pedagogy arrays stay empty because there
+// is no error to coach through.
+function buildCannedCorrectFeedback(studentName) {
+  const greeting = studentName ? `${studentName}, ` : "";
+  return {
+    correct: true,
+    hintStream: `${greeting}excellent work — your answer is correct. Keep going!`,
+    part1: [],
+    part2: [],
+    part3: [],
+    advancedChallenge: { congratulations: "", question: "" },
+    standardSolution: "",
+    commonMistake: { isCommon: false, title: "", answerLatex: "" },
+    raw: "",
+  };
+}
+
 export async function getClassworkAiFeedback({
   questionText,
   answer,
@@ -718,6 +614,67 @@ export async function getClassworkAiFeedback({
   computeCommonMistake = false,
 }) {
   const reqId = newReqId();
+  const normalizedAnswer = normalizeAnswerText(answer);
+
+  // Server-side equivalence pre-check — authoritative when it matches, so
+  // we can skip Gemini entirely. Runs BEFORE the response cache because
+  // it's still cheaper (one string normalise + compare) and safer
+  // (guaranteed correctness verdict; the response cache could hold an
+  // older correct=false verdict from before the teacher fixed a bad
+  // correctAnswer, and we'd rather trust the current server check).
+  if (serverSideEquivalenceMatches(answer, correctAnswer, format)) {
+    const canned = buildCannedCorrectFeedback(studentName);
+    console.log(
+      `[ClassworkFeedback][req=${reqId}] server-side equivalence match — skipping Gemini call`,
+    );
+    // Log a lightweight audit row so the admin dashboard still shows this
+    // submission. usageMetadata=null means zero tokens billed.
+    recordAiCallLog({
+      reqId,
+      tag: "ClassworkFeedback:preCheck",
+      model: "",
+      sessionId,
+      classroomId,
+      teacherId,
+      studentId,
+      studentName,
+      questionText,
+      studentAnswer: normalizedAnswer,
+      aiResponseSummary: JSON.stringify(canned),
+      userPromptText: "",
+      standardPromptSnippet: "",
+      standardPromptHash: "",
+      teacherPromptSnippet: "",
+      usageMetadata: null,
+    });
+    const preCheckKey = classworkResponseCacheKey({
+      teacherId,
+      questionId,
+      normalizedAnswer,
+    });
+    if (preCheckKey) setCachedClassworkResponse(preCheckKey, canned);
+    return canned;
+  }
+
+  // Response-level cache: if the same (teacher, question, normalizedAnswer)
+  // has been graded within TTL, return the previous feedback and skip
+  // Gemini entirely. Image-only submissions produce an empty normalized
+  // answer and are not cached.
+  const responseCacheKey = classworkResponseCacheKey({
+    teacherId,
+    questionId,
+    normalizedAnswer,
+  });
+  const cachedResponse = responseCacheKey
+    ? getCachedClassworkResponse(responseCacheKey)
+    : null;
+  if (cachedResponse) {
+    console.log(
+      `[ClassworkFeedback][req=${reqId}] response-cache HIT — skipping Gemini call`,
+    );
+    return cachedResponse;
+  }
+
   const [MODEL, FALLBACK_MODEL, retryCfg] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
@@ -904,6 +861,12 @@ export async function getClassworkAiFeedback({
       usageMetadata: result?.usageMetadata,
     });
   });
+
+  // Populate the response cache so an identical resubmit within TTL
+  // returns immediately without a Gemini call.
+  if (responseCacheKey) {
+    setCachedClassworkResponse(responseCacheKey, feedback);
+  }
 
   return feedback;
 }
@@ -1381,6 +1344,90 @@ export async function getClassworkAiFeedbackStream({
   onBodyClose,
 }) {
   const reqId = newReqId();
+  const normalizedAnswer = normalizeAnswerText(answer);
+
+  const safeCall = (fn, ...args) => {
+    if (typeof fn !== "function") return;
+    try {
+      fn(...args);
+    } catch (err) {
+      console.error(
+        `[ClassworkFeedback][req=${reqId}][stream] callback threw:`,
+        err,
+      );
+    }
+  };
+
+  const replayFeedbackThroughCallbacks = (feedback) => {
+    safeCall(onVerdict, Boolean(feedback.correct));
+    if (feedback.hintStream) safeCall(onHintDelta, feedback.hintStream);
+    safeCall(onHintClose, feedback.hintStream || "");
+    for (const field of ["part1", "part2"]) {
+      const items = Array.isArray(feedback[field]) ? feedback[field] : [];
+      items.forEach((text, index) => {
+        safeCall(onBodyDelta, field, index, text);
+        safeCall(onBodyClose, field, index, text);
+      });
+    }
+  };
+
+  // Server-side equivalence pre-check — authoritative when it matches, so
+  // we skip Gemini entirely and replay a canned "correct" feedback through
+  // the streaming callbacks.
+  if (serverSideEquivalenceMatches(answer, correctAnswer, format)) {
+    const canned = buildCannedCorrectFeedback(studentName);
+    console.log(
+      `[ClassworkFeedback][req=${reqId}][stream] server-side equivalence match — skipping Gemini call`,
+    );
+    replayFeedbackThroughCallbacks(canned);
+    recordAiCallLog({
+      reqId,
+      tag: "ClassworkFeedback:stream:preCheck",
+      model: "",
+      sessionId,
+      classroomId,
+      teacherId,
+      studentId,
+      studentName,
+      questionText,
+      studentAnswer: normalizedAnswer,
+      aiResponseSummary: JSON.stringify(canned),
+      userPromptText: "",
+      standardPromptSnippet: "",
+      standardPromptHash: "",
+      teacherPromptSnippet: "",
+      usageMetadata: null,
+    });
+    const preCheckKey = classworkResponseCacheKey({
+      teacherId,
+      questionId,
+      normalizedAnswer,
+    });
+    if (preCheckKey) setCachedClassworkResponse(preCheckKey, canned);
+    return canned;
+  }
+
+  // Response-level cache: replay a previously-cached response through the
+  // streaming callbacks so the SSE controller emits the exact same event
+  // sequence it would for a live stream, but skips the Gemini call. No
+  // artificial delays — deltas fire back-to-back and the client sees the
+  // full response essentially instantly.
+  const responseCacheKey = classworkResponseCacheKey({
+    teacherId,
+    questionId,
+    normalizedAnswer,
+  });
+  const cachedResponse = responseCacheKey
+    ? getCachedClassworkResponse(responseCacheKey)
+    : null;
+  if (cachedResponse) {
+    console.log(
+      `[ClassworkFeedback][req=${reqId}][stream] response-cache HIT — replaying cached response`,
+    );
+    replayFeedbackThroughCallbacks(cachedResponse);
+    return cachedResponse;
+  }
+
   const [MODEL, FALLBACK_MODEL, retryCfg] = await Promise.all([
     getAiModel(),
     getAiModel("fallback"),
@@ -1713,6 +1760,12 @@ export async function getClassworkAiFeedbackStream({
     });
   });
 
+  // Populate the response cache so an identical resubmit within TTL is
+  // served straight from memory without another Gemini call.
+  if (responseCacheKey) {
+    setCachedClassworkResponse(responseCacheKey, feedback);
+  }
+
   return feedback;
 }
 
@@ -1732,40 +1785,19 @@ export async function warmClassworkFeedbackCache({
 }) {
   try {
     if (!questionId) return { ok: false, reason: "no-question" };
-    const [
-      MODEL,
-      teacherPrompt,
-      standardText,
-      MATH_EQUIVALENCE_INSTRUCTION,
-      HINT_STREAM_INSTRUCTION,
-    ] = await Promise.all([
+    const [MODEL, teacherPrompt, standardText] = await Promise.all([
       getAiModel(),
       getTeacherPromptCached(teacherId),
       getAiStandardHintPrompt(),
-      getAiDirective("classwork.mathEquivalence"),
-      getAiDirective("classwork.hintStream"),
     ]);
-    const cachedSolution = (standardSolution || "").trim();
-    const solutionBlock = cachedSolution
-      ? `Canonical step-by-step solution (precomputed at question-create time; treat as authoritative):\n${cachedSolution}`
-      : "";
     // Order MUST match buildGeminiRequest's systemInstruction assembly —
     // any drift changes the digest and the on-submit path would create a
     // second cache entry instead of reusing this one.
-    const systemInstruction = [
-      standardText,
-      MATH_EQUIVALENCE_INSTRUCTION,
-      HINT_STREAM_INSTRUCTION,
-      teacherPrompt,
-      solutionBlock,
-    ]
+    const systemInstruction = [standardText, teacherPrompt]
       .filter(Boolean)
       .join("\n\n");
-    // Mirrors the buildGeminiRequest size log so staging can compare
-    // warm-vs-submit assembly and confirm both paths produce the same
-    // length (a prerequisite for the sha1 digests matching).
     console.log(
-      `[ClassworkFeedback][warm][q=${questionId}] systemInstruction len=${systemInstruction.length} ~tokens=${Math.round(systemInstruction.length / 4)} slots={std=${standardText?.length || 0},mathEq=${MATH_EQUIVALENCE_INSTRUCTION?.length || 0},hintStream=${HINT_STREAM_INSTRUCTION?.length || 0},teacher=${teacherPrompt?.length || 0},solution=${solutionBlock?.length || 0}}`,
+      `[ClassworkFeedback][warm][q=${questionId}] systemInstruction len=${systemInstruction.length} ~tokens=${Math.round(systemInstruction.length / 4)} slots={std=${standardText?.length || 0},teacher=${teacherPrompt?.length || 0}}`,
     );
     const result = await getOrCreateClassworkFeedbackCache({
       model: MODEL,

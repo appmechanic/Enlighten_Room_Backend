@@ -12,6 +12,12 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const cacheRegistry = new Map();
 
 const MIN_SYSTEM_INSTRUCTION_CHARS = 400;
+// Gemini rejects caches.create for payloads under ~1024 input tokens
+// (~4096 chars at ~4 chars/token). Checking here means we skip the
+// doomed round-trip and log a clear reason, instead of hammering the
+// Gemini API with failed creates on every submission.
+const MIN_SYSTEM_INSTRUCTION_TOKENS = 1024;
+const CHARS_PER_TOKEN_ESTIMATE = 4;
 
 function computeKey({ model, teacherId, questionId, systemInstruction }) {
   const digest = crypto
@@ -42,13 +48,25 @@ export async function getOrCreateClassworkFeedbackCache({
   systemInstruction,
   tag,
 }) {
-  if (
-    !model ||
-    !questionId ||
-    !systemInstruction ||
-    systemInstruction.length < MIN_SYSTEM_INSTRUCTION_CHARS
-  ) {
-    return { name: "", ok: false, reused: false, reason: "skip-small" };
+  if (!model || !questionId || !systemInstruction) {
+    return { name: "", ok: false, reused: false, reason: "skip-missing-input" };
+  }
+  if (systemInstruction.length < MIN_SYSTEM_INSTRUCTION_CHARS) {
+    return { name: "", ok: false, reused: false, reason: "skip-below-char-floor" };
+  }
+  const approxTokens = Math.round(
+    systemInstruction.length / CHARS_PER_TOKEN_ESTIMATE,
+  );
+  if (approxTokens < MIN_SYSTEM_INSTRUCTION_TOKENS) {
+    console.warn(
+      `[${tag || "ClassworkFeedbackCache"}] skipping caches.create — systemInstruction only ~${approxTokens} tokens (< ${MIN_SYSTEM_INSTRUCTION_TOKENS}); Gemini would reject the create. Add more content to standardPrompt or teacherPrompt so the prefix is cacheable.`,
+    );
+    return {
+      name: "",
+      ok: false,
+      reused: false,
+      reason: "skip-below-token-floor",
+    };
   }
 
   const key = computeKey({ model, teacherId, questionId, systemInstruction });
