@@ -115,7 +115,7 @@ export async function cancelPreviousSubscription(userId) {
   if (!existing) return null;
 
   await cancelOnProvider(existing);
-
+ 
   existing.status = "cancelled";
   existing.cancelledAt = new Date();
   await existing.save();
