@@ -1,5 +1,5 @@
 import crypto from "crypto";
-
+ 
 // Response-level cache for identical (teacher, question, normalizedAnswer)
 // submissions. Sits IN FRONT of Gemini so repeated wrong answers, accidental
 // double-taps, and "checking…" retries return the previous feedback without
