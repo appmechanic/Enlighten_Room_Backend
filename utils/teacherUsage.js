@@ -45,6 +45,48 @@ export function monthBounds(monthKey) {
   return { start, end };
 }
 
+// Clamps the monthly window to Subscription.usageResetAt so an upgrade
+// zeroes every monthly counter as of the reset moment. resetAt=null (no
+// active subscription) leaves the window untouched.
+export function effectiveMonthlyWindow(monthKey, resetAt) {
+  const { start, end } = monthBounds(monthKey);
+  if (!resetAt) return { start, end };
+  const reset = resetAt instanceof Date ? resetAt : new Date(resetAt);
+  if (Number.isNaN(reset.getTime())) return { start, end };
+  return {
+    start: reset > start ? reset : start,
+    end,
+  };
+}
+
+// Reads the active subscription's usageResetAt marker. Returns null when
+// no active subscription exists — callers treat that as "no reset applied".
+export async function getUsageResetAt(teacherId) {
+  const teacherOid = toObjectId(teacherId);
+  if (!teacherOid) return null;
+  const sub = await Subscription.findOne({
+    userId: teacherOid,
+    status: "active",
+  })
+    .select("usageResetAt")
+    .lean();
+  return sub?.usageResetAt || null;
+}
+
+// Stamps Subscription.usageResetAt=now for a teacher. Call from any code
+// path that grants a new billing period: plan upgrade/downgrade endpoints,
+// Stripe subscription webhooks (customer.subscription.created/updated when
+// the plan changes), and admin manual plan edits. Fire-and-forget-safe.
+export async function touchUsageResetAt(teacherId) {
+  const teacherOid = toObjectId(teacherId);
+  if (!teacherOid) return null;
+  return Subscription.findOneAndUpdate(
+    { userId: teacherOid, status: "active" },
+    { $set: { usageResetAt: new Date() } },
+    { new: true, projection: { usageResetAt: 1 } },
+  ).lean();
+}
+
 function toObjectId(value) {
   if (!value) return null;
   if (value instanceof mongoose.Types.ObjectId) return value;
@@ -56,20 +98,34 @@ function toObjectId(value) {
 }
 
 // Sums (endedAt - startedAt) for lessons owned by this teacher whose activity
-// overlapped the month. Active lessons (endedAt=null) are clipped to now so
-// dashboards reflect in-progress usage.
-async function sumMeetingMinutes(teacherId, monthKey) {
-  const { start, end } = monthBounds(monthKey);
+// overlapped the given [start, end) window. Active lessons (endedAt=null)
+// are clipped to now so dashboards reflect in-progress usage. Caller is
+// responsible for clamping `start` to max(monthStart, subscription.usageResetAt)
+// so upgrades zero the counter mid-month.
+async function sumMeetingMinutes(teacherId, start, end) {
   const classrooms = await Classroom.find({ teacherId })
     .select("_id")
     .lean();
   if (classrooms.length === 0) return 0;
   const classroomIds = classrooms.map((c) => c._id);
 
+  // Some legacy Lesson docs have classroomId=null because
+  // resolveSessionContext returned null at create time (roomId <-> Session
+  // regex miss). Recover those via sessionId → Session.classroomId.
+  const sessionIds = await Session.find({ classroomId: { $in: classroomIds } })
+    .distinct("_id");
+
   const lessons = await Lesson.find({
-    classroomId: { $in: classroomIds },
-    startedAt: { $lt: end },
-    $or: [{ endedAt: null }, { endedAt: { $gte: start } }],
+    $and: [
+      {
+        $or: [
+          { classroomId: { $in: classroomIds } },
+          ...(sessionIds.length ? [{ sessionId: { $in: sessionIds } }] : []),
+        ],
+      },
+      { startedAt: { $lt: end } },
+      { $or: [{ endedAt: null }, { endedAt: { $gte: start } }] },
+    ],
   })
     .select("startedAt endedAt")
     .lean();
@@ -87,8 +143,7 @@ async function sumMeetingMinutes(teacherId, monthKey) {
   return Math.round(ms / 60000);
 }
 
-async function sumScreenLockMinutes(teacherId, monthKey) {
-  const { start, end } = monthBounds(monthKey);
+async function sumScreenLockMinutes(teacherId, start, end) {
   const intervals = await ScreenLockInterval.find({
     teacherId,
     startedAt: { $lt: end },
@@ -110,8 +165,7 @@ async function sumScreenLockMinutes(teacherId, monthKey) {
   return Math.round(ms / 60000);
 }
 
-async function countLessonReports(teacherId, monthKey) {
-  const { start, end } = monthBounds(monthKey);
+async function countLessonReports(teacherId, start, end) {
   return LessonReportSent.countDocuments({
     teacherId,
     sentAt: { $gte: start, $lt: end },
@@ -123,10 +177,9 @@ async function countLessonReports(teacherId, monthKey) {
 // assignment gen + every student submission in one of the teacher's
 // classrooms), so this captures the teacher's spend AND their students'
 // spend — matching what the teacher sees in their own AI call log.
-async function sumAiTokensBilled(teacherId, monthKey) {
+async function sumAiTokensBilled(teacherId, start, end) {
   const teacherOid = toObjectId(teacherId);
   if (!teacherOid) return 0;
-  const { start, end } = monthBounds(monthKey);
   const [row] = await AiCallLog.aggregate([
     {
       $match: {
@@ -157,10 +210,9 @@ async function sumAiTokensBilled(teacherId, monthKey) {
 // month — includes the teacher's own calls plus every AI call triggered by
 // their students. This is the "number of times AI was used" figure shown
 // on the teacher's own subscription view.
-async function countAiCalls(teacherId, monthKey) {
+async function countAiCalls(teacherId, start, end) {
   const teacherOid = toObjectId(teacherId);
   if (!teacherOid) return 0;
-  const { start, end } = monthBounds(monthKey);
   return AiCallLog.countDocuments({
     teacherId: teacherOid,
     createdAt: { $gte: start, $lt: end },
@@ -181,8 +233,12 @@ async function sumStorageBytes(teacherId) {
 // middleware (which cares only about the {used, limit} pair for its category).
 export async function getTeacherMonthUsage(teacherId, monthKey) {
   const mk = monthKey || currentMonthKey();
-  const user = await User.findById(teacherId).select("limits").lean();
+  const [user, resetAt] = await Promise.all([
+    User.findById(teacherId).select("limits").lean(),
+    getUsageResetAt(teacherId),
+  ]);
   const limits = user?.limits || {};
+  const { start, end } = effectiveMonthlyWindow(mk, resetAt);
 
   const [
     meetingMinutes,
@@ -192,11 +248,11 @@ export async function getTeacherMonthUsage(teacherId, monthKey) {
     aiCalls,
     storageBytes,
   ] = await Promise.all([
-    sumMeetingMinutes(teacherId, mk),
-    sumScreenLockMinutes(teacherId, mk),
-    countLessonReports(teacherId, mk),
-    sumAiTokensBilled(teacherId, mk),
-    countAiCalls(teacherId, mk),
+    sumMeetingMinutes(teacherId, start, end),
+    sumScreenLockMinutes(teacherId, start, end),
+    countLessonReports(teacherId, start, end),
+    sumAiTokensBilled(teacherId, start, end),
+    countAiCalls(teacherId, start, end),
     sumStorageBytes(teacherId),
   ]);
 
@@ -235,22 +291,26 @@ export async function getTeacherMonthUsage(teacherId, monthKey) {
 // where ok=false means the teacher has already reached (or passed) the cap.
 export async function checkUsageBudget(teacherId, category, monthKey) {
   const mk = monthKey || currentMonthKey();
-  const user = await User.findById(teacherId).select("limits").lean();
+  const [user, resetAt] = await Promise.all([
+    User.findById(teacherId).select("limits").lean(),
+    getUsageResetAt(teacherId),
+  ]);
   const limit = user?.limits?.[LIMIT_FIELD_BY_CATEGORY[category]] ?? 0;
+  const { start, end } = effectiveMonthlyWindow(mk, resetAt);
 
   let used = 0;
   switch (category) {
     case "meetingMinutes":
-      used = await sumMeetingMinutes(teacherId, mk);
+      used = await sumMeetingMinutes(teacherId, start, end);
       break;
     case "screenLockMinutes":
-      used = await sumScreenLockMinutes(teacherId, mk);
+      used = await sumScreenLockMinutes(teacherId, start, end);
       break;
     case "lessonReports":
-      used = await countLessonReports(teacherId, mk);
+      used = await countLessonReports(teacherId, start, end);
       break;
     case "aiTokens":
-      used = await sumAiTokensBilled(teacherId, mk);
+      used = await sumAiTokensBilled(teacherId, start, end);
       break;
     case "storageBytes":
       used = await sumStorageBytes(teacherId);
@@ -285,9 +345,14 @@ async function countClassrooms(teacherOid) {
 }
 
 async function countStudents(teacherOid) {
+  // Match both the new multi-teacher array (teacherIds) AND the legacy
+  // singular teacherId — students created before the multi-teacher
+  // migration only have teacherId set, so the array-only query returned
+  // 0 for teachers whose students were all pre-migration. See
+  // [[student-multi-teacher]].
   return User.countDocuments({
     userRole: "student",
-    teacherIds: teacherOid,
+    $or: [{ teacherIds: teacherOid }, { teacherId: teacherOid }],
   });
 }
 
@@ -310,7 +375,6 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
   const teacherOid = toObjectId(teacherId);
   if (!teacherOid) return null;
   const mk = monthKey || currentMonthKey();
-  const { start, end } = monthBounds(mk);
 
   const subscription = await Subscription.findOne({
     userId: teacherOid,
@@ -323,17 +387,25 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
   const limits = plan?.limits || {};
   const featureFlags = plan?.featureFlags || {};
 
+  // Reset marker on the subscription clamps every monthly counter, so
+  // upgrading/renewing a plan zeroes them mid-month without touching any
+  // underlying rows. Cumulative counters (classrooms, students, teachers)
+  // deliberately ignore reset — they reflect current state, not history.
+  const { start, end } = effectiveMonthlyWindow(mk, subscription?.usageResetAt);
+
   const [
     aiCalls,
     sessions,
     sessionMinutes,
+    screenLockMinutes,
     classrooms,
     students,
     teachers,
   ] = await Promise.all([
     countAiCallsInternal(teacherOid, start, end),
     countSessionsThisMonth(teacherOid, start, end),
-    sumMeetingMinutes(teacherOid, mk),
+    sumMeetingMinutes(teacherOid, start, end),
+    sumScreenLockMinutes(teacherOid, start, end),
     countClassrooms(teacherOid),
     countStudents(teacherOid),
     countTeachers(teacherOid),
@@ -362,6 +434,14 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
       unit: "min",
       used: sessionMinutes,
       limit: limits.maxSessionMinutesPerMonth,
+      period: "month",
+    },
+    {
+      key: "screenLockMinutes",
+      label: "Screen lock minutes",
+      unit: "min",
+      used: screenLockMinutes,
+      limit: limits.maxScreenLockMinutesPerMonth,
       period: "month",
     },
     {

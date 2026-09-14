@@ -20,6 +20,7 @@ import {
 import {
   listTeachersWithLimits,
   updateTeacherLimits,
+  resetTeacherUsage,
 } from "../controllers/adminTeacherLimitsController.js";
 import auth_admin from "../middleware/auth_admin.js";
 import auth_key_header from "../middleware/auth_key_header.js";
@@ -127,6 +128,12 @@ router.patch(
   auth_admin,
   auth_key_header,
   updateTeacherLimits
+);
+router.post(
+  "/teachers/:id/reset-usage",
+  auth_admin,
+  auth_key_header,
+  resetTeacherUsage
 );
 
 export default router;

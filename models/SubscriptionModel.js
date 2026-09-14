@@ -48,6 +48,16 @@ const subscriptionSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+  // Marker used by teacherUsage's monthly counters. Every counter is
+  // clamped to max(monthStart, usageResetAt), so bumping this to `now`
+  // makes AI calls / sessions / session minutes / screen lock minutes /
+  // lesson reports all read 0 immediately. Stripe webhooks bump it on
+  // subscription.created and on any plan change (upgrade/downgrade);
+  // admin-side plan edits should call touchUsageResetAt(userId) too.
+  usageResetAt: {
+    type: Date,
+    default: Date.now,
+  },
 });
 
 const Subscription = mongoose.model("Subscription", subscriptionSchema);

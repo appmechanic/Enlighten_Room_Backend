@@ -466,6 +466,12 @@ async function handleSubscriptionCreated(event) {
       ) {
         await cancelPreviousSubscription(user._id);
       }
+      // A fresh Stripe subscription arriving means the teacher just
+      // upgraded / switched — bump usageResetAt so every monthly counter
+      // resets to zero immediately.
+      const isNewProviderSub =
+        existing.providerSubscriptionId !== subscription.id;
+      const isPlanChange = plan?._id && String(existing.planType) !== String(plan._id);
       existing.status = mappedStatus;
       existing.provider = "stripe";
       existing.providerSubscriptionId = subscription.id;
@@ -473,6 +479,9 @@ async function handleSubscriptionCreated(event) {
       existing.frequency = frequency;
       existing.addons = addons;
       existing.cancelledAt = mappedStatus === "cancelled" ? new Date() : null;
+      if (isNewProviderSub || isPlanChange) {
+        existing.usageResetAt = new Date();
+      }
       saved = await existing.save();
     } else if (plan?._id) {
       saved = await Subscription.create({
@@ -554,6 +563,18 @@ async function handleSubscriptionUpdated(event) {
           : null,
     };
     if (plan?._id) update.planType = plan._id;
+
+    // Plan change on an existing subscription = upgrade/downgrade —
+    // reset the usage counters. Non-plan updates (status flips, address
+    // changes, addon toggles) leave the counters running.
+    if (plan?._id) {
+      const priorSub = await Subscription.findOne({ userId: user._id })
+        .select("planType")
+        .lean();
+      if (priorSub && String(priorSub.planType) !== String(plan._id)) {
+        update.usageResetAt = new Date();
+      }
+    }
 
     const updated = await Subscription.findOneAndUpdate(
       { userId: user._id },

@@ -4,6 +4,7 @@ import User from "../models/user.js";
 import {
   getTeacherMonthUsage,
   currentMonthKey,
+  touchUsageResetAt,
 } from "../utils/teacherUsage.js";
 
 const LIMIT_FIELDS = [
@@ -130,5 +131,31 @@ export const updateTeacherLimits = asyncHandler(async (req, res) => {
       isSuspended: teacher.isSuspended,
       limits: teacher.limits,
     },
+  });
+});
+
+// POST /api/admin/teachers/:id/reset-usage
+// Bumps Subscription.usageResetAt=now so every monthly counter reads 0
+// from this moment. Cumulative counters (classrooms, students, teachers,
+// storage) are untouched — they reflect current state, not history.
+export const resetTeacherUsage = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({ ok: false, error: "Invalid teacher id" });
+  }
+  const teacher = await User.findById(id).select("_id userRole").lean();
+  if (!teacher || teacher.userRole !== "teacher") {
+    return res.status(404).json({ ok: false, error: "Teacher not found" });
+  }
+  const updated = await touchUsageResetAt(id);
+  if (!updated) {
+    return res.status(409).json({
+      ok: false,
+      error: "No active subscription for this teacher",
+    });
+  }
+  return res.json({
+    ok: true,
+    data: { _id: String(teacher._id), usageResetAt: updated.usageResetAt },
   });
 });

@@ -75,6 +75,7 @@ const planSchema = new mongoose.Schema(
       maxTeachers: { type: Number, default: null },
       maxSessionsPerMonth: { type: Number, default: null },
       maxSessionMinutesPerMonth: { type: Number, default: null },
+      maxScreenLockMinutesPerMonth: { type: Number, default: null },
       maxAiCallsPerMonth: { type: Number, default: null },
       maxClassrooms: { type: Number, default: null },
     },

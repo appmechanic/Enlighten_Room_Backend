@@ -717,6 +717,11 @@ async function handleCheckoutSessionCompletedEnhanced(session, summary) {
             provider: "stripe",
             providerSubscriptionId: subscriptionId,
             cancelledAt: null,
+            // Checkout completion always starts a new billing period —
+            // reset monthly usage counters so the teacher sees 0-used
+            // right after paying. See getTeacherSubscriptionUsage for
+            // how this clamp is applied.
+            usageResetAt: new Date(),
           },
         },
         { upsert: true, new: true }
@@ -1001,6 +1006,9 @@ async function handleInvoicePaymentSucceededEnhanced(
             provider: "stripe",
             providerSubscriptionId: subscriptionId,
             cancelledAt: null,
+            // Every paid invoice (first charge or renewal) starts a new
+            // billing period — roll monthly usage counters to zero.
+            usageResetAt: new Date(),
           },
         },
         { upsert: true, new: true }
