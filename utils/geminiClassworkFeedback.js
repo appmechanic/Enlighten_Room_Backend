@@ -651,6 +651,8 @@ export async function getClassworkAiFeedback({
       teacherId,
       questionId,
       normalizedAnswer,
+      format,
+      answer,
     });
     if (preCheckKey) setCachedClassworkResponse(preCheckKey, canned);
     return canned;
@@ -658,12 +660,15 @@ export async function getClassworkAiFeedback({
 
   // Response-level cache: if the same (teacher, question, normalizedAnswer)
   // has been graded within TTL, return the previous feedback and skip
-  // Gemini entirely. Image-only submissions produce an empty normalized
-  // answer and are not cached.
+  // Gemini entirely. Handwriting/image submissions are excluded inside
+  // classworkResponseCacheKey — their normalizedAnswer is a constant
+  // placeholder that would collide across every student.
   const responseCacheKey = classworkResponseCacheKey({
     teacherId,
     questionId,
     normalizedAnswer,
+    format,
+    answer,
   });
   const cachedResponse = responseCacheKey
     ? getCachedClassworkResponse(responseCacheKey)
@@ -1402,6 +1407,8 @@ export async function getClassworkAiFeedbackStream({
       teacherId,
       questionId,
       normalizedAnswer,
+      format,
+      answer,
     });
     if (preCheckKey) setCachedClassworkResponse(preCheckKey, canned);
     return canned;
@@ -1411,11 +1418,14 @@ export async function getClassworkAiFeedbackStream({
   // streaming callbacks so the SSE controller emits the exact same event
   // sequence it would for a live stream, but skips the Gemini call. No
   // artificial delays — deltas fire back-to-back and the client sees the
-  // full response essentially instantly.
+  // full response essentially instantly. Handwriting/image submissions
+  // are excluded inside classworkResponseCacheKey.
   const responseCacheKey = classworkResponseCacheKey({
     teacherId,
     questionId,
     normalizedAnswer,
+    format,
+    answer,
   });
   const cachedResponse = responseCacheKey
     ? getCachedClassworkResponse(responseCacheKey)

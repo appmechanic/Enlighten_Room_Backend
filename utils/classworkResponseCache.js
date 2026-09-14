@@ -10,8 +10,14 @@ import crypto from "crypto";
 // deployments get one cache per worker — that's fine for a "same student
 // re-submits within seconds" workflow, which is the target.
 //
-// Not cached: image-only submissions (answer text empty), errored responses,
-// or when either teacherId or questionId is missing.
+// Not cached: image-only submissions (handwriting), errored responses, or
+// when either teacherId or questionId is missing.
+//
+// Handwriting is explicitly excluded because normalizeAnswerText collapses
+// every image answer to the same constant string, so all handwriting answers
+// to the same question would collide on the same cache key even though the
+// student drew completely different content — see [[answer-split-data-url]]
+// for the sibling trap on the submit path.
 
 const TTL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_ENTRIES = 500;
@@ -33,11 +39,29 @@ function evictExpiredAndOversized() {
   }
 }
 
+// Formats whose "answer" is actually image bytes — the normalized answer text
+// is a constant placeholder that collides across every student, so caching
+// by that text alone would serve the same feedback for different drawings.
+const IMAGE_ANSWER_FORMATS = new Set(["handwriting"]);
+
+function answerIsImage(answer) {
+  if (!answer) return false;
+  if (typeof answer === "string") return /^data:image\//i.test(answer);
+  if (typeof answer === "object") {
+    if (typeof answer.imageUrl === "string" && answer.imageUrl.trim()) return true;
+    if (typeof answer.imageData === "string" && /^data:image\//i.test(answer.imageData)) return true;
+    if (answer.type === "image") return true;
+  }
+  return false;
+}
+
 // Deterministic key for a submission. Returns null if we shouldn't cache —
 // caller can safely treat that as "cache disabled for this call".
-export function classworkResponseCacheKey({ teacherId, questionId, normalizedAnswer }) {
+export function classworkResponseCacheKey({ teacherId, questionId, normalizedAnswer, format, answer }) {
   if (!teacherId || !questionId) return null;
   if (typeof normalizedAnswer !== "string" || !normalizedAnswer.trim()) return null;
+  if (format && IMAGE_ANSWER_FORMATS.has(format)) return null;
+  if (answerIsImage(answer)) return null;
   const answerHash = crypto
     .createHash("sha1")
     .update(normalizedAnswer.trim())
