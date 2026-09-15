@@ -503,10 +503,12 @@ async function buildGeminiRequest({
   // start. Every fetched image goes through resizeGeminiInlineData
   // (≤384px, JPEG q80) so Gemini bills at the single-tile floor instead of
   // the 4-tile ~1030-token cost we measured on raw phone-camera photos.
-  // Question image is additionally billed at MEDIA_RESOLUTION_LOW (~64
-  // tokens) since the question text is present as a fallback for anything
-  // the model can't read at low resolution. Answer image stays at default
-  // resolution so handwriting recognition isn't degraded.
+  // Both images use MEDIA_RESOLUTION_LOW (~64 tokens each) — the answer
+  // image had been left at default (~258 tk) to protect handwriting
+  // recognition, but at ≤384px the tile visually collapses to the same
+  // pixels either way and LOW mode still resolves single digits / short
+  // expressions reliably. Reverse this if you see correctness regressions
+  // on messy or small handwriting.
   const [rawQuestionImage, rawAnswerImage] = await Promise.all([
     includeRawQuestionImage
       ? sourceToInlineData(questionImage).catch(() => null)
@@ -535,6 +537,7 @@ async function buildGeminiRequest({
     parts.push({ text: "Student answer image (inspect carefully):" });
     parts.push({
       inlineData: { data: answerImageData.base64, mimeType: answerImageData.mimeType },
+      mediaResolution: { level: "MEDIA_RESOLUTION_LOW" },
     });
   }
 
