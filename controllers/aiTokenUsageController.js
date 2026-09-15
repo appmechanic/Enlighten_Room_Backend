@@ -313,8 +313,9 @@ export const getAiCacheStats = asyncHandler(async (req, res) => {
 
 // GET /api/admin/ai-token-usage-by-teacher?monthKey=YYYY-MM
 // Per-teacher rollup for one month. Groups AiTokenUsage rows through
-// session → classroom → teacher, then joins User for name/email + the
-// teacher's aiTokensPerMonth limit so the UI can render used-vs-quota.
+// session → classroom → teacher, joins User for name/email, then joins
+// active Subscription → Plan for the plan name. AI is capped by call
+// count (not tokens), so this table is cost visibility only — no quota.
 export const getAiTokenUsageByTeacher = asyncHandler(async (req, res) => {
   const monthKey = String(req.query.monthKey || currentMonthKey());
 
@@ -365,6 +366,39 @@ export const getAiTokenUsageByTeacher = asyncHandler(async (req, res) => {
       },
     },
     { $unwind: { path: "$teacher", preserveNullAndEmptyArrays: true } },
+    // Subscription → Plan lookup so we can show each teacher's plan name
+    // alongside their token spend. AI spend is capped by call count on the
+    // plan, not by tokens — this page is pure cost visibility.
+    {
+      $lookup: {
+        from: "subscriptions",
+        let: { tid: "$_id" },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ["$userId", "$$tid"] },
+                  { $eq: ["$status", "active"] },
+                ],
+              },
+            },
+          },
+          { $limit: 1 },
+        ],
+        as: "subscription",
+      },
+    },
+    { $unwind: { path: "$subscription", preserveNullAndEmptyArrays: true } },
+    {
+      $lookup: {
+        from: "plans",
+        localField: "subscription.planType",
+        foreignField: "_id",
+        as: "plan",
+      },
+    },
+    { $unwind: { path: "$plan", preserveNullAndEmptyArrays: true } },
     {
       $project: {
         _id: 0,
@@ -381,7 +415,7 @@ export const getAiTokenUsageByTeacher = asyncHandler(async (req, res) => {
           },
         },
         teacherEmail: "$teacher.email",
-        aiTokensPerMonth: "$teacher.limits.aiTokensPerMonth",
+        planName: "$plan.name",
         isPaid: "$teacher.isPaid",
         promptTokenCount: 1,
         candidatesTokenCount: 1,

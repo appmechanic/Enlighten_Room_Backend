@@ -4,32 +4,30 @@ import Classroom from "../models/classroomModel.js";
 import ScreenLockInterval from "../models/ScreenLockIntervalModel.js";
 import LessonReportSent from "../models/LessonReportSentModel.js";
 import UploadedFile from "../models/UploadedFileModel.js";
-import AiTokenUsage from "../models/AiTokenUsageModel.js";
 import AiCallLog from "../models/AiCallLogModel.js";
 import User from "../models/user.js";
 import Subscription from "../models/SubscriptionModel.js";
+import Plan from "../models/PlanModel.js";
 import Session from "../models/SessionModel.js";
-
-// Keep in sync with COST_OVERHEAD_MULTIPLIER in AdminAiTokenUsage.jsx and
-// AiTokenUsageCard.jsx. Raw Gemini tokens are multiplied by this factor to
-// get the "billed" count that plan quotas are stated in.
-const AI_COST_OVERHEAD_MULTIPLIER = 1.3;
 
 export const USAGE_CATEGORIES = [
   "meetingMinutes",
-  "screenLockMinutes",
+  "screenLockSessions",
   "lessonReports",
-  "aiTokens",
+  "aiCalls",
   "storageBytes",
 ];
 
-// Maps each usage category to the User.limits.<field> it's compared against.
+// Maps each usage category to the Plan.limits.<field> it's compared against.
+// null/undefined on the plan means "unlimited" for that dimension. AI spend
+// is capped by call count only — token totals stay visible on the admin AI
+// token page but are not enforced.
 export const LIMIT_FIELD_BY_CATEGORY = {
-  meetingMinutes: "meetingMinutesPerMonth",
-  screenLockMinutes: "screenLockMinutesPerMonth",
-  lessonReports: "lessonReportsPerMonth",
-  aiTokens: "aiTokensPerMonth",
-  storageBytes: "storageBytes",
+  meetingMinutes: "maxSessionMinutesPerMonth",
+  screenLockSessions: "maxScreenLockSessionsPerMonth",
+  lessonReports: "maxLessonReportsPerMonth",
+  aiCalls: "maxAiCallsPerMonth",
+  storageBytes: "maxStorageBytes",
 };
 
 export function currentMonthKey(date = new Date()) {
@@ -71,6 +69,33 @@ export async function getUsageResetAt(teacherId) {
     .select("usageResetAt")
     .lean();
   return sub?.usageResetAt || null;
+}
+
+// Resolves the effective Plan.limits for a teacher. Reads the active
+// Subscription → Plan first; if the teacher has no active subscription,
+// falls back to the Free plan (planType: "free") so untiered accounts still
+// get their marketing caps enforced. Returns `{}` if even the Free plan is
+// missing — every `limits[field]` read then yields undefined, which the
+// hasLimit check treats as unlimited (fail-open, matching prior behaviour).
+export async function getEffectivePlanLimits(teacherId) {
+  const teacherOid = toObjectId(teacherId);
+  if (!teacherOid) return {};
+  const sub = await Subscription.findOne({
+    userId: teacherOid,
+    status: "active",
+  })
+    .populate({ path: "planType", select: "limits" })
+    .lean();
+  if (sub?.planType?.limits) return sub.planType.limits;
+  const freePlan = await Plan.findOne({ planType: "free" })
+    .select("limits")
+    .lean();
+  return freePlan?.limits || {};
+}
+
+// null/undefined limit on Plan.limits means "unlimited" per the plan schema.
+function hasLimit(v) {
+  return v !== null && v !== undefined;
 }
 
 // Stamps Subscription.usageResetAt=now for a teacher. Call from any code
@@ -143,26 +168,15 @@ async function sumMeetingMinutes(teacherId, start, end) {
   return Math.round(ms / 60000);
 }
 
-async function sumScreenLockMinutes(teacherId, start, end) {
-  const intervals = await ScreenLockInterval.find({
+// Counts screen-lock activations (distinct ScreenLockInterval rows) in the
+// window rather than summing minutes. Marketing lists caps as "N sessions"
+// (e.g. "Screen Lock Sessions: 240 sessions"), so the enforcement dimension
+// is a session count, not a minute total.
+async function countScreenLockSessions(teacherId, start, end) {
+  return ScreenLockInterval.countDocuments({
     teacherId,
-    startedAt: { $lt: end },
-    $or: [{ endedAt: null }, { endedAt: { $gte: start } }],
-  })
-    .select("startedAt endedAt")
-    .lean();
-
-  const now = new Date();
-  let ms = 0;
-  for (const it of intervals) {
-    const s = it.startedAt ? new Date(it.startedAt) : null;
-    if (!s) continue;
-    const e = it.endedAt ? new Date(it.endedAt) : now;
-    const clipStart = s < start ? start : s;
-    const clipEnd = e > end ? end : e;
-    if (clipEnd > clipStart) ms += clipEnd - clipStart;
-  }
-  return Math.round(ms / 60000);
+    startedAt: { $gte: start, $lt: end },
+  });
 }
 
 async function countLessonReports(teacherId, start, end) {
@@ -170,40 +184,6 @@ async function countLessonReports(teacherId, start, end) {
     teacherId,
     sentAt: { $gte: start, $lt: end },
   });
-}
-
-// Sums raw Gemini tokens across every AiCallLog row where teacherId matches
-// this teacher. AiCallLog is written on every call (teacher-initiated
-// assignment gen + every student submission in one of the teacher's
-// classrooms), so this captures the teacher's spend AND their students'
-// spend — matching what the teacher sees in their own AI call log.
-async function sumAiTokensBilled(teacherId, start, end) {
-  const teacherOid = toObjectId(teacherId);
-  if (!teacherOid) return 0;
-  const [row] = await AiCallLog.aggregate([
-    {
-      $match: {
-        teacherId: teacherOid,
-        createdAt: { $gte: start, $lt: end },
-      },
-    },
-    {
-      $group: {
-        _id: null,
-        rawTotal: {
-          $sum: {
-            $add: [
-              { $ifNull: ["$promptTokenCount", 0] },
-              { $ifNull: ["$candidatesTokenCount", 0] },
-              { $ifNull: ["$totalThoughtTokens", 0] },
-            ],
-          },
-        },
-      },
-    },
-  ]);
-  const raw = row?.rawTotal || 0;
-  return Math.ceil(raw * AI_COST_OVERHEAD_MULTIPLIER);
 }
 
 // Count of AI calls (rows in AiCallLog) attributed to this teacher for the
@@ -231,71 +211,58 @@ async function sumStorageBytes(teacherId) {
 // Returns { monthKey, meetingMinutes:{used,limit}, ... } for one teacher.
 // Called by the admin dashboard, teacher self-view, and the enforcement
 // middleware (which cares only about the {used, limit} pair for its category).
+// Limits are derived from the teacher's active Subscription → Plan.limits,
+// falling back to the Free plan when no active sub. A null/undefined `limit`
+// in a returned pair means "unlimited" for that category.
 export async function getTeacherMonthUsage(teacherId, monthKey) {
   const mk = monthKey || currentMonthKey();
-  const [user, resetAt] = await Promise.all([
-    User.findById(teacherId).select("limits").lean(),
+  const [planLimits, resetAt] = await Promise.all([
+    getEffectivePlanLimits(teacherId),
     getUsageResetAt(teacherId),
   ]);
-  const limits = user?.limits || {};
   const { start, end } = effectiveMonthlyWindow(mk, resetAt);
 
   const [
     meetingMinutes,
-    screenLockMinutes,
+    screenLockSessions,
     lessonReports,
-    aiTokens,
     aiCalls,
     storageBytes,
   ] = await Promise.all([
     sumMeetingMinutes(teacherId, start, end),
-    sumScreenLockMinutes(teacherId, start, end),
+    countScreenLockSessions(teacherId, start, end),
     countLessonReports(teacherId, start, end),
-    sumAiTokensBilled(teacherId, start, end),
     countAiCalls(teacherId, start, end),
     sumStorageBytes(teacherId),
   ]);
 
+  const pair = (used, category) => ({
+    used,
+    limit: planLimits[LIMIT_FIELD_BY_CATEGORY[category]] ?? null,
+  });
+
   return {
     teacherId: String(teacherId),
     monthKey: mk,
-    meetingMinutes: {
-      used: meetingMinutes,
-      limit: limits.meetingMinutesPerMonth ?? 0,
-    },
-    screenLockMinutes: {
-      used: screenLockMinutes,
-      limit: limits.screenLockMinutesPerMonth ?? 0,
-    },
-    lessonReports: {
-      used: lessonReports,
-      limit: limits.lessonReportsPerMonth ?? 0,
-    },
-    aiTokens: {
-      used: aiTokens,
-      limit: limits.aiTokensPerMonth ?? 0,
-    },
-    aiCalls: {
-      used: aiCalls,
-      limit: 0,
-    },
-    storageBytes: {
-      used: storageBytes,
-      limit: limits.storageBytes ?? 0,
-    },
+    meetingMinutes: pair(meetingMinutes, "meetingMinutes"),
+    screenLockSessions: pair(screenLockSessions, "screenLockSessions"),
+    lessonReports: pair(lessonReports, "lessonReports"),
+    aiCalls: pair(aiCalls, "aiCalls"),
+    storageBytes: pair(storageBytes, "storageBytes"),
   };
 }
 
 // Cheaper single-category check for the enforcement middleware — avoids
-// running all five aggregations on every action. Returns {used, limit, ok}
-// where ok=false means the teacher has already reached (or passed) the cap.
+// running all aggregations on every action. Returns {used, limit, ok} where
+// ok=false means the teacher has already reached (or passed) the cap.
+// A null/undefined limit on the plan is treated as unlimited (ok=true).
 export async function checkUsageBudget(teacherId, category, monthKey) {
   const mk = monthKey || currentMonthKey();
-  const [user, resetAt] = await Promise.all([
-    User.findById(teacherId).select("limits").lean(),
+  const [planLimits, resetAt] = await Promise.all([
+    getEffectivePlanLimits(teacherId),
     getUsageResetAt(teacherId),
   ]);
-  const limit = user?.limits?.[LIMIT_FIELD_BY_CATEGORY[category]] ?? 0;
+  const limit = planLimits[LIMIT_FIELD_BY_CATEGORY[category]] ?? null;
   const { start, end } = effectiveMonthlyWindow(mk, resetAt);
 
   let used = 0;
@@ -303,21 +270,22 @@ export async function checkUsageBudget(teacherId, category, monthKey) {
     case "meetingMinutes":
       used = await sumMeetingMinutes(teacherId, start, end);
       break;
-    case "screenLockMinutes":
-      used = await sumScreenLockMinutes(teacherId, start, end);
+    case "screenLockSessions":
+      used = await countScreenLockSessions(teacherId, start, end);
       break;
     case "lessonReports":
       used = await countLessonReports(teacherId, start, end);
       break;
-    case "aiTokens":
-      used = await sumAiTokensBilled(teacherId, start, end);
+    case "aiCalls":
+      used = await countAiCalls(teacherId, start, end);
       break;
     case "storageBytes":
       used = await sumStorageBytes(teacherId);
       break;
     default:
-      return { ok: true, used: 0, limit: 0 };
+      return { ok: true, used: 0, limit: null };
   }
+  if (!hasLimit(limit)) return { ok: true, used, limit: null };
   return { ok: used < limit, used, limit };
 }
 
@@ -383,9 +351,20 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
     .populate("planType")
     .lean();
 
-  const plan = subscription?.planType || null;
-  const limits = plan?.limits || {};
-  const featureFlags = plan?.featureFlags || {};
+  // Resolve limits from the active plan OR the Free-tier plan when the
+  // teacher has no active subscription — same fallback getEffectivePlanLimits
+  // uses, so enforcement and the self-service view agree on the cap.
+  let plan = subscription?.planType || null;
+  let limits = plan?.limits || {};
+  let featureFlags = plan?.featureFlags || {};
+  if (!subscription) {
+    const freePlan = await Plan.findOne({ planType: "free" }).lean();
+    if (freePlan) {
+      plan = freePlan;
+      limits = freePlan.limits || {};
+      featureFlags = freePlan.featureFlags || {};
+    }
+  }
 
   // Reset marker on the subscription clamps every monthly counter, so
   // upgrading/renewing a plan zeroes them mid-month without touching any
@@ -397,7 +376,9 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
     aiCalls,
     sessions,
     sessionMinutes,
-    screenLockMinutes,
+    screenLockSessions,
+    lessonReports,
+    storageBytes,
     classrooms,
     students,
     teachers,
@@ -405,7 +386,9 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
     countAiCallsInternal(teacherOid, start, end),
     countSessionsThisMonth(teacherOid, start, end),
     sumMeetingMinutes(teacherOid, start, end),
-    sumScreenLockMinutes(teacherOid, start, end),
+    countScreenLockSessions(teacherOid, start, end),
+    countLessonReports(teacherOid, start, end),
+    sumStorageBytes(teacherOid),
     countClassrooms(teacherOid),
     countStudents(teacherOid),
     countTeachers(teacherOid),
@@ -437,12 +420,28 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
       period: "month",
     },
     {
-      key: "screenLockMinutes",
-      label: "Screen lock minutes",
-      unit: "min",
-      used: screenLockMinutes,
-      limit: limits.maxScreenLockMinutesPerMonth,
+      key: "screenLockSessions",
+      label: "Screen lock sessions",
+      unit: "sessions",
+      used: screenLockSessions,
+      limit: limits.maxScreenLockSessionsPerMonth,
       period: "month",
+    },
+    {
+      key: "lessonReports",
+      label: "Lesson reports",
+      unit: "reports",
+      used: lessonReports,
+      limit: limits.maxLessonReportsPerMonth,
+      period: "month",
+    },
+    {
+      key: "storageBytes",
+      label: "Storage",
+      unit: "bytes",
+      used: storageBytes,
+      limit: limits.maxStorageBytes,
+      period: "cumulative",
     },
     {
       key: "classrooms",

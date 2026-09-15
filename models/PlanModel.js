@@ -65,18 +65,25 @@ const planSchema = new mongoose.Schema(
       },
     ],
 
-    // Quota fields consumed by requirePlanLimit middleware. A null/undefined
-    // value on any limit means "unlimited" for that dimension — makes it
-    // safe to introduce new limits without retroactively bounding every
-    // existing plan. Keep the shape flat so Stripe metadata can populate
-    // it 1:1 on plan sync.
+    // Quota fields consumed by requirePlanLimit + requireUsageBudget
+    // middleware. A null/undefined value on any limit means "unlimited" for
+    // that dimension — makes it safe to introduce new limits without
+    // retroactively bounding every existing plan. Keep the shape flat so
+    // Stripe metadata can populate it 1:1 on plan sync.
+    //
+    // AI spend is capped by call count (maxAiCallsPerMonth), not tokens —
+    // token usage is still visible on the admin AI token page but not
+    // gated. maxStorageBytes is cumulative, not monthly.
     limits: {
       maxStudents: { type: Number, default: null },
+      maxStudentsPerClass: { type: Number, default: null },
       maxTeachers: { type: Number, default: null },
       maxSessionsPerMonth: { type: Number, default: null },
       maxSessionMinutesPerMonth: { type: Number, default: null },
-      maxScreenLockMinutesPerMonth: { type: Number, default: null },
+      maxScreenLockSessionsPerMonth: { type: Number, default: null },
       maxAiCallsPerMonth: { type: Number, default: null },
+      maxLessonReportsPerMonth: { type: Number, default: null },
+      maxStorageBytes: { type: Number, default: null },
       maxClassrooms: { type: Number, default: null },
     },
 

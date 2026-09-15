@@ -20,6 +20,7 @@ import {
   getCachedClassworkResponse,
   setCachedClassworkResponse,
 } from "./classworkResponseCache.js";
+import { resizeGeminiInlineData } from "./resizeGeminiImage.js";
 
 // Classwork feedback resolves its standard prompt + directives from the
 // admin-edited StandardPrompt via aiConfig (60s in-memory cache). Both fall
@@ -484,9 +485,8 @@ async function buildGeminiRequest({
         ? `Reference / Correct Answer (AI-derived from the canonical solution): ${derivedReferenceAnswer}`
         : null,
     `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
-    includeRawQuestionImage ? "A question image is attached." : null,
     answerImageSource
-      ? "A student answer image is attached. Inspect the handwriting/image carefully."
+      ? "Inspect the student's handwriting/image carefully."
       : null,
   ].filter(Boolean);
 
@@ -495,8 +495,14 @@ async function buildGeminiRequest({
   // Fetch both images in parallel — for handwriting submissions both are
   // present, so serializing the two round trips added the slower image's
   // full latency on top of the faster one before the Gemini call could
-  // start.
-  const [questionImageData, answerImageData] = await Promise.all([
+  // start. Every fetched image goes through resizeGeminiInlineData
+  // (≤384px, JPEG q80) so Gemini bills at the single-tile floor instead of
+  // the 4-tile ~1030-token cost we measured on raw phone-camera photos.
+  // Question image is additionally billed at MEDIA_RESOLUTION_LOW (~64
+  // tokens) since the question text is present as a fallback for anything
+  // the model can't read at low resolution. Answer image stays at default
+  // resolution so handwriting recognition isn't degraded.
+  const [rawQuestionImage, rawAnswerImage] = await Promise.all([
     includeRawQuestionImage
       ? sourceToInlineData(questionImage).catch(() => null)
       : null,
@@ -504,11 +510,19 @@ async function buildGeminiRequest({
       ? sourceToInlineData(answerImageSource).catch(() => null)
       : null,
   ]);
+  const [questionImageData, answerImageData] = await Promise.all([
+    rawQuestionImage ? resizeGeminiInlineData(rawQuestionImage) : null,
+    rawAnswerImage ? resizeGeminiInlineData(rawAnswerImage) : null,
+  ]);
 
   if (questionImageData) {
     parts.push({ text: "Question image:" });
     parts.push({
-      inlineData: { data: questionImageData.base64, mimeType: questionImageData.mimeType },
+      inlineData: {
+        data: questionImageData.base64,
+        mimeType: questionImageData.mimeType,
+      },
+      mediaResolution: { level: "MEDIA_RESOLUTION_LOW" },
     });
   }
 

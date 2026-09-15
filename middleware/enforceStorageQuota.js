@@ -3,7 +3,8 @@
 // Pre-upload guard. Runs BEFORE multer so we don't burn a network round-trip
 // pushing a file to DigitalOcean Spaces only to reject it after. Reads
 // Content-Length off the request and compares (current + incoming) against
-// User.limits.storageBytes.
+// Plan.limits.maxStorageBytes for the teacher's active plan (via
+// checkUsageBudget). A null/undefined cap on the plan means unlimited.
 //
 // Content-Length is set by the browser and is trustworthy for multipart
 // uploads in practice; a client that forges it just gets an inaccurate
@@ -24,6 +25,7 @@ export function enforceStorageQuota(resolveTeacherId) {
         teacherId,
         "storageBytes"
       );
+      if (limit === null || limit === undefined) return next();
 
       if (used + contentLength > limit) {
         return res.status(402).json({

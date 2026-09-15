@@ -6,6 +6,7 @@ import StandardPrompt from "../models/standardPromptModel.js";
 import { withGeminiRetry, parseFirstJsonObject } from "./geminiCommon.js";
 import { recordAiTokenUsage, logAiUsage } from "./aiTokenUsage.js";
 import { getAiModel, getAiRetry, getAiTuning, getAiDirective } from "./aiConfig.js";
+import { resizeGeminiInlineData } from "./resizeGeminiImage.js";
 
 // One Gemini call made at question CREATION time so every subsequent
 // per-student submission can skip re-deriving the canonical solution:
@@ -130,7 +131,11 @@ export async function precomputeStandardSolution({
 
     const parts = [{ text: instruction }];
     if (imageSource) {
-      const inline = await sourceToInlineData(imageSource).catch(() => null);
+      const rawInline = await sourceToInlineData(imageSource).catch(() => null);
+      // Downscale to Gemini's 1-tile bucket (≤384px, 258 tokens) instead of
+      // the multi-tile cost the raw teacher-uploaded image would incur here
+      // AND on every subsequent per-student feedback call.
+      const inline = rawInline ? await resizeGeminiInlineData(rawInline) : null;
       if (inline) {
         parts.push({
           inlineData: { data: inline.base64, mimeType: inline.mimeType },

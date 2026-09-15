@@ -19,7 +19,6 @@ import {
 } from "../controllers/aiTokenUsageController.js";
 import {
   listTeachersWithLimits,
-  updateTeacherLimits,
   resetTeacherUsage,
 } from "../controllers/adminTeacherLimitsController.js";
 import auth_admin from "../middleware/auth_admin.js";
@@ -106,8 +105,9 @@ router.get(
   getAiCacheStats
 );
 
-// Per-teacher token rollup for one month. Joins teacher name + their
-// aiTokensPerMonth quota so the UI can show used-vs-limit per teacher.
+// Per-teacher token rollup for one month. Joins teacher name + active plan
+// name for cost visibility. Not gated — AI is capped by call count, not
+// tokens, so this table shows spend without a per-teacher token quota.
 router.get(
   "/ai-token-usage-by-teacher",
   auth_admin,
@@ -115,19 +115,15 @@ router.get(
   getAiTokenUsageByTeacher
 );
 
-// Admin subscription management: list teachers with limits + current-month
-// usage, PATCH to update any teacher's limits / isPaid / isSuspended.
+// Admin subscription page: list teachers with their active plan + current-
+// month usage. Per-teacher limit overrides were removed — admins edit
+// Plan.limits directly via the Package Management page. Reset-usage still
+// available to zero one teacher's counters mid-month.
 router.get(
   "/teachers/limits",
   auth_admin,
   auth_key_header,
   listTeachersWithLimits
-);
-router.patch(
-  "/teachers/:id/limits",
-  auth_admin,
-  auth_key_header,
-  updateTeacherLimits
 );
 router.post(
   "/teachers/:id/reset-usage",

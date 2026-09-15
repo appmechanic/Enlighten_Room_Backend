@@ -1,4 +1,5 @@
 import Plan from "../models/PlanModel.js";
+import { parsePlanFeatures } from "../utils/parsePlanFeatures.js";
 
 // CREATE a new plan
 export const createPlan = async (req, res) => {
@@ -12,12 +13,17 @@ export const createPlan = async (req, res) => {
       priceYearly,
       features,
       subtitle,
+      featureFlags,
     } = req.body;
     const existing = await Plan.findOne({ planType });
 
     if (existing) {
       return res.status(400).json({ message: "Plan type already exists." });
     }
+
+    // Plan.limits is derived from features on every save so the admin only
+    // has to edit one thing. Any body.limits sent by the client is ignored.
+    const { limits: derivedLimits } = parsePlanFeatures(features);
 
     const plan = new Plan({
       name,
@@ -28,6 +34,8 @@ export const createPlan = async (req, res) => {
       priceYearly,
       features,
       subtitle,
+      limits: derivedLimits,
+      featureFlags,
     });
     await plan.save();
     res.status(201).json(plan);
@@ -79,10 +87,22 @@ export const getPlanById = async (req, res) => {
 };
 
 // UPDATE plan by ID
+// When body.features is present we re-derive Plan.limits from it (features
+// are the source of truth for quotas). PATCHes that don't touch features
+// leave limits alone — matches the client that only edits a subset of
+// fields (e.g. the status toggle sends { status } only).
 export const updatePlan = async (req, res) => {
   try {
     const { id } = req.params;
-    const updated = await Plan.findByIdAndUpdate(id, req.body, { new: true });
+    const body = { ...(req.body || {}) };
+    if (Array.isArray(body.features)) {
+      const { limits } = parsePlanFeatures(body.features);
+      body.limits = limits;
+    } else {
+      // Never let a client bypass the derivation by PATCHing limits directly.
+      delete body.limits;
+    }
+    const updated = await Plan.findByIdAndUpdate(id, body, { new: true });
     if (!updated) return res.status(404).json({ message: "Plan not found." });
     res.json(updated);
   } catch (error) {
