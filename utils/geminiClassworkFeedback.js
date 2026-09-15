@@ -469,6 +469,12 @@ async function buildGeminiRequest({
   const effectiveQuestionText = questionText || "";
   const includeRawQuestionImage = Boolean(questionImage);
 
+  // When the student's answer is an image, we skip the redundant
+  // `Student Answer: Student submitted the answer as an image/handwriting sample.`
+  // and the separate `Inspect the student's handwriting/image carefully.` line —
+  // both are dead weight because the image part below is already labelled
+  // `Student answer image (inspect carefully):`. Saves ~25 tokens per
+  // handwriting submission with no signal lost.
   const promptLines = [
     interactionId ? `interaction_id: ${interactionId}` : null,
     previousInteractionId
@@ -484,10 +490,9 @@ async function buildGeminiRequest({
       : derivedReferenceAnswer
         ? `Reference / Correct Answer (AI-derived from the canonical solution): ${derivedReferenceAnswer}`
         : null,
-    `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
     answerImageSource
-      ? "Inspect the student's handwriting/image carefully."
-      : null,
+      ? null
+      : `Student Answer: ${normalizedAnswerText || "[No text provided]"}`,
   ].filter(Boolean);
 
   const parts = [];
@@ -527,7 +532,7 @@ async function buildGeminiRequest({
   }
 
   if (answerImageData) {
-    parts.push({ text: "Student answer image:" });
+    parts.push({ text: "Student answer image (inspect carefully):" });
     parts.push({
       inlineData: { data: answerImageData.base64, mimeType: answerImageData.mimeType },
     });
@@ -756,6 +761,9 @@ export async function getClassworkAiFeedback({
     systemInstruction,
     tag: `ClassworkFeedback:${reqId}`,
   });
+  console.log(
+    `[ClassworkFeedback][req=${reqId}] cache decision=${cacheResult.ok ? (cacheResult.reused ? "hit" : "created") : `inline:${cacheResult.reason || "unknown"}`}`,
+  );
 
   // One-shot MAX_TOKENS retry: bilingual prompts + long thinking budgets can
   // truncate the JSON right before its closing brace, and parseFirstJsonObject
@@ -1508,6 +1516,9 @@ export async function getClassworkAiFeedbackStream({
     systemInstruction,
     tag: `ClassworkFeedback:${reqId}:stream`,
   });
+  console.log(
+    `[ClassworkFeedback][req=${reqId}][stream] cache decision=${cacheResult.ok ? (cacheResult.reused ? "hit" : "created") : `inline:${cacheResult.reason || "unknown"}`}`,
+  );
 
   const config = cacheResult.ok
     ? {
