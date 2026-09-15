@@ -121,35 +121,35 @@ const CLASSWORK_SCHEMA_PROPERTIES = {
   correct: {
     type: Type.BOOLEAN,
     description:
-      "true only when the student's answer is complete and correct; otherwise false. This field MUST be emitted first so the client can show the verdict without waiting for the hint.",
+      "true only when the student's answer is complete and correct.",
   },
   hintStream: {
     type: Type.STRING,
     description:
-      "The concise live hint the student sees typing in real time. STRICT: 1-2 short sentences MAX in the question's language. Greet by first name and give the single most important next-step nudge toward the correct method WITHOUT revealing the final answer. Be terse — no acknowledgment paragraphs, no restatement of what they did, no filler. Must stand alone as a useful hint; never just a greeting and never a copy of part1.",
+      "Live hint shown while typing. 1–2 short sentences in the question's language. Greet by first name, give the top next-step nudge WITHOUT revealing the answer. Must not restate the student's work or duplicate part1.",
   },
   part1: {
     type: Type.ARRAY,
     items: { type: Type.STRING },
     description:
-      "Acknowledgment. EXACTLY ONE short string: greet by first name and name the last correct step. Do NOT add more entries.",
+      "Acknowledgment. EXACTLY 1 short string: greet by first name and name the last correct step.",
   },
   part2: {
     type: Type.ARRAY,
     items: { type: Type.STRING },
     description:
-      "Immediate Next Step Guidance. EXACTLY 4 strings in order: DON'T / WHAT / HOW / WHY. Each string starts with its subtitle in the question's language. WHY length scales with grade (≤1 sentence for grade ≤3, ≤50 words for grade 4–8, a paragraph for grade 8+). Use empty string for HOW or WHY if not needed.",
+      "Next Step. EXACTLY 4 strings in order: DON'T / WHAT / HOW / WHY. Each begins with its subtitle. Use empty string for HOW or WHY if not needed.",
   },
   part3: {
     type: Type.ARRAY,
     items: { type: Type.STRING },
     description:
-      "Diagnostic training suggestions. EXACTLY 2 short strings: [0] training for the previous-milestone gap, [1] training for the current-milestone difficulty.",
+      "Training. EXACTLY 2 strings: [0] previous-milestone gap, [1] current-milestone difficulty.",
   },
   advancedChallenge: {
     type: Type.OBJECT,
     description:
-      "Only filled when correct is true: 1 short congratulation + 1 new question one level harder. Leave both fields empty strings when the answer is not yet correct.",
+      "Only when correct=true: 1 congratulation + 1 new question one level harder. Empty strings otherwise.",
     properties: {
       congratulations: { type: Type.STRING },
       question: { type: Type.STRING },
