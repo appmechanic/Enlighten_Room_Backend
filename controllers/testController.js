@@ -150,13 +150,13 @@ export const createTestWithAI = async (req, res) => {
       error: "At least one format must request a non-zero question count.",
     });
   }
-  // Enforce the picker's 3-30 range on the server so a hand-crafted request
+  // Enforce the picker's 1-30 range on the server so a hand-crafted request
   // can't smuggle a huge count past the UI.
   for (const [fmt, n] of Object.entries(perFormatCounts)) {
     const v = Number(n) || 0;
-    if (v > 0 && (v < 3 || v > 30)) {
+    if (v > 0 && (v < 1 || v > 30)) {
       return res.status(400).json({
-        error: `perFormatCounts.${fmt} must be between 3 and 30 (got ${v}).`,
+        error: `perFormatCounts.${fmt} must be between 1 and 30 (got ${v}).`,
       });
     }
   }

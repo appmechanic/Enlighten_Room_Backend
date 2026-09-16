@@ -644,6 +644,7 @@ export const getAssignmentsByClassroom = async (req, res) => {
       .catch(() => {});
 
     const assignments = await Assignment.find({ classroomId })
+      .sort({ createdAt: -1 })
       .populate("classroomId")
       .populate("sessionId", "notes topic sessionDate sessionUrl")
       .populate("teacherId", "firstName lastName email")
@@ -1024,6 +1025,7 @@ export const getStudentAssignmentsByClassroom = async (req, res) => {
       classroomId,
       "assignments.studentIds": studentId,
     })
+      .sort({ createdAt: -1 })
       .populate("classroomId")
       .populate("sessionId")
       .populate("teacherId", "firstName lastName email")
