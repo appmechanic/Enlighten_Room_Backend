@@ -26,7 +26,7 @@ import ClassworkAiReport from "../models/ClassworkAiReportModel.js";
 import GradedAnswerModel from "../models/GradedAnswerModel.js";
 import StudentAssignmentStatus from "../models/StudentAssignmentStatus.js";
 import { generateClassReportSummary } from "../utils/geminiClassReportSummary.js";
-
+ 
 // Generates the class general report for a sub-assignment once it has expired.
 // Same prompt / schema / attachment shape as the classwork Class Report — we
 // literally call generateClassReportSummary and pass the sub-assignment's
