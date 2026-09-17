@@ -133,6 +133,25 @@ const userSchema = new mongoose.Schema(
       reason: { type: String, default: "" },
       verifiedAt: { type: Date, default: null },
     },
+    // Set when a schoolAdmin creates this teacher via the school-admin
+    // Teachers page. Used to (a) attribute the teacher to the school for
+    // seat-quota accounting and (b) list all teachers belonging to a school.
+    // Null for solo/individual teachers.
+    schoolId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "RegisteredSchool",
+      default: null,
+      index: true,
+    },
+    // schoolAdmin user (User._id) who invited/created this teacher. Optional
+    // but useful for auditing and for scoping the SA Teachers list without
+    // relying on a shared schoolId.
+    schoolAdminId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
     isAdmin: {
       type: Boolean,
       default: false,

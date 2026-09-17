@@ -1,9 +1,51 @@
 import User from "../models/user.js";
 import RegisteredSchool from "../models/RegisteredSchool.js";
+import Subscription from "../models/SubscriptionModel.js";
 import {
   sendSchoolAdminApprovedEmail,
   sendSchoolAdminPendingEmail,
 } from "../utils/helper.js";
+
+// Second-pass hydration: fetches active Subscription+Plan for a batch of
+// users and returns a Map keyed by userId string. Kept in-controller to
+// avoid a new util file for one call-site.
+async function loadSubscriptionsByUserId(userIds) {
+  if (!userIds.length) return new Map();
+  const subs = await Subscription.find({
+    userId: { $in: userIds },
+    status: "active",
+  })
+    .populate({ path: "planType", select: "name planType planCategory" })
+    .select("userId planType status frequency createdAt")
+    .lean();
+  const map = new Map();
+  for (const s of subs) map.set(String(s.userId), s);
+  return map;
+}
+
+// Attaches `subscription` (with populated plan) onto each user in-place.
+// Users without an active subscription get `subscription: null` so the UI
+// can show "—" instead of "loading".
+function attachSubscriptions(users, subMap) {
+  for (const u of users) {
+    const sub = subMap.get(String(u._id));
+    u.subscription = sub
+      ? {
+          status: sub.status,
+          frequency: sub.frequency,
+          createdAt: sub.createdAt,
+          plan: sub.planType
+            ? {
+                _id: String(sub.planType._id),
+                name: sub.planType.name,
+                planType: sub.planType.planType,
+                planCategory: sub.planType.planCategory,
+              }
+            : null,
+        }
+      : null;
+  }
+}
 
 // Users the site admin can review: anyone currently a schoolAdmin (approved)
 // or a teacher whose schoolAdmin request was auto-rejected at signup. The
@@ -23,30 +65,28 @@ export const listReviewableUsers = async (req, res) => {
 
     const filter = orClauses.length ? { $or: orClauses } : {};
 
+    let query;
     if (search) {
       const rx = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
       // Combine with search — wrap the status filter under $and.
       const searchFilter = {
         $or: [{ email: rx }, { firstName: rx }, { lastName: rx }, { organization: rx }],
       };
-      const combined = orClauses.length ? { $and: [filter, searchFilter] } : searchFilter;
-      const users = await User.find(combined)
-        .select(
-          "firstName lastName email organization userRole schoolVerification createdAt"
-        )
-        .populate({ path: "schoolVerification.matchedSchoolId", select: "name" })
-        .sort({ createdAt: -1 })
-        .lean();
-      return res.status(200).json({ success: true, data: users });
+      query = orClauses.length ? { $and: [filter, searchFilter] } : searchFilter;
+    } else {
+      query = filter;
     }
 
-    const users = await User.find(filter)
+    const users = await User.find(query)
       .select(
         "firstName lastName email organization userRole schoolVerification createdAt"
       )
       .populate({ path: "schoolVerification.matchedSchoolId", select: "name" })
       .sort({ createdAt: -1 })
       .lean();
+
+    const subMap = await loadSubscriptionsByUserId(users.map((u) => u._id));
+    attachSubscriptions(users, subMap);
 
     return res.status(200).json({ success: true, data: users });
   } catch (err) {

@@ -199,6 +199,28 @@ async function countAiCalls(teacherId, start, end) {
   });
 }
 
+// Sums Gemini prompt (input) + candidates (output) tokens attributed to this
+// teacher for the window. Returns { input, output } — AiCallLog has both
+// fields per call, so a single aggregation returns both dimensions.
+async function sumAiTokens(teacherOid, start, end) {
+  const [row] = await AiCallLog.aggregate([
+    {
+      $match: {
+        teacherId: teacherOid,
+        createdAt: { $gte: start, $lt: end },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        input: { $sum: "$promptTokenCount" },
+        output: { $sum: "$candidatesTokenCount" },
+      },
+    },
+  ]);
+  return { input: row?.input || 0, output: row?.output || 0 };
+}
+
 // Cumulative — storage doesn't reset each month.
 async function sumStorageBytes(teacherId) {
   const [row] = await UploadedFile.aggregate([
@@ -374,6 +396,7 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
 
   const [
     aiCalls,
+    aiTokens,
     sessions,
     sessionMinutes,
     screenLockSessions,
@@ -384,6 +407,7 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
     teachers,
   ] = await Promise.all([
     countAiCallsInternal(teacherOid, start, end),
+    sumAiTokens(teacherOid, start, end),
     countSessionsThisMonth(teacherOid, start, end),
     sumMeetingMinutes(teacherOid, start, end),
     countScreenLockSessions(teacherOid, start, end),
@@ -401,6 +425,22 @@ export async function getTeacherSubscriptionUsage(teacherId, monthKey) {
       unit: "calls",
       used: aiCalls,
       limit: limits.maxAiCallsPerMonth,
+      period: "month",
+    },
+    {
+      key: "aiInputTokens",
+      label: "AI input tokens",
+      unit: "tokens",
+      used: aiTokens.input,
+      limit: limits.maxAiInputTokensPerMonth,
+      period: "month",
+    },
+    {
+      key: "aiOutputTokens",
+      label: "AI output tokens",
+      unit: "tokens",
+      used: aiTokens.output,
+      limit: limits.maxAiOutputTokensPerMonth,
       period: "month",
     },
     {

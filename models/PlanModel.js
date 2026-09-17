@@ -82,6 +82,8 @@ const planSchema = new mongoose.Schema(
       maxSessionMinutesPerMonth: { type: Number, default: null },
       maxScreenLockSessionsPerMonth: { type: Number, default: null },
       maxAiCallsPerMonth: { type: Number, default: null },
+      maxAiInputTokensPerMonth: { type: Number, default: null },
+      maxAiOutputTokensPerMonth: { type: Number, default: null },
       maxLessonReportsPerMonth: { type: Number, default: null },
       maxStorageBytes: { type: Number, default: null },
       maxClassrooms: { type: Number, default: null },

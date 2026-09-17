@@ -76,6 +76,7 @@ import Keys from "./models/keys.js";
 import adminDashboardRoutes from "./routes/adminDashboardRoute.js";
 import registeredSchoolRoutes from "./routes/registeredSchoolRoutes.js";
 import schoolAdminReviewRoutes from "./routes/schoolAdminReviewRoutes.js";
+import schoolAdminTeacherRoutes from "./routes/schoolAdminTeacherRoutes.js";
 import aiConfigRoutes from "./routes/aiConfigRoutes.js";
 import whiteBoardRoutes from "./routes/whiteBoardRoute.js";
 import contactRoutes from "./routes/contactRoutes.js";
@@ -239,6 +240,7 @@ app.use("/api/team", teamRoutes);
 app.use("/api/admin", adminDashboardRoutes);
 app.use("/api/admin/registered-schools", registeredSchoolRoutes);
 app.use("/api/admin/school-admins", schoolAdminReviewRoutes);
+app.use("/api/school-admin", schoolAdminTeacherRoutes);
 // public AI tuning config (grade bands, multipliers) — read-only, no auth
 app.use("/api/ai-config", aiConfigRoutes);
 //home page counter

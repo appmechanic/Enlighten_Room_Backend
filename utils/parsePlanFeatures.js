@@ -72,6 +72,28 @@ const RULES = [
     convert: (n) => n,
   },
   {
+    key: "maxAiInputTokensPerMonth",
+    // Accepts "AI Input Tokens" and "Input Tokens". Value may be given as
+    // a raw count or with a K/M suffix (unit converter handles both).
+    label: /^(?:ai\s+)?input\s+tokens$/i,
+    convert: (n, unit) => {
+      const u = (unit || "").toLowerCase();
+      if (u === "m" || u.startsWith("million")) return Math.round(n * 1_000_000);
+      if (u === "k" || u.startsWith("thousand")) return Math.round(n * 1_000);
+      return Math.round(n);
+    },
+  },
+  {
+    key: "maxAiOutputTokensPerMonth",
+    label: /^(?:ai\s+)?output\s+tokens$/i,
+    convert: (n, unit) => {
+      const u = (unit || "").toLowerCase();
+      if (u === "m" || u.startsWith("million")) return Math.round(n * 1_000_000);
+      if (u === "k" || u.startsWith("thousand")) return Math.round(n * 1_000);
+      return Math.round(n);
+    },
+  },
+  {
     key: "maxStorageBytes",
     // "Storage (Materials & Reports)" or plain "Storage".
     label: /^storage(?:\s*\(.*\))?$/i,
