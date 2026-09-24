@@ -270,7 +270,16 @@ export async function generateIndividualAssignmentQuestions({
     throw new Error("perFormatCounts must request at least one question.");
   }
 
-  const [standardPrompt, teacherPrompt, MODEL, retryCfg, cacheTuning, taskPrompt] = await Promise.all([
+  const [
+    schemaGuidance,
+    standardPrompt,
+    teacherPrompt,
+    MODEL,
+    retryCfg,
+    cacheTuning,
+    taskPrompt,
+  ] = await Promise.all([
+    getSchemaGuidance(),
     loadStandardPrompt(),
     loadTeacherAssignmentPrompt(teacherId),
     getAiModel(),
@@ -282,7 +291,7 @@ export async function generateIndividualAssignmentQuestions({
   const explicitCacheTtl = Math.max(60, Number(cacheTuning?.geminiExplicitCacheTtlSeconds) || 3600);
 
   const systemInstruction = [
-    SCHEMA_GUIDANCE,
+    schemaGuidance,
     standardPrompt,
     teacherPrompt,
     classroomPrompt,
