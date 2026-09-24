@@ -13,6 +13,7 @@ import {
   getAiModel,
   getAiRetry,
   getAiStandardHintPrompt,
+  getAiHintPromptSection,
 } from "./aiConfig.js";
 import { getOrCreateClassworkFeedbackCache } from "./classworkGeminiCache.js";
 import {
@@ -111,60 +112,22 @@ function resolveThinkingBudget(resolvedMaxOutputTokens, hasCachedSolution, forma
 // Everything after `correct` still follows the original ordering
 // (hintStream, part1, part2 first for progressive rendering; heavier
 // metadata like commonMistake/standardSolution last).
-// Frozen response schema for the classwork feedback call. Property order
-// matters: Gemini emits structured-JSON fields in the order they appear, so
-// `correct` goes first — the client shows "✅ Correct" / "keep going" within
-// a token or two of the first chunk, without waiting for the hint stream to
-// finish. Two variants: with/without `standardSolution`, so callers pick
-// instead of branching a schema factory at call time.
-const CLASSWORK_SCHEMA_PROPERTIES = {
-  correct: {
-    type: Type.BOOLEAN,
-    description:
-      "true only when the student's answer is complete and correct.",
-  },
-  hintStream: {
-    type: Type.STRING,
-    description:
-      "Live hint shown while typing. 1–2 short sentences in the question's language. Greet by first name, give the top next-step nudge WITHOUT revealing the answer. Must not restate the student's work or duplicate part1.",
-  },
-  part1: {
-    type: Type.ARRAY,
-    items: { type: Type.STRING },
-    description:
-      "Acknowledgment. EXACTLY 1 short string: greet by first name and name the last correct step.",
-  },
-  part2: {
-    type: Type.ARRAY,
-    items: { type: Type.STRING },
-    description:
-      "Next Step. EXACTLY 4 strings in order: DON'T / WHAT / HOW / WHY. Each begins with its subtitle. Use empty string for HOW or WHY if not needed.",
-  },
-  part3: {
-    type: Type.ARRAY,
-    items: { type: Type.STRING },
-    description:
-      "Training. EXACTLY 2 strings: [0] previous-milestone gap, [1] current-milestone difficulty.",
-  },
-  advancedChallenge: {
-    type: Type.OBJECT,
-    description:
-      "Only when correct=true: 1 congratulation + 1 new question one level harder. Empty strings otherwise.",
-    properties: {
-      congratulations: { type: Type.STRING },
-      question: { type: Type.STRING },
-    },
-    required: ["congratulations", "question"],
-  },
-  commonMistake: {
-    type: Type.OBJECT,
-    properties: {
-      isCommon: { type: Type.BOOLEAN },
-      title: { type: Type.STRING },
-      answerLatex: { type: Type.STRING },
-    },
-    required: ["isCommon", "title"],
-  },
+// Every field description in the classwork response schema is pulled at call
+// time from the admin-edited aiHintPromptSections (AdminAiPrompts page). The
+// same section text is also concatenated into the system-instruction prompt
+// via getAiStandardHintPrompt, so pedagogy edits ride through both surfaces
+// on every classwork submission. Small models like flash-lite weight
+// structured-output field descriptions heavily, so echoing the section text
+// into the schema is what makes prompt edits actually stick in the emitted
+// JSON. Mapping = the slot indexes fixed by AI_HINT_PROMPT_SECTION_DEFAULTS.
+const SECTION_INDEX = {
+  OVERVIEW: 0,
+  DIAGNOSTIC_HINT_STREAM: 2,
+  PART1: 3,
+  PART2: 4,
+  PART3: 5,
+  MASTERY_HINT_STREAM: 7,
+  ADVANCED_CHALLENGE: 8,
 };
 
 const CLASSWORK_SCHEMA_REQUIRED = [
@@ -176,25 +139,119 @@ const CLASSWORK_SCHEMA_REQUIRED = [
   "advancedChallenge",
 ];
 
-const CLASSWORK_RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: CLASSWORK_SCHEMA_PROPERTIES,
-  required: CLASSWORK_SCHEMA_REQUIRED,
-};
+// Attach `description` only when the DB slot resolved to a non-empty string.
+// If the admin cleared a slot, we let the field ride without a description
+// rather than falling back to any hardcoded text — the DB is the sole
+// source of truth for every field-level description.
+function withDescription(base, description) {
+  const trimmed = typeof description === "string" ? description.trim() : "";
+  return trimmed ? { ...base, description: trimmed } : base;
+}
 
-const CLASSWORK_RESPONSE_SCHEMA_WITH_SOLUTION = {
-  type: Type.OBJECT,
-  properties: {
-    ...CLASSWORK_SCHEMA_PROPERTIES,
-    standardSolution: { type: Type.STRING },
-  },
-  required: CLASSWORK_SCHEMA_REQUIRED,
-};
+function buildClassworkSchemaProperties(sectionDescriptions) {
+  const advancedChallenge =
+    typeof sectionDescriptions.advancedChallenge === "string"
+      ? sectionDescriptions.advancedChallenge.trim()
+      : "";
+  return {
+    correct: withDescription(
+      { type: Type.BOOLEAN },
+      sectionDescriptions.correct,
+    ),
+    hintStream: withDescription(
+      { type: Type.STRING },
+      sectionDescriptions.hintStream,
+    ),
+    part1: withDescription(
+      { type: Type.ARRAY, items: { type: Type.STRING } },
+      sectionDescriptions.part1,
+    ),
+    part2: withDescription(
+      { type: Type.ARRAY, items: { type: Type.STRING } },
+      sectionDescriptions.part2,
+    ),
+    part3: withDescription(
+      { type: Type.ARRAY, items: { type: Type.STRING } },
+      sectionDescriptions.part3,
+    ),
+    advancedChallenge: withDescription(
+      {
+        type: Type.OBJECT,
+        properties: {
+          congratulations: { type: Type.STRING },
+          question: withDescription({ type: Type.STRING }, advancedChallenge),
+        },
+        required: ["congratulations", "question"],
+      },
+      advancedChallenge,
+    ),
+    commonMistake: {
+      type: Type.OBJECT,
+      properties: {
+        isCommon: { type: Type.BOOLEAN },
+        title: { type: Type.STRING },
+        answerLatex: { type: Type.STRING },
+      },
+      required: ["isCommon", "title"],
+    },
+  };
+}
 
-function pickClassworkResponseSchema(computeStandardSolution) {
-  return computeStandardSolution
-    ? CLASSWORK_RESPONSE_SCHEMA_WITH_SOLUTION
-    : CLASSWORK_RESPONSE_SCHEMA;
+async function buildClassworkResponseSchema(computeStandardSolution) {
+  const [
+    overview,
+    diagnosticHintStream,
+    part1,
+    part2,
+    part3,
+    masteryHintStream,
+    advancedChallenge,
+  ] = await Promise.all([
+    getAiHintPromptSection(SECTION_INDEX.OVERVIEW),
+    getAiHintPromptSection(SECTION_INDEX.DIAGNOSTIC_HINT_STREAM),
+    getAiHintPromptSection(SECTION_INDEX.PART1),
+    getAiHintPromptSection(SECTION_INDEX.PART2),
+    getAiHintPromptSection(SECTION_INDEX.PART3),
+    getAiHintPromptSection(SECTION_INDEX.MASTERY_HINT_STREAM),
+    getAiHintPromptSection(SECTION_INDEX.ADVANCED_CHALLENGE),
+  ]);
+  // hintStream is a dual-purpose field: on incorrect answers it carries the
+  // diagnostic nudge (slot 2), on correct answers the mastery greeting (slot
+  // 7). Concatenate both non-empty slots so the schema description tells the
+  // model what to emit in either branch.
+  const hintStream = [diagnosticHintStream, masteryHintStream]
+    .filter((s) => typeof s === "string" && s.trim())
+    .join("\n\n");
+  const properties = buildClassworkSchemaProperties({
+    correct: "",
+    hintStream,
+    part1,
+    part2,
+    part3,
+    advancedChallenge,
+  });
+  // Top-level schema description = the admin-edited "AI hint Overview" slot.
+  // Used by the model as a global "how to respond" guardrail across every
+  // field. Omitted when the slot is empty so we don't spend prefill tokens
+  // on a blank string.
+  const rootDescription =
+    typeof overview === "string" && overview.trim() ? overview.trim() : "";
+  const buildRoot = (props) => {
+    const schema = {
+      type: Type.OBJECT,
+      properties: props,
+      required: CLASSWORK_SCHEMA_REQUIRED,
+    };
+    if (rootDescription) schema.description = rootDescription;
+    return schema;
+  };
+  if (computeStandardSolution) {
+    return buildRoot({
+      ...properties,
+      standardSolution: { type: Type.STRING },
+    });
+  }
+  return buildRoot(properties);
 }
 
 // Purely mechanical cleanup applied to both the student answer and the
@@ -774,6 +831,9 @@ export async function getClassworkAiFeedback({
   // the call once with 2× the output budget. Capped so a runaway prompt can't
   // burn the full context window.
   const MAX_TOKENS_HARD_CAP = 16000;
+  const responseSchema = await buildClassworkResponseSchema(
+    Boolean(computeStandardSolution),
+  );
   const callWithBudget = (tokens) => {
     const thinking = resolveThinkingBudget(
       tokens,
@@ -783,7 +843,7 @@ export async function getClassworkAiFeedback({
     );
     const commonCfg = {
       responseMimeType: "application/json",
-      responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
+      responseSchema,
       thinkingConfig: { thinkingBudget: thinking },
       maxOutputTokens: tokens,
     };
@@ -1523,18 +1583,21 @@ export async function getClassworkAiFeedbackStream({
     `[ClassworkFeedback][req=${reqId}][stream] cache decision=${cacheResult.ok ? (cacheResult.reused ? "hit" : "created") : `inline:${cacheResult.reason || "unknown"}`}`,
   );
 
+  const responseSchema = await buildClassworkResponseSchema(
+    Boolean(computeStandardSolution),
+  );
   const config = cacheResult.ok
     ? {
         cachedContent: cacheResult.name,
         responseMimeType: "application/json",
-        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
+        responseSchema,
         thinkingConfig: { thinkingBudget },
         maxOutputTokens: resolvedMaxOutputTokens,
       }
     : {
         systemInstruction,
         responseMimeType: "application/json",
-        responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
+        responseSchema,
         thinkingConfig: { thinkingBudget },
         maxOutputTokens: resolvedMaxOutputTokens,
       };
@@ -1544,7 +1607,7 @@ export async function getClassworkAiFeedbackStream({
   const inlineConfig = {
     systemInstruction,
     responseMimeType: "application/json",
-    responseSchema: pickClassworkResponseSchema(Boolean(computeStandardSolution)),
+    responseSchema,
     thinkingConfig: { thinkingBudget },
     maxOutputTokens: resolvedMaxOutputTokens,
   };

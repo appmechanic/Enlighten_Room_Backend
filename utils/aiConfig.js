@@ -194,6 +194,22 @@ export async function getAiStandardHintPrompt() {
     .join("\n\n");
 }
 
+// Returns a single admin-edited AI-hint prompt section by its slot index
+// (0..AI_HINT_PROMPT_SECTION_DEFAULTS.length-1). Falls back to the canonical
+// default for that slot if the DB entry is empty or the doc is unseeded.
+// Used by the classwork feedback schema builder so the same section text the
+// admin edits in AdminAiPrompts also drives the Gemini structured-output
+// field descriptions — no duplicate directive needed.
+export async function getAiHintPromptSection(index) {
+  const cfg = await getConfig();
+  const sections = Array.isArray(cfg?.aiHintPromptSections)
+    ? cfg.aiHintPromptSections
+    : [];
+  const dbValue = sections[index];
+  if (typeof dbValue === "string" && dbValue.trim()) return dbValue.trim();
+  return AI_HINT_PROMPT_SECTION_DEFAULTS[index] || "";
+}
+
 // Force-invalidate the cache (call from admin save handler so edits take
 // effect within one request instead of waiting up to 60s).
 export function invalidateAiConfigCache() {

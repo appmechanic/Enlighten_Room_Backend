@@ -15,6 +15,16 @@
 // schema (part1 / part2 / part3 / advancedChallenge) is unchanged; only the
 // prompt guidance for each slot is populated below.
 
+const AI_HINT_RESPONSE_FORMAT_DEFAULT = `Response Format & Mode Selection:
+- Return ONE JSON object that matches the schema exactly. No prose, markdown, or commentary outside the JSON.
+- Emit "correct" first (boolean verdict) so the UI can render ✅ / ⚠ before the streaming hint arrives.
+- Pick the mode from "correct":
+  * MASTERY (correct=true): put a 1–2 sentence congratulation in "hintStream"; fill "advancedChallenge.congratulations" and "advancedChallenge.question" with a harder follow-up question that embeds a positive-value scenario (Love, Peace, Family, Charity, Human Dignity, Community, Truth, Service, Justice, Integrity, Equity, Inclusion, Reconciliation, Respect). Leave "part1", "part2", "part3" as empty arrays.
+  * DIAGNOSTIC (correct=false): put a 1–2 sentence live nudge in "hintStream"; fill "part1" (studentCanDo, exactly 1 string), "part2" (DON'T / WHAT / HOW / WHY, exactly 4 strings), and "part3" (previous-milestone gap + current-milestone difficulty, exactly 2 strings). Leave "advancedChallenge" fields as empty strings.
+- "commonMistake" is optional metadata — populate only when isCommon=true (a mistake >50% of this grade would make).
+- Write EVERY field in the SAME language as the ORIGINAL QUESTION; never switch languages mid-response.
+- Use LaTeX for all math (\\frac, \\sqrt, \\int, \\sin, \\alpha, ...) — inline via \\(...\\) or $...$; display via \\[...\\] or $$...$$.`;
+
 const AI_HINT_STYLE_GUIDANCE_DEFAULT = `Overview:
 - Detect the language of the ORIGINAL QUESTION and write the ENTIRE response in that single language. Every field (hintStream, part1, part2, part3, advancedChallenge, subtitle translations) must be in the SAME language.
 - Do NOT switch languages mid-response, mid-field, or mid-sentence. Do NOT translate to English if the question is not in English. Do NOT mix English with French / Chinese / Spanish / etc.
@@ -40,7 +50,7 @@ const AI_HINT_ADVANCED_CHALLENGE_DEFAULT = `Advanced Challenge:
 Create a brand-new question exactly one level more advanced than the current one (STEM: introduce an optimization constraint or symbolic variation; Humanities: a deeper thematic prompt, a more complex grammatical structure, or a comparative primary-source analysis). (If the current question includes an image, try to create a more advanced question related to the image.) (When a positive context fits naturally, WEAVE THE SCENARIO DIRECTLY INTO THIS QUESTION TEXT with love or peace, or helping people in war / needs according to seasons and current news.)`;
 
 export const AI_HINT_PROMPT_SECTION_DEFAULTS = [
-  "", // 0. responseFormat
+  AI_HINT_RESPONSE_FORMAT_DEFAULT, // 0. responseFormat — response-schema + mode selection overview (also injected as the top-level schema `description`)
   "", // 1. diagnosticIntro
   "", // 2. diagnosticHintStream
   AI_HINT_PART1_DEFAULT, // 3. part1 — studentCanDo
