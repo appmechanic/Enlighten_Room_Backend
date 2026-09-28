@@ -22,13 +22,13 @@ const AI_HINT_RESPONSE_FORMAT_DEFAULT = `Response Format & Mode Selection:
   * MASTERY (correct=true): put a 1–2 sentence congratulation in "hintStream"; fill "advancedChallenge.congratulations" and "advancedChallenge.question" with a harder follow-up question that embeds a positive-value scenario (Love, Peace, Family, Charity, Human Dignity, Community, Truth, Service, Justice, Integrity, Equity, Inclusion, Reconciliation, Respect). Leave "part1", "part2", "part3" as empty arrays.
   * DIAGNOSTIC (correct=false): put a 1–2 sentence live nudge in "hintStream"; fill "part1" (studentCanDo, exactly 1 string), "part2" (DON'T / WHAT / HOW / WHY, exactly 4 strings), and "part3" (previous-milestone gap + current-milestone difficulty, exactly 2 strings). Leave "advancedChallenge" fields as empty strings.
 - "commonMistake" is optional metadata — populate only when isCommon=true (a mistake >50% of this grade would make).
-- Write EVERY field in the SAME language as the ORIGINAL QUESTION; never switch languages mid-response.
+- Write EVERY field in the language named on the "Instruction Language:" line at the top of the user prompt; never switch languages mid-response and never fall back to the question's language.
 - Use LaTeX for all math (\\frac, \\sqrt, \\int, \\sin, \\alpha, ...) — inline via \\(...\\) or $...$; display via \\[...\\] or $$...$$.`;
 
 const AI_HINT_STYLE_GUIDANCE_DEFAULT = `Overview:
-- Detect the language of the ORIGINAL QUESTION and write the ENTIRE response in that single language. Every field (hintStream, part1, part2, part3, advancedChallenge, subtitle translations) must be in the SAME language.
-- Do NOT switch languages mid-response, mid-field, or mid-sentence. Do NOT translate to English if the question is not in English. Do NOT mix English with French / Chinese / Spanish / etc.
-- Create new questions in the same language as the original question.
+- Read the "Instruction Language:" line at the top of the user prompt and write the ENTIRE response in that single language, regardless of what language the question or the student's answer is in. Every field (hintStream, part1, part2, part3, advancedChallenge, subtitle translations) must be in that Instruction Language.
+- Do NOT auto-detect the language from the question. Do NOT switch languages mid-response, mid-field, or mid-sentence. Do NOT mix English with French / Chinese / Spanish / etc.
+- Create new questions in the Instruction Language too, even if the original question is in a different language.
 - Use LaTeX form for all math expressions and formulas.`;
 
 const AI_HINT_PART1_DEFAULT = `Student can do:
@@ -44,7 +44,7 @@ const AI_HINT_PART3_DEFAULT = `Training:
 - the first string: advice one training to improve the lack of this issue from previous milestone or learning stage.
 - the second string: advice one training to improve the difficulty from the current milestone or topic.`;
 
-const MASTERY_HINT_STREAM_DEFAULT = `hintStream (correct answer): greet by first name, congratulate in 1–2 short sentences in the question's language, then hand off to advancedChallenge. Do not restate the student's answer.`;
+const MASTERY_HINT_STREAM_DEFAULT = `hintStream (correct answer): greet by first name, congratulate in 1–2 short sentences in the Instruction Language named at the top of the user prompt, then hand off to advancedChallenge. Do not restate the student's answer.`;
 
 const AI_HINT_ADVANCED_CHALLENGE_DEFAULT = `Advanced Challenge:
 Create a brand-new question exactly one level more advanced than the current one (STEM: introduce an optimization constraint or symbolic variation; Humanities: a deeper thematic prompt, a more complex grammatical structure, or a comparative primary-source analysis). (If the current question includes an image, try to create a more advanced question related to the image.) (When a positive context fits naturally, WEAVE THE SCENARIO DIRECTLY INTO THIS QUESTION TEXT with love or peace, or helping people in war / needs according to seasons and current news.)`;
@@ -69,9 +69,9 @@ export const REPORT_PROMPT_SECTION_DEFAULTS = [
   `You are an experienced teacher analyzing the attached learning difficulties that the class encountered. Generate a class general report for the subject teacher covering the three categories described below: students' difficulties, next lesson strategy, and targeted homework.
 
 Language rules:
-- Write the entire report in the dominant language of the classwork questions. Detect the script: if most questions are Traditional Chinese write in Traditional Chinese; if Simplified Chinese, write in Simplified Chinese; do the same for Japanese, Korean, Arabic, Hindi, Spanish, French, German, and any other language. Default to English when there is no clear majority.
-- Use the exact natural-language script the question uses for every free-text field ("difficulty", "teachingStrategy", "kindsOfTraining"). Do NOT translate student names — keep them as written in the submissions.
-- Mixed-language classes: pick the single dominant language and stay in it; do not switch mid-report.
+- Write the entire report in the language named on the "Instruction Language:" line at the top of the user prompt, regardless of what language the classwork questions or student submissions are in. Do NOT auto-detect the language from the questions.
+- Use that Instruction Language for every free-text field ("difficulty", "teachingStrategy", "kindsOfTraining"). Do NOT translate student names — keep them as written in the submissions.
+- Do not switch languages mid-report even when the questions and submissions are in a different language than the Instruction Language.
 
 LaTeX rules:
 - Wrap every inline math expression in single dollars: $x^2 + 1$.
@@ -146,6 +146,8 @@ export const TEST_AI_HINT_PROMPT_DEFAULT = `a) My student is doing a test. The f
   2) For the first content/step the student stuck, which formula, keyword, concept, knowledge, method, strategy, theorem can't the student manage?
   3) Only for this content/step the student stuck, what should the student practice more after class? What useful formula, keyword, concept, knowledge, method, strategy, and theorem should the student pay attention to? Please give me specific but short comment focusing on the student's weakness in this content/step only.
   4) how many marks that the student can get in this question.
+
+Language rule: write every free-text field ("correctBeforeStuck", "stuckOn", "practiceAdvice") in the language named on the "Instruction Language:" line at the top of the user prompt, regardless of the question's or the student answer's language. Do not auto-detect the language from the question.
 
 The following is my teacher's personalized prompt. Please follow his/her advice and the above structure to generate my test report if the personalized prompt is good to my learning. But please ignore it if it doesn't fit my needs.`;
 
@@ -255,7 +257,7 @@ const CLASSWORK_MISTAKE_COMPUTE_DEFAULT = `commonMistake: {
 const CLASSWORK_MISTAKE_SKIP_DEFAULT = "commonMistake: Leave it empty";
 
 const CLASSWORK_HINT_STREAM_DEFAULT =
-  "hintStream: 2-4 sentences in the question's language. Greet by first name, acknowledge what they got right, then give the key next-step nudge — WITHOUT revealing the answer. Do not just repeat part1.";
+  'hintStream: 2-4 sentences in the language named on the "Instruction Language:" line at the top of the user prompt (never the question\'s language). Greet by first name, acknowledge what they got right, then give the key next-step nudge — WITHOUT revealing the answer. Do not just repeat part1.';
 
 // Compact system prompt for the fast-hint "opener" call. Deliberately tiny
 // (~120 tokens) because it's carried on EVERY fast-hint submission and every

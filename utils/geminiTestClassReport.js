@@ -74,6 +74,7 @@ export async function generateTestClassReport({
   totalQuestions,
   maxMarks,
   submissions,
+  instructionLanguage,
 }) {
   const [reportPrompt, teacherPrompt, MODEL, retryCfg] = await Promise.all([
     loadReportPrompt(),
@@ -97,6 +98,7 @@ export async function generateTestClassReport({
     .join("\n\n");
 
   const userMessage = [
+    `Instruction Language: ${(typeof instructionLanguage === "string" && instructionLanguage.trim()) || "English"}`,
     `Test: ${title || "(untitled)"}`,
     `Total questions: ${totalQuestions}`,
     `Max marks: ${maxMarks}`,

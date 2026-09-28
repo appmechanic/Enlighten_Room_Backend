@@ -3,7 +3,22 @@
 // module centralises the retry loop shape, the retryable-status set, and the
 // defensive JSON-fence parser so drift between the four feature utils stops.
 
+import Session from "../models/SessionModel.js";
+
 export const RETRYABLE_GEMINI_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+// Every AI feedback path (classwork, session/assignment/test class reports,
+// per-question test feedback) pins the feedback language to a session's
+// Session.instructionLanguage. Callers pass this string into the per-request
+// user prompt as an "Instruction Language:" line so the AI knows which
+// language to write in without auto-detecting from the question.
+export async function resolveInstructionLanguage(sessionId) {
+  if (!sessionId) return "English";
+  const s = await Session.findById(sessionId)
+    .select("instructionLanguage")
+    .lean();
+  return s?.instructionLanguage || "English";
+}
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

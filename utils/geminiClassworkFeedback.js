@@ -475,6 +475,7 @@ async function buildGeminiRequest({
   cachedContext,
   computeStandardSolution,
   computeCommonMistake,
+  instructionLanguage,
 }) {
   // Only two admin-editable inputs feed the Gemini hint call now: the
   // global standardPrompt (aiHintPromptSections joined) and the per-teacher
@@ -533,6 +534,7 @@ async function buildGeminiRequest({
   // `Student answer image (inspect carefully):`. Saves ~25 tokens per
   // handwriting submission with no signal lost.
   const promptLines = [
+    `Instruction Language: ${(typeof instructionLanguage === "string" && instructionLanguage.trim()) || "English"}`,
     interactionId ? `interaction_id: ${interactionId}` : null,
     previousInteractionId
       ? `previous_interaction_id: ${previousInteractionId}`
@@ -691,6 +693,7 @@ export async function getClassworkAiFeedback({
   cachedContext,
   computeStandardSolution = false,
   computeCommonMistake = false,
+  instructionLanguage,
 }) {
   const reqId = newReqId();
   const normalizedAnswer = normalizeAnswerText(answer);
@@ -789,6 +792,7 @@ export async function getClassworkAiFeedback({
     cachedContext,
     computeStandardSolution,
     computeCommonMistake,
+    instructionLanguage,
   });
 
   const resolvedMaxOutputTokens =
@@ -1427,6 +1431,7 @@ export async function getClassworkAiFeedbackStream({
   cachedContext,
   computeStandardSolution = false,
   computeCommonMistake = false,
+  instructionLanguage,
   onHintDelta,
   onHintClose,
   onVerdict,
@@ -1553,6 +1558,7 @@ export async function getClassworkAiFeedbackStream({
     cachedContext,
     computeStandardSolution,
     computeCommonMistake,
+    instructionLanguage,
   });
 
   const resolvedMaxOutputTokens =

@@ -77,6 +77,7 @@ export async function generateTestFeedback({
   question, // { text, format, correctAnswer, solution }
   studentAnswer, // free-form string as submitted by the student
   fullMarks,
+  instructionLanguage,
 }) {
   const [standardPrompt, teacherPrompt, MODEL, retryCfg] = await Promise.all([
     loadStandardTestPrompt(),
@@ -111,6 +112,7 @@ export async function generateTestFeedback({
             })();
 
   const userMessage = [
+    `Instruction Language: ${(typeof instructionLanguage === "string" && instructionLanguage.trim()) || "English"}`,
     studentName ? `Student: ${studentName}` : null,
     `Question format: ${question?.format || ""}`,
     `Question: ${question?.text || ""}`,

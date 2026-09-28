@@ -20,6 +20,7 @@ import {
 import { tryFastPathAiResult } from '../utils/classworkFastPath.js';
 import { precomputeStandardSolution } from '../utils/geminiClassworkPrecompute.js';
 import { generateClassReportSummary } from '../utils/geminiClassReportSummary.js';
+import { resolveInstructionLanguage } from '../utils/geminiCommon.js';
 import { getExpiryState, getQuestionAiExpirySeconds, getQuestionExpirySeconds, getQuestionTimerStart, isValidExpirySeconds } from '../utils/classworkExpiry.js';
 import { s3 } from '../utils/s3.js';
 import nodemailer from "nodemailer";
@@ -719,6 +720,8 @@ function scheduleFeedbackWarmup(question) {
         : (typeof question.correctAnswer === 'string' && question.correctAnswer.trim())
           ? question.correctAnswer
           : 'warm-up';
+      const instructionLanguage =
+        await resolveInstructionLanguage(sessionIdForUsage);
       await getClassworkAiFeedback({
         questionText: question.question || '',
         answer: referenceAnswer,
@@ -743,6 +746,7 @@ function scheduleFeedbackWarmup(question) {
         cachedContext,
         computeStandardSolution: false,
         computeCommonMistake: false,
+        instructionLanguage,
       });
       console.log('[Classwork] Feedback warm-up completed', {
         questionId: question.id,
@@ -2319,6 +2323,7 @@ async function prepareClassworkSubmission(req) {
       existingReportPromise,
       sessionIdPromise,
     ]);
+  const instructionLanguage = await resolveInstructionLanguage(sessionIdForUsage);
   const priorInteractionCount = Array.isArray(existingReport?.interactions)
     ? existingReport.interactions.length
     : 0;
@@ -2350,6 +2355,7 @@ async function prepareClassworkSubmission(req) {
     submissionNumber,
     cachedContext,
     sessionIdForUsage,
+    instructionLanguage,
     roomId,
     questionId,
   };
@@ -2724,6 +2730,7 @@ export const submitAnswer = async (req, res) => {
             submissionNumber: ctx.submissionNumber,
             cachedContext: ctx.cachedContext,
             computeStandardSolution: !hasPrecomputedSolution,
+            instructionLanguage: ctx.instructionLanguage,
           });
           if (cacheKey) setCachedFeedback(cacheKey, aiResult);
         } catch (aiErr) {
@@ -2935,6 +2942,7 @@ export const submitAnswerStream = async (req, res) => {
             submissionNumber: ctx.submissionNumber,
             cachedContext: ctx.cachedContext,
             computeStandardSolution: !hasPrecomputedSolution,
+            instructionLanguage: ctx.instructionLanguage,
             onHintDelta: (chunk) => {
               if (clientGone) return;
               writeSseEvent(res, 'hint', { chunk });

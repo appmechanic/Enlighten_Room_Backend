@@ -4,6 +4,7 @@ import Question from "../models/QuestionModel.js";
 import User from "../models/user.js";
 import AssignmentAiReport from "../models/AssignmentAiReportModel.js";
 import { getClassworkAiFeedback } from "../utils/geminiClassworkFeedback.js";
+import { resolveInstructionLanguage } from "../utils/geminiCommon.js";
 
 // Coerces whatever Gemini returned for part1/part2/part3 into a string array,
 // matching the Mongo sub-schema. Same shape defensive as classworkController.
@@ -144,6 +145,9 @@ export const getAssignmentAiHint = async (req, res) => {
 
     let aiResult;
     try {
+      const instructionLanguage = await resolveInstructionLanguage(
+        parent.sessionId,
+      );
       aiResult = await getClassworkAiFeedback({
         questionText: question.questionText,
         answer: studentAnswer,
@@ -160,6 +164,7 @@ export const getAssignmentAiHint = async (req, res) => {
         // a mistake cache — always tell Gemini to skip both.
         computeStandardSolution: false,
         computeCommonMistake: false,
+        instructionLanguage,
       });
     } catch (aiErr) {
       console.error("[AssignmentAi] Gemini call failed:", aiErr);

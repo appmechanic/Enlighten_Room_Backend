@@ -26,6 +26,7 @@ import ClassworkAiReport from "../models/ClassworkAiReportModel.js";
 import GradedAnswerModel from "../models/GradedAnswerModel.js";
 import StudentAssignmentStatus from "../models/StudentAssignmentStatus.js";
 import { generateClassReportSummary } from "../utils/geminiClassReportSummary.js";
+import { resolveInstructionLanguage } from "../utils/geminiCommon.js";
  
 // Generates the class general report for a sub-assignment once it has expired.
 // Same prompt / schema / attachment shape as the classwork Class Report — we
@@ -126,12 +127,16 @@ export async function ensureAssignmentClassReport(parentAssignment, subAssignmen
     for (const s of list) if (s.studentId) uniqueStudentIds.add(s.studentId);
   }
 
+  const instructionLanguage = await resolveInstructionLanguage(
+    parentDoc.sessionId,
+  );
   const summary = await generateClassReportSummary({
     lessonName: task.title || "Assignment",
     questions,
     teacherId: parentDoc.teacherId,
     studentCount: uniqueStudentIds.size,
     sessionId: parentDoc.sessionId,
+    instructionLanguage,
   });
   if (!summary) return null;
 

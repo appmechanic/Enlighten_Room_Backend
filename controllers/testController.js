@@ -17,6 +17,7 @@ import {
 } from "../utils/geminiAssignmentImage.js";
 import { generateTestFeedback } from "../utils/geminiTestFeedback.js";
 import { generateTestClassReport } from "../utils/geminiTestClassReport.js";
+import { resolveInstructionLanguage } from "../utils/geminiCommon.js";
 import GradedTestAnswerModel from "../models/GradedTestAnswerModel.js";
 import GradeSetting from "../models/GradeSetting.js";
 import User from "../models/user.js";
@@ -79,12 +80,16 @@ async function ensureTestClassReport(testDoc, taskId) {
     feedback: s.feedback,
   }));
 
+  const instructionLanguage = await resolveInstructionLanguage(
+    testDoc.sessionId,
+  );
   const body = await generateTestClassReport({
     teacherId: testDoc.teacherId,
     title: task.title,
     totalQuestions: (task.questions || []).length,
     maxMarks: task.maxMarks,
     submissions,
+    instructionLanguage,
   });
   task.classReport = { generatedAt: new Date(), body };
   await testDoc.save();
@@ -611,6 +616,9 @@ export const submitTestQuestion = async (req, res) => {
         practiceAdvice: "No answer submitted.",
       };
     } else {
+      const instructionLanguage = await resolveInstructionLanguage(
+        testDoc.sessionId,
+      );
       feedback = await generateTestFeedback({
         teacherId: testDoc.teacherId,
         studentName: student?.name || "",
@@ -622,6 +630,7 @@ export const submitTestQuestion = async (req, res) => {
         },
         studentAnswer: answer,
         fullMarks: perQFull,
+        instructionLanguage,
       });
     }
 

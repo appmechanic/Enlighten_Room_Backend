@@ -173,8 +173,17 @@ const STRATEGIES_ONLY_SCHEMA = {
 // Compact the lesson's classwork + submissions into a textual snapshot the
 // model can summarize. Per-student answers are listed under each question so
 // the model can see the spread of responses.
-function buildLessonSnapshot({ lessonName, questions, interactionId, previousInteractionId }) {
+function buildLessonSnapshot({
+  lessonName,
+  questions,
+  interactionId,
+  previousInteractionId,
+  instructionLanguage,
+}) {
   const lines = [];
+  lines.push(
+    `Instruction Language: ${(typeof instructionLanguage === "string" && instructionLanguage.trim()) || "English"}`,
+  );
   if (interactionId) lines.push(`interaction_id: ${interactionId}`);
   lines.push(`previous_interaction_id: ${previousInteractionId || "null"}`);
   if (lessonName) lines.push(`Lesson: ${lessonName}`);
@@ -208,6 +217,7 @@ export async function generateClassReportSummary({
   sessionId,
   interactionId,
   previousInteractionId,
+  instructionLanguage,
 }) {
   if (!Array.isArray(questions) || questions.length === 0) {
     return null;
@@ -262,6 +272,7 @@ export async function generateClassReportSummary({
     questions,
     interactionId,
     previousInteractionId,
+    instructionLanguage,
   });
 
   const maxOutputTokens = reportMaxOutputTokens(studentCount, reportTuning);
