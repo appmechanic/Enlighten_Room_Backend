@@ -15,18 +15,22 @@ export const USAGE_CATEGORIES = [
   "screenLockSessions",
   "lessonReports",
   "aiCalls",
+  "aiInputTokens",
+  "aiOutputTokens",
   "storageBytes",
 ];
 
 // Maps each usage category to the Plan.limits.<field> it's compared against.
 // null/undefined on the plan means "unlimited" for that dimension. AI spend
-// is capped by call count only — token totals stay visible on the admin AI
-// token page but are not enforced.
+// enforcement middleware checks maxAiCallsPerMonth; the token dimensions are
+// surfaced for admin visibility but not hard-gated (see checkUsageBudget).
 export const LIMIT_FIELD_BY_CATEGORY = {
   meetingMinutes: "maxSessionMinutesPerMonth",
   screenLockSessions: "maxScreenLockSessionsPerMonth",
   lessonReports: "maxLessonReportsPerMonth",
   aiCalls: "maxAiCallsPerMonth",
+  aiInputTokens: "maxAiInputTokensPerMonth",
+  aiOutputTokens: "maxAiOutputTokensPerMonth",
   storageBytes: "maxStorageBytes",
 };
 
@@ -244,17 +248,20 @@ export async function getTeacherMonthUsage(teacherId, monthKey) {
   ]);
   const { start, end } = effectiveMonthlyWindow(mk, resetAt);
 
+  const teacherOid = toObjectId(teacherId);
   const [
     meetingMinutes,
     screenLockSessions,
     lessonReports,
     aiCalls,
+    aiTokens,
     storageBytes,
   ] = await Promise.all([
     sumMeetingMinutes(teacherId, start, end),
     countScreenLockSessions(teacherId, start, end),
     countLessonReports(teacherId, start, end),
     countAiCalls(teacherId, start, end),
+    sumAiTokens(teacherOid, start, end),
     sumStorageBytes(teacherId),
   ]);
 
@@ -270,6 +277,8 @@ export async function getTeacherMonthUsage(teacherId, monthKey) {
     screenLockSessions: pair(screenLockSessions, "screenLockSessions"),
     lessonReports: pair(lessonReports, "lessonReports"),
     aiCalls: pair(aiCalls, "aiCalls"),
+    aiInputTokens: pair(aiTokens.input, "aiInputTokens"),
+    aiOutputTokens: pair(aiTokens.output, "aiOutputTokens"),
     storageBytes: pair(storageBytes, "storageBytes"),
   };
 }
@@ -301,6 +310,16 @@ export async function checkUsageBudget(teacherId, category, monthKey) {
     case "aiCalls":
       used = await countAiCalls(teacherId, start, end);
       break;
+    case "aiInputTokens": {
+      const t = await sumAiTokens(toObjectId(teacherId), start, end);
+      used = t.input;
+      break;
+    }
+    case "aiOutputTokens": {
+      const t = await sumAiTokens(toObjectId(teacherId), start, end);
+      used = t.output;
+      break;
+    }
     case "storageBytes":
       used = await sumStorageBytes(teacherId);
       break;
