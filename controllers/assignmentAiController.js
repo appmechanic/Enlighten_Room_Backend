@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import Assignment from "../models/AssignmentModel.js";
 import Question from "../models/QuestionModel.js";
 import User from "../models/user.js";
+import Session from "../models/SessionModel.js";
 import AssignmentAiReport from "../models/AssignmentAiReportModel.js";
 import { getClassworkAiFeedback } from "../utils/geminiClassworkFeedback.js";
 import { resolveInstructionLanguage } from "../utils/geminiCommon.js";
@@ -143,6 +144,24 @@ export const getAssignmentAiHint = async (req, res) => {
       } catch (_) {}
     }
 
+    // Resolve the linked session's token budget so assignment feedback uses
+    // the same teacher-chosen limit as the live-class classwork path. Falls
+    // back to 800 (SessionModel default) if the session is missing or the
+    // field is unset — defensive guard against orphaned assignments, though
+    // every assignment is expected to have a session today.
+    let sessionMaxOutputTokens = 800;
+    try {
+      if (parent.sessionId) {
+        const session = await Session.findById(parent.sessionId)
+          .select("maxOutputTokens")
+          .lean();
+        const n = Number(session?.maxOutputTokens);
+        if (Number.isFinite(n) && n > 0) sessionMaxOutputTokens = n;
+      }
+    } catch (_) {
+      // Keep the 800 fallback on any lookup failure.
+    }
+
     let aiResult;
     try {
       const instructionLanguage = await resolveInstructionLanguage(
@@ -158,7 +177,7 @@ export const getAssignmentAiHint = async (req, res) => {
         studentId,
         classroomId: parent.classroomId || null,
         teacherId: parent.teacherId,
-        // Question has no maxOutputTokens; util applies its own default.
+        maxOutputTokens: sessionMaxOutputTokens,
         sessionId: parent.sessionId,
         // Assignment path never captures a canonical solution or finalizes
         // a mistake cache — always tell Gemini to skip both.
