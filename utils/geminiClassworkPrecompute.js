@@ -143,10 +143,15 @@ export async function precomputeStandardSolution({
       }
     }
 
-    const resolvedMax =
-      Number(maxOutputTokens) > 0
-        ? Number(maxOutputTokens)
-        : precomputeTuning.solutionMaxTokens;
+    // Precompute budget is max(session value, admin-configurable floor).
+    // The session value (teacher-chosen, 800 default) drives feedback cost,
+    // but the floor prevents truncated step-by-step solutions for complex
+    // questions when teachers pick a very low session value.
+    const sessionValue = Number(maxOutputTokens) > 0 ? Number(maxOutputTokens) : 800;
+    const solutionFloor = Number(precomputeTuning?.solutionMinTokens) > 0
+      ? Number(precomputeTuning.solutionMinTokens)
+      : 1500;
+    const resolvedMax = Math.max(sessionValue, solutionFloor);
 
     console.log(
       `[ClassworkPrecompute][req=${reqId}] === SOLUTION === teacherId=${teacherId || "(none)"} maxOutputTokens=${resolvedMax}`,

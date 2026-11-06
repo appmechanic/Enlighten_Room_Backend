@@ -210,7 +210,12 @@ export const TUNING_DEFAULTS = {
     uncachedMinThinkingBudget: 192,
   },
   precompute: {
-    solutionMaxTokens: 2000,
+    // Lower bound for the background model-solution call. The resolved token
+    // limit is max(session.maxOutputTokens, solutionMinTokens) — the session's
+    // teacher-configurable value drives feedback cost, but the model solution
+    // is a one-shot per question (not per student submission) so we guarantee
+    // it a sane minimum to avoid truncated step-by-step solutions.
+    solutionMinTokens: 1500,
     solutionThinkingRatio: 0.6,
   },
   report: {
