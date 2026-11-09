@@ -44,6 +44,7 @@ import studentDriveRoutes from "./routes/studentDriveRoutes.js";
 import classroomRoutes from "./routes/classroomRoutes.js";
 import reminderRoutes from "./routes/reminderRoutes.js";
 import reportRoutes from "./routes/reportRoutes.js";
+import reportLinkRoutes from "./routes/reportLinkRoutes.js";
 import subscriptionRoutes from "./routes/subscriptionRoutes.js";
 import planRoutes from "./routes/planRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
@@ -174,6 +175,9 @@ app.use("/api/parents", parentRoutes);
 app.use("/api/drive", driveRoutes);
 app.use("/api/reminders", reminderRoutes);
 app.use("/api/reports", reportRoutes);
+// PUBLIC (no auth middleware) — tokenized lesson-report viewer for Task 2.
+// Security is the 256-bit token itself; see reportLinkRoutes for details.
+app.use("/api/report-link", reportLinkRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
 app.use("/api/drive/teacher", teacherDriveRoutes);
 app.use("/api/drive/student", studentDriveRoutes);

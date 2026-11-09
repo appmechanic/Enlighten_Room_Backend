@@ -1,5 +1,6 @@
 import express from "express";
 import { clearAllClasswork, addQuestion, submitAnswer, submitAnswerStream, viewAnswers, viewAllAnswers, getQuestions, getStagedQuestions, releaseQuestion, sendClassworkReportToStudentsAndParents, downloadAllAnswersCsvReport, startLessonForRoom, renameLessonForRoom, endLessonForRoom, getActiveLessonForRoom, getClassReportForRoom, regenerateClassReportForRoom, reassignClassworkLesson, syncOrphanLessons, updateStagedQuestion, getStudentLessonReport, resolveTeacherIdForRoom } from "../controllers/classworkController.js";
+import { dispatchLessonReportLinks } from "../controllers/tokenizedReportController.js";
 import { uploadClasswork } from "../utils/multer.js";
 import { requireUsageBudget } from "../middleware/requireUsageBudget.js";
 import { enforceStorageQuota } from "../middleware/enforceStorageQuota.js";
@@ -35,10 +36,13 @@ router.get("/answers-overview/:roomId", viewAllAnswers);
 router.get("/student-report/:roomId/:studentId", getStudentLessonReport);
 // Download all answers as a report (JSON)
 router.get("/download-csv-report/:roomId", downloadAllAnswersCsvReport);
+// Task 2: route path unchanged for frontend compat (SendReportModal POSTs here),
+// but the handler is now dispatchLessonReportLinks — issues tokenized web-viewer
+// links via HTML email instead of attaching a CSV. See tokenizedReportController.
 router.post(
   "/send-report",
   requireUsageBudget("lessonReports", resolveTeacherFromRoomBody),
-  sendClassworkReportToStudentsAndParents
+  dispatchLessonReportLinks
 );
 router.get("/answers/:questionId", viewAnswers);
 router.post(

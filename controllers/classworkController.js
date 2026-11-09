@@ -59,7 +59,7 @@ function emptyAiFeedback() {
 // by the teacher/student report renderers. Walks `interactions` backwards
 // once to surface the latest advanced-challenge question (the mastery-mode
 // bonus prompt).
-function projectAiReport(report, { includeStudentAnswer = false } = {}) {
+export function projectAiReport(report, { includeStudentAnswer = false } = {}) {
   const interactions = Array.isArray(report?.interactions) ? report.interactions : [];
 
   let latestAdvancedQuestion = '';
@@ -407,7 +407,7 @@ function normalizeSubmittedAnswer(answer, format, metadata = {}) {
   return { answer: normalizedAnswer, uploadPromise };
 }
 
-function getSubmittedAnswerImage(answer) {
+export function getSubmittedAnswerImage(answer) {
   if (!answer || typeof answer !== 'object' || Array.isArray(answer)) {
     return null;
   }
@@ -430,7 +430,7 @@ function buildAnswerEchoOpener(rawAnswer) {
   return `You wrote: "${clipped}" — let me take a look.`;
 }
 
-function formatSubmittedAnswerText(answer) {
+export function formatSubmittedAnswerText(answer) {
   if (Array.isArray(answer)) {
     return answer.map((entry) => String(entry ?? '')).join(' | ');
   }
