@@ -136,3 +136,14 @@ export function setCachedFeedback(key, feedback) {
 export function _resetClassworkFeedbackCacheForTests() {
   cache.clear();
 }
+
+// Called from upsertStandardPrompts after an admin edits the AI prompts so
+// previously cached (questionId, answerHash) → feedback entries don't keep
+// replaying the pre-edit response shape until their 60-min TTL expires.
+// Full flush is fine — prompt saves are rare, and a cold cache just means
+// the next duplicate-answer submission pays a fresh Gemini call.
+export function clearClassworkFeedbackCache() {
+  const size = cache.size;
+  cache.clear();
+  return size;
+}

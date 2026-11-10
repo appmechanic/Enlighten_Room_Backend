@@ -90,6 +90,14 @@ async function loadFromDb() {
     // sections array; finally fall back to the canonical defaults so an
     // unseeded DB still produces a usable prompt.
     aiHintPrompt: resolveHintPrompt(doc),
+    // Per-slot admin edits carried alongside the joined string. Without this,
+    // getAiHintPromptSection() has no DB view and silently returns hardcoded
+    // defaults — meaning the Gemini responseSchema field descriptions
+    // (overview, part1/2/3, hintStream, advancedChallenge) never reflect
+    // admin edits regardless of what the UI saves.
+    aiHintPromptSections: Array.isArray(doc?.aiHintPromptSections)
+      ? doc.aiHintPromptSections
+      : [],
   };
 }
 
@@ -128,6 +136,7 @@ async function refresh() {
         aiHintPrompt: AI_HINT_PROMPT_SECTION_DEFAULTS
           .filter((s) => typeof s === "string" && s.length > 0)
           .join("\n\n"),
+        aiHintPromptSections: [],
       };
     }
   }

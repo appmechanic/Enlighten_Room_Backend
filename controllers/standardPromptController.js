@@ -3,6 +3,7 @@ import StandardPrompt from "../models/standardPromptModel.js";
 import ClassworkModel from "../models/ClassworkModel.js";
 import { invalidateAiConfigCache } from "../utils/aiConfig.js";
 import { warmClassworkFeedbackCache } from "../utils/geminiClassworkFeedback.js";
+import { clearClassworkFeedbackCache } from "../utils/classworkFeedbackCache.js";
 import { resolveTeacherIdForRoom } from "./classworkController.js";
 import {
   buildSeedPatch,
@@ -200,6 +201,14 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
   ).lean();
 
   invalidateAiConfigCache();
+  // Flush in-process (questionId, answerHash) → feedback cache so stale
+  // pre-edit responses don't get replayed to the next student who submits
+  // the same answer within the 60-min TTL. Prompt saves are rare; the next
+  // duplicate submission just pays a fresh Gemini call.
+  const clearedEntries = clearClassworkFeedbackCache();
+  console.log(
+    `[StandardPrompt] saved — invalidated aiConfig cache, cleared ${clearedEntries} feedback cache entries`
+  );
   // Fire-and-forget: the admin's response ships instantly; recent classwork
   // questions get their Gemini explicit-cache entries pre-warmed under the
   // new digest so the first submission after this edit doesn't pay the
