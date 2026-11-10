@@ -155,6 +155,49 @@ The following is my teacher's personalized prompt. Please follow his/her advice 
 // No canonical default today; admin authors this from scratch.
 export const EMAIL_PROMPT_DEFAULT = "";
 
+// ---------- classSummaryPrompt / studentSummaryPrompt (Task 3) ----------
+// System-level prompts for the Date-Range Summary Reports. The aggregator
+// feeds pre-computed JSON fragments (studentDifficulties / per-interaction
+// part2[0] / test feedback) instead of raw submissions, so these prompts
+// stay focused on SYNTHESIS rather than per-answer analysis. The teacher's
+// TeacherAIConfig.reportPrompt is appended to whichever of these the
+// request targets, matching the stacking used by the classwork class
+// report and test class report generators.
+
+export const CLASS_SUMMARY_PROMPT_DEFAULT = `You are an experienced teacher synthesising a class-wide performance summary over a date range. The user prompt below contains pre-aggregated inputs from three sources inside the window: lesson class reports, assignment class reports, and test class reports.
+
+Your job:
+- Produce ONE concise, teacher-facing narrative summary that identifies the recurring difficulties across the whole window.
+- Call out the top 3-5 themes (pattern of errors / common misconception) that span MULTIPLE items within the window, not single-lesson noise.
+- Do NOT repeat the raw input verbatim — synthesise.
+- Do NOT include "Next lesson strategy" or "Targeted homework" sections — those are generated elsewhere.
+
+Language rules:
+- Write in the language named on the "Instruction Language:" line at the top of the user prompt. Do not auto-detect from the input content.
+- Keep student names as written; never translate them.
+
+LaTeX rules:
+- Wrap inline math in $...$, display math in $$...$$. Emit literal "\\frac", "\\int", etc. — do not escape backslashes.
+
+Output must be valid JSON matching the schema the API provides. No prose outside the JSON.`;
+
+export const STUDENT_SUMMARY_PROMPT_DEFAULT = `You are an experienced teacher writing an individual performance summary for ONE student over a date range. The user prompt below contains pre-aggregated inputs for that student: per-attempt misconception lines from classwork and assignments, final-attempt diagnostic breakdowns, and per-question test feedback.
+
+Your job:
+- Produce a warm, specific, student-facing narrative that highlights what this student has mastered and what to focus on next.
+- Ground every observation in the aggregated inputs — cite the question or lesson by name when possible.
+- Balance strengths and growth areas; do not catalogue every mistake.
+- End with an encouraging next-step suggestion.
+
+Language rules:
+- Write in the language named on the "Instruction Language:" line at the top of the user prompt. Do not auto-detect from the input content.
+- Address the student in second person where natural ("you solved…", "try…").
+
+LaTeX rules:
+- Wrap inline math in $...$, display math in $$...$$. Emit literal "\\frac", "\\int", etc. — do not escape backslashes.
+
+Output must be valid JSON matching the schema the API provides. No prose outside the JSON.`;
+
 // ---------- models ----------
 // All text AI calls (classwork feedback, precompute, class report, assignment
 // generation, test paths, whiteboard, ai-grader) resolve their model via
@@ -438,6 +481,8 @@ export function getStandardPromptDefaults() {
     creatingTestPrompt: CREATING_TEST_PROMPT_DEFAULT,
     testAiHintPrompt: TEST_AI_HINT_PROMPT_DEFAULT,
     emailPrompt: EMAIL_PROMPT_DEFAULT,
+    classSummaryPrompt: CLASS_SUMMARY_PROMPT_DEFAULT,
+    studentSummaryPrompt: STUDENT_SUMMARY_PROMPT_DEFAULT,
     models: { ...MODEL_DEFAULTS },
     retry: JSON.parse(JSON.stringify(RETRY_DEFAULTS)),
     tuning: JSON.parse(JSON.stringify(TUNING_DEFAULTS)),
@@ -508,6 +553,14 @@ export function buildSeedPatch(doc) {
     if (EMAIL_PROMPT_DEFAULT) {
       set.emailPrompt = EMAIL_PROMPT_DEFAULT;
     }
+  }
+
+  if (!(typeof d.classSummaryPrompt === "string" && d.classSummaryPrompt.trim())) {
+    set.classSummaryPrompt = CLASS_SUMMARY_PROMPT_DEFAULT;
+  }
+
+  if (!(typeof d.studentSummaryPrompt === "string" && d.studentSummaryPrompt.trim())) {
+    set.studentSummaryPrompt = STUDENT_SUMMARY_PROMPT_DEFAULT;
   }
 
   const curModels = d.models && typeof d.models === "object" ? d.models : {};

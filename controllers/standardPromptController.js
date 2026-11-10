@@ -114,6 +114,8 @@ function serializeDoc(doc) {
     ),
     emailPrompt: doc?.emailPrompt || "",
     creatingAssignmentPrompt: doc?.creatingAssignmentPrompt || "",
+    classSummaryPrompt: doc?.classSummaryPrompt || "",
+    studentSummaryPrompt: doc?.studentSummaryPrompt || "",
     models: {
       default: doc?.models?.default || "",
       fallback: doc?.models?.fallback || "",
@@ -146,6 +148,8 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     reportPrompt,
     emailPrompt,
     creatingAssignmentPrompt,
+    classSummaryPrompt,
+    studentSummaryPrompt,
     models,
     retry,
     tuning,
@@ -176,6 +180,8 @@ export const upsertStandardPrompts = asyncHandler(async (req, res) => {
     reportPromptSections: reportSections,
     emailPrompt: (emailPrompt || "").trim(),
     creatingAssignmentPrompt: (creatingAssignmentPrompt || "").trim(),
+    classSummaryPrompt: (classSummaryPrompt || "").trim(),
+    studentSummaryPrompt: (studentSummaryPrompt || "").trim(),
     updatedBy: userId || null,
   };
 

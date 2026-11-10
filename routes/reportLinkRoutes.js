@@ -1,10 +1,15 @@
 import express from "express";
-import { viewLessonReportByToken } from "../controllers/tokenizedReportController.js";
+import {
+  viewLessonReportByToken,
+  viewSummaryByToken,
+} from "../controllers/tokenizedReportController.js";
 
-// Task 2: PUBLIC router for tokenized lesson-report access.
-// Deliberately NO auth middleware — these endpoints are for recipients who
-// received an emailed link, not logged-in users. Security is the token itself
-// (256 bits of entropy + 90-day TTL + per-recipient issuance).
+// PUBLIC router for tokenized report access (Task 2 lesson reports + Task 3
+// student summary reports). Deliberately NO auth middleware — these endpoints
+// are for recipients who received an emailed link, not logged-in users.
+// Security is the token itself (256 bits of entropy + 90-day TTL +
+// per-recipient issuance). The handlers kind-guard the token so a Task 2
+// token cannot resolve a Task 3 route or vice versa.
 //
 // Mounted at /api/report-link in app.js. Separate from /api/reports (legacy,
 // auth-required) and /api/classwork (auth-required) to make the "no auth
@@ -12,7 +17,12 @@ import { viewLessonReportByToken } from "../controllers/tokenizedReportControlle
 
 const router = express.Router();
 
-// View the lesson report for the given token. 404 if not found, 410 if expired.
+// Task 2 — single-lesson tokenized report (one student's lesson attempts).
+// 404 if not found, 410 if expired.
 router.get("/view/:token", viewLessonReportByToken);
+
+// Task 3 — single-student date-range summary.
+// 404 if not found, 410 if expired or empty-for-this-student.
+router.get("/view-summary/:token", viewSummaryByToken);
 
 export default router;

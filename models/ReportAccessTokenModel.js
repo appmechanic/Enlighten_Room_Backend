@@ -20,22 +20,40 @@ const ReportAccessTokenSchema = new mongoose.Schema(
       index: true,
     },
 
-    // Which lesson this link scopes to (Task 2: single-lesson scope, not a
-    // whole-session bundle like the old CSV flow).
-    lessonId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Lesson",
-      required: true,
+    // Discriminator: "lesson" = Task 2 tokenized lesson report viewer;
+    // "studentSummary" = Task 3 per-student date-range summary.
+    // Default preserves backwards-compat for rows written before Task 3.
+    kind: {
+      type: String,
+      enum: ["lesson", "studentSummary"],
+      default: "lesson",
       index: true,
     },
 
-    // Denormalised: stored so the view endpoint can route the DB query by
-    // roomId (the key the classwork collection is indexed on) without an
-    // extra Lesson lookup on every view. Lesson.roomId is immutable so this
-    // is safe to cache.
+    // Which lesson this link scopes to (Task 2 — only populated when
+    // kind === "lesson"). Required-via-validate below rather than
+    // schema-level required:true so summary-kind rows can leave it unset.
+    lessonId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Lesson",
+      index: true,
+    },
+
+    // Denormalised for lesson-kind lookups: the classwork collection is
+    // indexed on roomId, so caching it here avoids an extra Lesson lookup
+    // on every view. Not set for summary-kind rows.
     roomId: {
       type: String,
-      required: true,
+    },
+
+    // Task 3 — only populated when kind === "studentSummary". Points at
+    // the SummaryReport doc; the view handler looks up the perStudent[]
+    // entry matching this row's studentId to render just that student's
+    // section (never sibling students).
+    summaryId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SummaryReport",
+      index: true,
     },
 
     // Which student's report this token exposes. Combined with roomId +

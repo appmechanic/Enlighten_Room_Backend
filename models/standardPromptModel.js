@@ -71,6 +71,22 @@ const StandardPromptSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    // System-level prompt prepended to every Date-Range Class Summary AI
+    // call (Task 3). Teacher's TeacherAIConfig.reportPrompt is appended
+    // after this so teacher tone flows through to summary outputs.
+    classSummaryPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    // System-level prompt prepended to every Date-Range Student Individual
+    // Summary AI call (Task 3). One call per student; same teacher-prompt
+    // stacking as classSummaryPrompt.
+    studentSummaryPrompt: {
+      type: String,
+      trim: true,
+      default: "",
+    },
     // Gemini model IDs used by every AI call site. `default` covers all text
     // generation (classwork feedback, precompute, class report, assignment
     // generation, whiteboard). `fallback` is used by classwork feedback when

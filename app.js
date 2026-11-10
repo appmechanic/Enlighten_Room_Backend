@@ -45,6 +45,7 @@ import classroomRoutes from "./routes/classroomRoutes.js";
 import reminderRoutes from "./routes/reminderRoutes.js";
 import reportRoutes from "./routes/reportRoutes.js";
 import reportLinkRoutes from "./routes/reportLinkRoutes.js";
+import summaryReportRoutes from "./routes/summaryReportRoutes.js";
 import subscriptionRoutes from "./routes/subscriptionRoutes.js";
 import planRoutes from "./routes/planRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
@@ -178,6 +179,10 @@ app.use("/api/reports", reportRoutes);
 // PUBLIC (no auth middleware) — tokenized lesson-report viewer for Task 2.
 // Security is the 256-bit token itself; see reportLinkRoutes for details.
 app.use("/api/report-link", reportLinkRoutes);
+// Task 3 — Date-Range Summary Reports (class + student individual).
+// Teacher-authenticated; quota enforced inside the controller after the
+// cache lookup so repeat-click cache hits don't burn monthly budget.
+app.use("/api/summary", summaryReportRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
 app.use("/api/drive/teacher", teacherDriveRoutes);
 app.use("/api/drive/student", studentDriveRoutes);

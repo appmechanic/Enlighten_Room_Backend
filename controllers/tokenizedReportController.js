@@ -27,7 +27,9 @@ import { buildLessonReportEmail } from "../utils/emailTemplates/lessonReportEmai
 // uses. Lazy-initialised so test environments without SMTP credentials
 // still boot.
 let _transporter = null;
-function getTransporter() {
+// Exported so Task 3's summaryReportController can reuse the same lazy
+// Gmail transporter singleton instead of creating a second instance.
+export function getTransporter() {
   if (_transporter) return _transporter;
   _transporter = nodemailer.createTransport({
     service: "gmail",
@@ -323,6 +325,15 @@ export const viewLessonReportByToken = async (req, res) => {
       });
     }
 
+    // Kind-guard: this handler only serves Task 2 lesson tokens. Task 3
+    // summary tokens must hit /view-summary/:token instead — if someone
+    // mis-types the URL we return 404 rather than crash on missing lessonId.
+    if (row.kind && row.kind !== "lesson") {
+      return res.status(404).json({
+        message: "Report link not found.",
+      });
+    }
+
     const { lessonId, roomId, studentId } = row;
 
     // Load the single lesson this token scopes to.
@@ -475,5 +486,113 @@ export const viewLessonReportByToken = async (req, res) => {
     return res
       .status(500)
       .json({ message: "Failed to load report.", error: err.message });
+  }
+};
+
+/**
+ * PUBLIC. GET /api/report-link/view-summary/:token
+ *
+ * Task 3 — serves a single student's slice of a Date-Range Student Summary
+ * report. Mirrors viewLessonReportByToken's shape (token lookup, expiry,
+ * cache headers, view counter) but resolves kind="studentSummary" tokens
+ * to a SummaryReport doc and returns ONLY the matching perStudent entry —
+ * never sibling students.
+ */
+export const viewSummaryByToken = async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token || typeof token !== "string" || token.length < 32) {
+      return res.status(404).json({ message: "Report link not found." });
+    }
+
+    const row = await ReportAccessToken.findOne({ token });
+    if (!row) {
+      return res.status(404).json({ message: "Report link not found." });
+    }
+    if (row.expiresAt.getTime() <= Date.now()) {
+      return res.status(410).json({
+        expired: true,
+        message:
+          "This report link has expired. Please log in to your Enlighten Room account to view past reports.",
+      });
+    }
+    // Kind-guard: lesson tokens must not resolve here.
+    if (row.kind !== "studentSummary") {
+      return res.status(404).json({ message: "Report link not found." });
+    }
+    if (!row.summaryId) {
+      return res.status(404).json({ message: "Report link not found." });
+    }
+
+    // Dynamic import avoids a top-level circular dep if SummaryReport ever
+    // grows to need ReportAccessToken at load time. Negligible cost on hot
+    // paths (module cached after first call).
+    const { default: SummaryReport } = await import("../models/SummaryReportModel.js");
+
+    const summary = await SummaryReport.findById(row.summaryId)
+      .select("_id kind classroomId teacherId dateRange instructionLanguage perStudent createdAt")
+      .lean();
+    if (!summary) {
+      return res.status(404).json({
+        message: "Summary not found. It may have been removed.",
+      });
+    }
+    if (summary.kind !== "student") {
+      // Should never happen — tokens are only issued for student kind,
+      // but guards against a malformed row surviving through time.
+      return res.status(404).json({ message: "Report link not found." });
+    }
+
+    // Find THIS student's entry. We never leak sibling perStudent entries
+    // through the public endpoint.
+    const entry = (summary.perStudent || []).find(
+      (p) => p.studentId && String(p.studentId) === String(row.studentId)
+    );
+    if (!entry || entry.status !== "ok" || !entry.body) {
+      // Teacher sent a link for a student whose generation failed /
+      // skipped. Surface as 410 so the frontend can show "no content"
+      // without implying the link itself is broken.
+      return res.status(410).json({
+        empty: true,
+        message: "This summary has no content for this student yet.",
+      });
+    }
+
+    // Fire-and-forget view analytics — same pattern as lesson view.
+    ReportAccessToken.updateOne(
+      { _id: row._id },
+      { $inc: { viewCount: 1 }, $set: { lastAccessedAt: new Date() } }
+    ).catch((err) =>
+      console.warn("[SummaryReport] viewCount update failed:", err?.message || err)
+    );
+
+    res.setHeader("Cache-Control", "private, no-store");
+
+    return res.json({
+      ok: true,
+      kind: "studentSummary",
+      data: {
+        summaryId: String(summary._id),
+        studentId: String(row.studentId),
+        studentName: entry.studentName || "",
+        recipientRole: row.recipientRole,
+        dateRange: {
+          start: summary.dateRange?.start || null,
+          end: summary.dateRange?.end || null,
+        },
+        instructionLanguage: summary.instructionLanguage || "English",
+        body: entry.body,
+        generatedAt: entry.generatedAt || summary.createdAt,
+        token: {
+          expiresAt: row.expiresAt,
+          servedAt: new Date(),
+        },
+      },
+    });
+  } catch (err) {
+    console.error("[SummaryReport] View error:", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to load summary.", error: err.message });
   }
 };
